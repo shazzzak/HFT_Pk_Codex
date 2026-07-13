@@ -21,8 +21,9 @@ import pyarrow.parquet as pq
 # ----------------------------- configuration ------------------------------
 IN_DIR = Path(r"C:\Users\shahz\OneDrive\Desktop\Del\Capital Stake\parsed\2026-06-30")
 FILES = [
-    IN_DIR / "2026-06-30_ticks.parquet",
-    IN_DIR / "2026-06-30_orderbook.parquet",
+    IN_DIR / "2026-06-30_trades.parquet",
+    IN_DIR / "2026-06-30_ob_snapshot.parquet",
+    IN_DIR / "2026-06-30_ob_updates.parquet",
     IN_DIR / "2026-06-30_other.parquet",
 ]
 OUT_DIR = IN_DIR / "csv"
