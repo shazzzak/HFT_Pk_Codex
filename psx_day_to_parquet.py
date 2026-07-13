@@ -22,6 +22,7 @@
 import gc
 import io
 import tarfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +34,8 @@ import pyarrow.parquet as pq
 SRC = Path(r"C:\Users\shahz\OneDrive\Desktop\Del\Capital Stake\2026-06-30.tar.gz")
 OUT_DIR = SRC.parent / "parsed" / SRC.name.replace(".tar.gz", "")
 CHUNK_LINES = 250_000            # ~250 MB of text per chunk; lower if RAM-tight
+PROGRESS_EVERY = 100_000         # heartbeat print every N lines read
+PRECOUNT = True                  # pre-count messages (one extra ~1-2 min pass)
 
 SOH = "^"
 
@@ -270,28 +273,48 @@ def run_day(src=SRC, out_dir=OUT_DIR, chunk_lines=CHUNK_LINES):
     day = Path(src).name.replace(".tar.gz", "")
     kinds = ("ticks", "orderbook", "other")
 
+    # ---- pass 0 (optional): pre-count messages -> expected chunk count ----
+    if PRECOUNT:
+        print("pre-counting messages (one extra pass over the archive) ...",
+              flush=True)
+        with tarfile.open(src, "r:*") as tf0:
+            m0 = next(m for m in tf0.getmembers()
+                      if m.isfile() and m.name.lower().endswith(".txt"))
+            total = sum(1 for _ in io.TextIOWrapper(
+                tf0.extractfile(m0), encoding="utf-8", errors="replace"))
+        print(f"{total:,} messages -> {-(-total // chunk_lines)} chunks expected",
+              flush=True)
+
     # ---- pass 1: chunk -> parse -> 3 partial parquets -> free RAM ----
     adds_index = {}
     n_chunk = 0
     totals = dict.fromkeys(kinds, 0)
 
+    t0 = time.time()
+    n_lines = 0
     tf = tarfile.open(src, "r:*")
     member = next(m for m in tf.getmembers()
                   if m.isfile() and m.name.lower().endswith(".txt"))
     stream = io.TextIOWrapper(tf.extractfile(member), encoding="utf-8",
                               errors="replace")
+    print(f"opened {member.name} inside {Path(src).name}", flush=True)
     buf = []
     for line in stream:
         buf.append(line)
+        n_lines += 1
+        if n_lines % PROGRESS_EVERY == 0:              # heartbeat
+            el = time.time() - t0
+            print(f"  read {n_lines:>10,} lines | {el:6.1f}s elapsed "
+                  f"| {n_lines/el:,.0f} lines/s", flush=True)
         if len(buf) < chunk_lines:
             continue
         n_chunk += 1
-        _write_chunk(buf, n_chunk, adds_index, out_dir, day, totals)
+        _write_chunk(buf, n_chunk, adds_index, out_dir, day, totals, t0)
         buf = []
         gc.collect()                                   # clear RAM
     if buf:
         n_chunk += 1
-        _write_chunk(buf, n_chunk, adds_index, out_dir, day, totals)
+        _write_chunk(buf, n_chunk, adds_index, out_dir, day, totals, t0)
         buf = []
         gc.collect()
     tf.close()
@@ -309,21 +332,32 @@ def run_day(src=SRC, out_dir=OUT_DIR, chunk_lines=CHUNK_LINES):
         writer = None
         for p in parts:
             pf = pq.ParquetFile(p)
-            for batch in pf.iter_batches(batch_size=131_072):
-                if writer is None:
-                    writer = pq.ParquetWriter(final, batch.schema,
-                                              compression="zstd")
-                writer.write_batch(batch)
+            try:
+                for batch in pf.iter_batches(batch_size=131_072):
+                    if writer is None:
+                        writer = pq.ParquetWriter(final, batch.schema,
+                                                  compression="zstd")
+                    writer.write_batch(batch)
+            finally:
+                pf.close()          # Windows: must close before unlink
         writer.close()
         for p in parts:                                # delete partial files
-            p.unlink()
+            try:
+                p.unlink()
+            except PermissionError:
+                print(f"  could not delete {p.name} (locked, e.g. by "
+                      f"OneDrive sync) — delete manually; the combined "
+                      f"file is complete")
         print(f"{kind}: {totals[kind]:,} rows -> {final}")
     return out_dir
 
 
-def _write_chunk(buf, n_chunk, adds_index, out_dir, day, totals):
+def _write_chunk(buf, n_chunk, adds_index, out_dir, day, totals, t0):
+    print(f"chunk {n_chunk:>3}: parsing {len(buf):,} msgs ...", flush=True)
     t, b, o = parse_fix_file(buf)                      # <- the parser
+    print(f"chunk {n_chunk:>3}: building frames ...", flush=True)
     df_t, df_b, df_o = build_frames(t, b, o, adds_index)
+    print(f"chunk {n_chunk:>3}: writing parquet ...", flush=True)
     for kind, df in (("ticks", df_t), ("orderbook", df_b), ("other", df_o)):
         if df.empty:
             continue
@@ -331,8 +365,9 @@ def _write_chunk(buf, n_chunk, adds_index, out_dir, day, totals):
         pq.write_table(pa.Table.from_pandas(df, preserve_index=False),
                        path, compression="zstd")
         totals[kind] += len(df)
-    print(f"chunk {n_chunk:>3}: {len(buf):>9,} msgs -> "
-          f"ticks {len(df_t):>9,} | book {len(df_b):>10,} | other {len(df_o):>7,}")
+    print(f"chunk {n_chunk:>3} DONE ({time.time()-t0:6.1f}s total): "
+          f"{len(buf):>9,} msgs -> ticks {len(df_t):>9,} "
+          f"| book {len(df_b):>10,} | other {len(df_o):>7,}", flush=True)
     del t, b, o, df_t, df_b, df_o                      # clear RAM
 
 
