@@ -1,3 +1,6 @@
+# To run in CMD
+#.backtest\Scripts\python.exe Perplexity_psx_day_to_parquet.py
+
 # =============================================================================
 # PSX FIX daily capture -> 4 Parquet files (chunked, bounded RAM)
 # Spec: PSX FIX Market Data Interface Specifications v1.05
