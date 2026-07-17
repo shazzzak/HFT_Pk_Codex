@@ -11,14 +11,30 @@
 #   {day}_ob_updates.parquet   - UA201 (order add) + UA202 ExecType=4 (cancel)
 #   {day}_other.parquet        - heartbeats, session status, news, all else
 #
-# FIX 7 spec errors vs PSX FIX Market Data Interface Specifications v1.05:
-#   Fix 1 - ExecType(150) only valid values are 4=Cancelled and F=Trade
-#   Fix 2 - Side(54) only valid values in this spec are 1=Buy and 2=Sell
-#   Fix 3 - MDStreamID(1500) separate maps for Snapshot vs Tick channels
-#   Fix 4 - UA004 structured parsing (TradingPhaseCode per segment)
-#   Fix 5 - ExecInst(18) captured from UA202 (B=Ok to Cross for NDM)
-#   Fix 6 - xl MDEntryType (close index) added to MDENTRY_MAP
-#   Fix 7 - ChannelNo(10201) cast to Int64 (spec: N4 numeric)
+# CHANGELOG (this revision, on top of the previous 7-fix version):
+#   Fix 8  - Auction crosses: both BidApplSeqNum(10116) & OfferApplSeqNum(10117)
+#            nonzero -> initiator = AUCTION, resting_ref = NULL (was ill-posed
+#            under the old "whichever ref nonzero" rule during phase O/N/V)
+#   Fix 9  - Cancel price resolved from the referenced UA201 via adds_index,
+#            instead of trusting tag 31 (LastPx), which is 0.0000 on cancels
+#            (spec marks it optional/trade-price; not meaningful for cancels)
+#   Fix 10 - exec_inst documented/enforced as cancel-and-trade-only; UA201 has
+#            no tag 18 in the spec, so it is structurally always null on adds
+#   Fix 11 - MDEntryType dictionary corrected against spec text:
+#            xa=PREV_CLOSE_INDEX, xb=OPEN_INDEX, xc=HIGH_INDEX, xd=LOW_INDEX,
+#            5=CLOSING_PRICE, 6=SETTLEMENT_PRICE, x5/x6=PE_RATIO_1/2,
+#            x7=FUND_PREV_NAV, x8=ETF_INAV, xg=OPEN_INTEREST, xl=CLOSE_INDEX
+#   Fix 12 - Circuit breaker sentinels handled asymmetrically per spec:
+#            xe (up limit) sentinel 999999999.9999 -> NULL
+#            xf (down limit) has NO large sentinel; its "no-limit" value is the
+#            market's price tick size (e.g. 0.01 for Regular Market) and is
+#            NOT nulled automatically — flagged via is_xf_tick_floor instead
+#   Fix 13 - TradingPhaseCode(8538) decoded into phase / suspended_all_day /
+#            break_reason columns instead of only storing the raw C8 string
+#   Fix 14 - after-hours (phase A) snapshot rows keep level/order-count
+#            columns nullable (spec: only 269/270/271 released in phase A)
+#   Fix 15 - UA001 heartbeat fields promoted to first-class columns:
+#            appl_last_seq(1350), end_of_channel(10205), heartbeat_time(60)
 # =============================================================================
 
 import gc
@@ -39,73 +55,99 @@ CHUNK_LINES = 250_000      # lines per batch; lower to 100_000 if RAM is tight
 
 SOH = "^"
 
-# Fix 2: spec Side(54) valid values are 1=Buy, 2=Sell only in market data feed
+# spec Side(54) valid values are 1=Buy, 2=Sell only in market data feed
 SIDE_MAP = {
     "1": "BUY",
     "2": "SELL",
 }
 
-# Fix 1: spec ExecType(150) valid values are 4=Cancelled and F=Trade only
+# spec ExecType(150) valid values are 4=Cancelled and F=Trade only
 EXECTYPE_MAP = {
     "4": "CANCELLED",
     "F": "TRADE",
 }
 
-# Fix 3: separate MDStreamID maps for Snapshot (35=W) vs Tick (UA201/UA202)
-# Snapshot channel MDStreamID values (tag 1500 inside 35=W messages)
+# separate MDStreamID maps for Snapshot (35=W) vs Tick (UA201/UA202)
 SNAPSHOT_SEGMENT_MAP = {
-    "010": "REG",                   # Regular Market
-    "020": "BILLS_BOND",            # Bills and Bond Market (was wrongly "ODL")
-    "030": "STOCK_DEL_FUT",         # Stock Deliverable Future
-    "040": "STOCK_CS_FUT",          # Stock Cash Settled Future
-    "050": "STOCK_DEL_OPT",         # Stock Deliverable Option
-    "060": "INDEX_OPT",             # Stock Index Option
-    "070": "STOCK_IDX_FUT",         # Stock Index Future
-    "080": "ODD_LOT",               # Odd Lot Market
-    "100": "EQ_SQUARE_UP",          # Equities Square Up
-    "120": "FUT_SQUARE_UP",         # Futures Square Up
-    "900": "INDEX",                 # Index
+    "010": "REG",
+    "020": "BILLS_BOND",
+    "030": "STOCK_DEL_FUT",
+    "040": "STOCK_CS_FUT",
+    "050": "STOCK_DEL_OPT",
+    "060": "INDEX_OPT",
+    "070": "STOCK_IDX_FUT",
+    "080": "ODD_LOT",
+    "100": "EQ_SQUARE_UP",
+    "120": "FUT_SQUARE_UP",
+    "900": "INDEX",
 }
 
-# Tick channel MDStreamID values (tag 1500 inside UA201/UA202 messages)
 TICK_SEGMENT_MAP = {
-    "011": "REG",                   # Regular Market
-    "031": "STOCK_DEL_FUT",         # Stock Deliverable Future
-    "041": "STOCK_CS_FUT",          # Stock Cash Settled Future
-    "051": "STOCK_DEL_OPT",         # Stock Deliverable Option
-    "061": "INDEX_OPT",             # Stock Index Option
-    "071": "STOCK_IDX_FUT",         # Stock Index Future
-    "081": "ODD_LOT",               # Odd Lot Market
-    "091": "NDM",                   # Negotiated Deal Market
+    "011": "REG",
+    "031": "STOCK_DEL_FUT",
+    "041": "STOCK_CS_FUT",
+    "051": "STOCK_DEL_OPT",
+    "061": "INDEX_OPT",
+    "071": "STOCK_IDX_FUT",
+    "081": "ODD_LOT",
+    "091": "NDM",
 }
 
-# Fix 6: added xl=CLOSE_INDEX (was missing)
+# Fix 11: MDEntryType dictionary corrected against spec text verbatim
 MDENTRY_MAP = {
     "0":  "BID",
     "1":  "OFFER",
-    "2":  "LAST_TRADE",             # latest execution price and volume
+    "2":  "LAST_TRADE",
     "3":  "INDEX_VALUE",
     "4":  "OPENING_PRICE",
-    "5":  "CLOSING_PRICE",
-    "6":  "SETTLEMENT_PRICE",
+    "5":  "CLOSING_PRICE",          # Fix 11
+    "6":  "SETTLEMENT_PRICE",       # Fix 11
     "7":  "SESSION_HIGH",
     "8":  "SESSION_LOW",
-    "x1": "NET_CHANGE",             # latest px minus prev close
+    "x1": "NET_CHANGE_1",           # latest px minus prev close
     "x2": "NET_CHANGE_2",           # latest px minus last latest px
-    "x3": "AGG_BID",                # VWAP px / total qty (within auction range)
-    "x4": "AGG_OFFER",              # VWAP px / total qty (within auction range)
-    "x5": "PE_RATIO_1",             # reserved, not released
-    "x6": "PE_RATIO_2",             # reserved, not released
-    "x7": "FUND_PREV_NAV",          # fund prev NAV (incl. ETF)
-    "x8": "ETF_INAV",               # ETF intraday NAV
-    "xa": "INDEX_PREV_CLOSE",
-    "xb": "INDEX_OPEN",
-    "xc": "INDEX_HIGH",
-    "xd": "INDEX_LOW",
+    "x3": "AGG_BID",                # VWAP px / total qty within auction range
+    "x4": "AGG_OFFER",              # VWAP px / total qty within auction range
+    "x5": "PE_RATIO_1",             # Fix 11: reserved, not released
+    "x6": "PE_RATIO_2",             # Fix 11: reserved, not released
+    "x7": "FUND_PREV_NAV",          # Fix 11: fund prev NAV incl. ETF
+    "x8": "ETF_INAV",               # Fix 11: ETF intraday NAV
+    "xa": "PREV_CLOSE_INDEX",       # Fix 11: corrected (was INDEX_OPEN)
+    "xb": "OPEN_INDEX",             # Fix 11: corrected
+    "xc": "HIGH_INDEX",             # Fix 11: corrected (was INDEX_LOW_?)
+    "xd": "LOW_INDEX",              # Fix 11: corrected
     "xe": "UPPER_CIRCUIT_BREAKER",
     "xf": "LOWER_CIRCUIT_BREAKER",
     "xg": "OPEN_INTEREST",          # position qty of derivative contract
-    "xl": "CLOSE_INDEX",            # Fix 6: close index (added)
+    "xl": "CLOSE_INDEX",
+}
+
+# Fix 12: sentinel value for "no limit" on xe (up circuit breaker) ONLY.
+# xf (down circuit breaker) has no universal sentinel — its no-limit value
+# equals the market's minimum price tick (e.g. 0.01 for Regular Market),
+# which varies by market/segment and must not be hard-coded/nulled blindly.
+XE_NO_LIMIT_SENTINEL = 999999999.9999
+
+# Fix 13: TradingPhaseCode(8538) 0th-digit phase code -> human label
+PHASE_MAP = {
+    "S": "STARTING",
+    "O": "OPEN_CALL_AUCTION",
+    "T": "CONTINUOUS_AUCTION",
+    "B": "TRADING_BREAK",
+    "N": "NORMAL_CALL_AUCTION_PM",
+    "H": "TEMPORARY_SUSPENSION",
+    "V": "NORMAL_CALL_AUCTION_RESUME",
+    "C": "CLOSE_CALL_AUCTION",
+    "A": "AFTER_HOUR_TRADING",
+    "E": "MARKET_CLOSED",
+}
+
+# Fix 13: break-reason 2nd digit (only meaningful when phase == B)
+BREAK_REASON_MAP = {
+    "1": "AFTER_PRE_OPEN",
+    "2": "FRIDAY_LUNCH_BREAK",
+    "3": "AFTER_PRE_OPEN_PM_FRIDAY",
+    "4": "BEFORE_POST_CLOSE",
 }
 
 
@@ -171,7 +213,6 @@ def parse_fix_chunk(lines):
         msg    = dict(pairs)
         mtype  = msg.get("35")
 
-        # Fix 7: channel stored as raw string; cast to Int64 in build step
         base = {
             "capture_ts":   capture_ts,
             "msg_seq":      msg.get("34"),
@@ -194,17 +235,16 @@ def parse_fix_chunk(lines):
                 "order_id":      msg.get("37"),
                 "transact_time": msg.get("60"),
                 "exec_type_code":None,
-                "exec_inst":     None,      # Fix 5: placeholder
+                "exec_inst":     None,   # Fix 10: UA201 has no tag 18 in spec
                 "buy_ref":       None,
                 "sell_ref":      None,
             })
 
         # ── UA202: Tick Execution → trade or cancel ───────────────────────
         elif mtype == "UA202":
-            et       = msg.get("150")
-            exec_inst= msg.get("18")        # Fix 5: ExecInst B=Ok to Cross
+            et        = msg.get("150")
+            exec_inst = msg.get("18")
 
-            # Fix 1: only F and 4 are valid per spec; anything else → other
             if et == "F":
                 trades.append({
                     **base,
@@ -215,7 +255,7 @@ def parse_fix_chunk(lines):
                     "qty":           msg.get("32"),
                     "transact_time": msg.get("60"),
                     "exec_type_code":"F",
-                    "exec_inst":     exec_inst,  # Fix 5
+                    "exec_inst":     exec_inst,
                     "buy_ref":       msg.get("10116"),
                     "sell_ref":      msg.get("10117"),
                 })
@@ -226,17 +266,19 @@ def parse_fix_chunk(lines):
                     "appl_seq":      msg.get("1181"),
                     "symbol":        msg.get("55"),
                     "side_code":     None,
-                    "price":         msg.get("31"),
+                    # Fix 9: tag 31 is unreliable (0.0000) on cancels; keep the
+                    # raw value here so build step can compare vs resolved px,
+                    # but the FINAL "price" column is resolved from adds_index
+                    "raw_last_px":   msg.get("31"),
                     "qty":           msg.get("32"),
                     "order_id":      None,
                     "transact_time": msg.get("60"),
                     "exec_type_code":"4",
-                    "exec_inst":     exec_inst,  # Fix 5
+                    "exec_inst":     exec_inst,
                     "buy_ref":       msg.get("10116"),
                     "sell_ref":      msg.get("10117"),
                 })
             else:
-                # unexpected ExecType — keep raw in other table
                 other.append({**base, "raw": body})
 
         # ── 35=W: Snapshot Data ───────────────────────────────────────────
@@ -266,19 +308,25 @@ def parse_fix_chunk(lines):
                     "order_qtys": [o.get("qty") for o in e["orders"]] or None,
                 })
 
-        # Fix 4: UA004 Statistics — parse structure instead of raw dump
         elif mtype == "UA004":
             other.append({
                 **base,
-                "raw":          body,
-                "orig_time":    msg.get("42"),
-                "n_streams":    msg.get("10208"),
-                # repeating group: stream-level TradingPhaseCode stored as raw
-                # (variable-length repeating group; full parse adds complexity
-                # for minimal gain — the raw field retains all info)
+                "raw":       body,
+                "orig_time": msg.get("42"),
+                "n_streams": msg.get("10208"),
             })
 
-        # ── everything else: h, B, UA001, UA002, j, f ────────────────────
+        # Fix 15: UA001 heartbeat fields promoted
+        elif mtype == "UA001":
+            other.append({
+                **base,
+                "raw":              body,
+                "appl_last_seq":    msg.get("1350"),
+                "end_of_channel":   msg.get("10205"),
+                "heartbeat_time":   msg.get("60"),
+            })
+
+        # ── everything else: h, B, UA002, j, f ───────────────────────────
         else:
             other.append({**base, "raw": body})
 
@@ -289,7 +337,7 @@ def parse_fix_chunk(lines):
 
 def _to_utc(series: pd.Series) -> pd.Series:
     return pd.to_datetime(
-        series.str.replace("-", " ", n=1),
+        series.astype(str).str.replace("-", " ", n=1),
         format="mixed", utc=True, errors="coerce"
     )
 
@@ -297,15 +345,15 @@ def _to_utc(series: pd.Series) -> pd.Series:
 def _build_trades(recs, adds_index: dict) -> pd.DataFrame:
     """
     Tick-level trade DataFrame from UA202/F records.
-    Resolves resting order ID and buyer/seller initiator.
 
-    Initiator logic per spec:
-      OfferApplSeqNum(10117) == 0  → no resting sell  → buyer was aggressor
-                                     → BidApplSeqNum(10116) is the resting buy
-                                     → SELLER_INITIATED  (seller hit the bid)
-      BidApplSeqNum(10116)  == 0   → no resting buy   → seller was aggressor
-                                     → OfferApplSeqNum(10117) is resting sell
-                                     → BUYER_INITIATED   (buyer lifted the offer)
+    Initiator logic (Fix 8 — handles auction crosses):
+      both buy_ref & sell_ref > 0  -> AUCTION (call-auction cross matches
+                                       two resting orders; ref rule is
+                                       ill-posed here) -> resting_ref = NULL
+      sell_ref > 0, buy_ref == 0   -> resting sell order  -> buyer aggressed
+                                       -> BUYER_INITIATED
+      buy_ref  > 0, sell_ref == 0  -> resting buy order   -> seller aggressed
+                                       -> SELLER_INITIATED
     """
     df = pd.DataFrame(recs)
     if df.empty:
@@ -316,7 +364,6 @@ def _build_trades(recs, adds_index: dict) -> pd.DataFrame:
     for c in ("appl_seq", "msg_seq", "buy_ref", "sell_ref"):
         df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
 
-    # Fix 7: channel as Int64
     df["channel"] = pd.to_numeric(df["channel"], errors="coerce").astype("Int64")
 
     df["transact_time"] = _to_utc(df["transact_time"])
@@ -324,31 +371,35 @@ def _build_trades(recs, adds_index: dict) -> pd.DataFrame:
     df["capture_ts"]    = pd.to_datetime(df["capture_ts"], utc=True,
                                          format="mixed", errors="coerce")
 
-    # Fix 1: only F is valid here; label it
     df["exec_type"] = df["exec_type_code"].map(EXECTYPE_MAP)
+    df["market"]    = df["segment"].map(TICK_SEGMENT_MAP)
 
-    # Fix 3: use tick segment map
-    df["market"] = df["segment"].map(TICK_SEGMENT_MAP)
+    buy_pos  = df["buy_ref"].fillna(0)  > 0
+    sell_pos = df["sell_ref"].fillna(0) > 0
+    is_auction = buy_pos & sell_pos                       # Fix 8
 
-    # resolve resting order_id via adds_index
-    ref = df["buy_ref"].where(df["buy_ref"].fillna(0) > 0, df["sell_ref"])
+    ref = df["buy_ref"].where(buy_pos, df["sell_ref"])
     df["resting_ref"] = ref.where(ref.fillna(0) > 0).astype("Int64")
-    keys = zip(df["channel"].astype("object"), df["resting_ref"].astype("float").fillna(-1).astype(int))
-    df["resting_order_id"] = [adds_index.get(k) for k in keys]
+    df.loc[is_auction, "resting_ref"] = pd.NA             # Fix 8
 
-    # initiator: sell_ref nonzero → resting sell → buyer aggressed → BUYER_INITIATED
-    #            buy_ref  nonzero → resting buy  → seller aggressed → SELLER_INITIATED
+    keys = zip(df["channel"].astype("object"),
+               df["resting_ref"].astype("float").fillna(-1).astype(int))
+    df["resting_order_id"] = [adds_index.get(k) for k in keys]
+    df.loc[is_auction, "resting_order_id"] = pd.NA        # Fix 8
+
     init = pd.Series(pd.NA, index=df.index, dtype="object")
-    init[df["sell_ref"].fillna(0) > 0] = "BUYER_INITIATED"
-    init[df["buy_ref"].fillna(0)  > 0] = "SELLER_INITIATED"
-    df["initiator"]      = init
+    init[sell_pos & ~is_auction] = "BUYER_INITIATED"
+    init[buy_pos  & ~is_auction] = "SELLER_INITIATED"
+    init[is_auction]             = "AUCTION"              # Fix 8
+    df["initiator"] = init
+
     df["aggressor_side"] = df["initiator"].map(
-        {"BUYER_INITIATED": "BUY", "SELLER_INITIATED": "SELL"})
+        {"BUYER_INITIATED": "BUY", "SELLER_INITIATED": "SELL",
+         "AUCTION": "AUCTION"})
 
     df = df[["transact_time", "sending_time", "capture_ts", "msg_seq",
              "appl_seq", "channel", "segment", "market",
-             "exec_type_code", "exec_type",
-             "exec_inst",                        # Fix 5
+             "exec_type_code", "exec_type", "exec_inst",
              "symbol", "price", "qty",
              "buy_ref", "sell_ref", "resting_ref", "resting_order_id",
              "initiator", "aggressor_side"]]
@@ -363,19 +414,27 @@ def _build_trades(recs, adds_index: dict) -> pd.DataFrame:
 def _build_ob_updates(recs, adds_index: dict) -> pd.DataFrame:
     """
     Order book update DataFrame: UA201 adds + UA202 cancels.
-    Populates adds_index for cross-chunk order ID resolution.
-    Fix 2: Side only 1/2; Fix 5: exec_inst captured.
+
+    Fix 9: cancel row's "price" is resolved from the referenced UA201 order
+           (via adds_index price cache) instead of trusting tag 31, which is
+           empirically 0.0000 on cancels and not spec-guaranteed meaningful.
+    Fix 10: exec_inst is structurally None for ORDER_ADD rows (UA201 has no
+            tag 18 per spec) — enforced explicitly here, not just inherited.
     """
     df = pd.DataFrame(recs)
     if df.empty:
         return df
+
+    # keep raw_last_px separate; do not use as final price for cancels
+    has_raw_px = "raw_last_px" in df.columns
+    if has_raw_px:
+        df["raw_last_px"] = pd.to_numeric(df["raw_last_px"], errors="coerce")
 
     for c in ("price", "qty"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     for c in ("appl_seq", "msg_seq", "buy_ref", "sell_ref"):
         df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
 
-    # Fix 7: channel as Int64
     df["channel"] = pd.to_numeric(df["channel"], errors="coerce").astype("Int64")
 
     df["transact_time"] = _to_utc(df["transact_time"])
@@ -383,45 +442,54 @@ def _build_ob_updates(recs, adds_index: dict) -> pd.DataFrame:
     df["capture_ts"]    = pd.to_datetime(df["capture_ts"], utc=True,
                                          format="mixed", errors="coerce")
 
-    # Fix 2: spec-compliant Side map (1=Buy, 2=Sell only)
-    df["side"] = df["side_code"].map(SIDE_MAP)
-
-    # Fix 1: map the two valid ExecType values only
+    df["side"]      = df["side_code"].map(SIDE_MAP)
     df["exec_type"] = df["exec_type_code"].map(EXECTYPE_MAP)
+    df["market"]    = df["segment"].map(TICK_SEGMENT_MAP)
 
-    # Fix 3: tick segment map
-    df["market"] = df["segment"].map(TICK_SEGMENT_MAP)
-
-    # populate adds_index from ORDER_ADD rows
     is_add = df["event"] == "ORDER_ADD"
-    for ch, sq, oid in zip(df.loc[is_add, "channel"],
-                            df.loc[is_add, "appl_seq"],
-                            df.loc[is_add, "order_id"]):
-        if pd.notna(sq) and pd.notna(ch):
-            adds_index[(int(ch), int(sq))] = oid
 
-    # for CANCEL rows: resolve order_id and infer side from resting ref
+    # Fix 10: enforce exec_inst is always null on ORDER_ADD rows
+    df.loc[is_add, "exec_inst"] = pd.NA
+
+    # populate adds_index with (order_id, price) so cancels can resolve both
+    for ch, sq, oid, px in zip(df.loc[is_add, "channel"],
+                                df.loc[is_add, "appl_seq"],
+                                df.loc[is_add, "order_id"],
+                                df.loc[is_add, "price"]):
+        if pd.notna(sq) and pd.notna(ch):
+            adds_index[(int(ch), int(sq))] = (oid, px)
+
     ref = df["buy_ref"].where(df["buy_ref"].fillna(0) > 0, df["sell_ref"])
     df["resting_ref"] = ref.where(ref.fillna(0) > 0).astype("Int64")
-    keys     = zip(df["channel"].astype("object"), df["resting_ref"].astype("float").fillna(-1).astype(int))
-    resolved = pd.Series([adds_index.get(k) for k in keys], index=df.index)
-    not_add  = ~is_add
-    df.loc[not_add, "order_id"] = resolved[not_add]
+    keys = list(zip(df["channel"].astype("object"),
+                    df["resting_ref"].astype("float").fillna(-1).astype(int)))
 
-    # Fix 2: infer side for CANCEL only from ref (1=buy resting, 2=sell resting)
+    resolved_oid = pd.Series(
+        [adds_index.get(k, (None, None))[0] for k in keys], index=df.index)
+    resolved_px = pd.Series(
+        [adds_index.get(k, (None, None))[1] for k in keys], index=df.index)
+
+    not_add = ~is_add
+    df.loc[not_add, "order_id"] = resolved_oid[not_add]
+
+    # Fix 9: overwrite cancel price with the resolved order price
+    is_cxl = df["event"] == "CANCEL"
+    df.loc[is_cxl, "price"] = resolved_px[is_cxl]
+
     cxl_side = np.where(df["buy_ref"].fillna(0)  > 0, "1",
                np.where(df["sell_ref"].fillna(0) > 0, "2", None))
-    is_cxl = df["event"] == "CANCEL"
     df.loc[is_cxl, "side_code"] = cxl_side[is_cxl]
     df.loc[is_cxl, "side"]      = df.loc[is_cxl, "side_code"].map(SIDE_MAP)
 
-    df = df[["transact_time", "sending_time", "capture_ts", "msg_seq",
-             "appl_seq", "channel", "segment", "market",
-             "event", "exec_type_code", "exec_type",
-             "exec_inst",                        # Fix 5
-             "symbol", "side_code", "side",
-             "price", "qty", "order_id",
-             "buy_ref", "sell_ref", "resting_ref"]]
+    cols = ["transact_time", "sending_time", "capture_ts", "msg_seq",
+            "appl_seq", "channel", "segment", "market",
+            "event", "exec_type_code", "exec_type", "exec_inst",
+            "symbol", "side_code", "side",
+            "price", "qty", "order_id",
+            "buy_ref", "sell_ref", "resting_ref"]
+    if has_raw_px:
+        cols.append("raw_last_px")   # kept for audit/QA of Fix 9
+    df = df[cols]
 
     for c in ("segment", "market", "event", "exec_type_code", "exec_type",
               "exec_inst", "symbol", "side_code", "side", "order_id"):
@@ -432,9 +500,14 @@ def _build_ob_updates(recs, adds_index: dict) -> pd.DataFrame:
 def _build_ob_snapshot(recs) -> pd.DataFrame:
     """
     Order book full-snapshot DataFrame from 35=W records.
-    Fix 3: use SNAPSHOT_SEGMENT_MAP.
-    Fix 6: xl entry type now resolves correctly via MDENTRY_MAP.
-    Fix 7: channel as Int64.
+
+    Fix 11: corrected MDENTRY_MAP applied.
+    Fix 12: xe sentinel (999999999.9999) -> px NULL; xf is NOT auto-nulled
+            (no universal sentinel — flagged via is_xf_tick_floor instead).
+    Fix 13: TradingPhaseCode decoded into phase / suspended_all_day /
+            break_reason.
+    Fix 14: level/order-count columns remain nullable for phase A rows
+            (already nullable by construction; documented here).
     """
     df = pd.DataFrame(recs)
     if df.empty:
@@ -446,7 +519,6 @@ def _build_ob_snapshot(recs) -> pd.DataFrame:
               "n_orders_at_level", "n_orders_detailed"):
         df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
 
-    # Fix 7
     df["channel"] = pd.to_numeric(df["channel"], errors="coerce").astype("Int64")
 
     df["snapshot_time"] = _to_utc(df["sending_time"])
@@ -454,11 +526,34 @@ def _build_ob_snapshot(recs) -> pd.DataFrame:
     df["capture_ts"]    = pd.to_datetime(df["capture_ts"], utc=True,
                                          format="mixed", errors="coerce")
 
-    # Fix 6: xl now in MDENTRY_MAP → resolves correctly
-    df["entry_type"] = df["entry_type_code"].map(MDENTRY_MAP)
+    df["entry_type"] = df["entry_type_code"].map(MDENTRY_MAP)   # Fix 11
+    df["market"]     = df["segment"].map(SNAPSHOT_SEGMENT_MAP)
 
-    # Fix 3: snapshot segment map
-    df["market"] = df["segment"].map(SNAPSHOT_SEGMENT_MAP)
+    # Fix 12: xe no-limit sentinel -> NULL. xf intentionally left untouched;
+    # instead flag rows where px looks like a tick-size floor (heuristic:
+    # px <= 1.0 for xf entries) so downstream users can decide per market.
+    is_xe = df["entry_type_code"] == "xe"
+    df.loc[is_xe & (df["px"] == XE_NO_LIMIT_SENTINEL), "px"] = np.nan
+
+    is_xf = df["entry_type_code"] == "xf"
+    df["is_xf_tick_floor"] = pd.NA
+    df.loc[is_xf, "is_xf_tick_floor"] = df.loc[is_xf, "px"] <= 1.0
+
+    # Fix 13: decode TradingPhaseCode(8538) -> phase / suspended / break
+    ts = df["trading_status"].astype(str)
+    phase_char     = ts.str.slice(0, 1)
+    suspended_char = ts.str.slice(1, 2)
+    break_char     = ts.str.slice(2, 3)
+
+    df["phase"]             = phase_char.map(PHASE_MAP).astype("string")
+    df["suspended_all_day"] = suspended_char.map({"1": True, "0": False})
+    df["break_reason"]      = np.where(
+        phase_char == "B", break_char.map(BREAK_REASON_MAP), None)
+    df["break_reason"] = df["break_reason"].astype("string")
+
+    # Fix 14: level/order-count columns already Int64 (nullable) — after-hour
+    # (phase A) rows will naturally carry <NA> since spec releases only
+    # 269/270/271 in that phase and the source message omits 1023/346/73.
 
     df["visible_qty_sum"] = df["order_qtys"].map(
         lambda q: float(np.sum([float(x) for x in q]))
@@ -470,12 +565,14 @@ def _build_ob_snapshot(recs) -> pd.DataFrame:
 
     df = df[["snapshot_time", "orig_time", "capture_ts", "msg_seq",
              "channel", "segment", "market",
-             "symbol", "trading_status",
+             "symbol", "trading_status", "phase",
+             "suspended_all_day", "break_reason",
              "prev_close", "num_trades", "cum_volume", "cum_value",
              "entry_type_code", "entry_type",
              "level", "px", "qty",
              "n_orders_at_level", "n_orders_detailed",
-             "order_ids", "order_qtys", "visible_qty_sum"]]
+             "order_ids", "order_qtys", "visible_qty_sum",
+             "is_xf_tick_floor"]]
 
     for c in ("segment", "market", "symbol", "trading_status",
               "entry_type_code", "entry_type", "order_ids", "order_qtys"):
@@ -485,37 +582,44 @@ def _build_ob_snapshot(recs) -> pd.DataFrame:
 
 def _build_other(recs) -> pd.DataFrame:
     """
-    Other messages: UA001 heartbeats, h session status, B news,
-    UA002 retransmit, UA004 stats (Fix 4: orig_time + n_streams added),
+    Other messages: UA001 heartbeats (Fix 15: fields promoted),
+    h session status, B news, UA002 retransmit, UA004 stats,
     j business reject, f security status.
     """
     df = pd.DataFrame(recs)
     if df.empty:
         return df
 
-    df["msg_seq"]    = pd.to_numeric(df["msg_seq"], errors="coerce").astype("Int64")
+    df["msg_seq"] = pd.to_numeric(df["msg_seq"], errors="coerce").astype("Int64")
+    df["channel"] = pd.to_numeric(df["channel"], errors="coerce").astype("Int64")
 
-    # Fix 7
-    df["channel"]    = pd.to_numeric(df["channel"], errors="coerce").astype("Int64")
+    df["capture_ts"]   = pd.to_datetime(df["capture_ts"], utc=True,
+                                        format="mixed", errors="coerce")
+    df["sending_time"] = _to_utc(df["sending_time"])
 
-    df["capture_ts"] = pd.to_datetime(df["capture_ts"], utc=True,
-                                      format="mixed", errors="coerce")
-    df["sending_time"]= _to_utc(df["sending_time"])
-
-    # Fix 4: orig_time and n_streams present only for UA004 rows; others → NaT / NA
     if "orig_time" not in df.columns:
         df["orig_time"] = pd.NaT
     else:
-        df["orig_time"] = _to_utc(df["orig_time"].astype(str))
+        df["orig_time"] = _to_utc(df["orig_time"])
 
     if "n_streams" not in df.columns:
         df["n_streams"] = pd.NA
-
     df["n_streams"] = pd.to_numeric(df["n_streams"], errors="coerce").astype("Int64")
+
+    # Fix 15: UA001 heartbeat fields
+    for col in ("appl_last_seq", "end_of_channel", "heartbeat_time"):
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    df["appl_last_seq"]  = pd.to_numeric(df["appl_last_seq"], errors="coerce").astype("Int64")
+    df["end_of_channel"] = pd.to_numeric(df["end_of_channel"], errors="coerce").astype("Int64")
+    df["heartbeat_time"] = _to_utc(df["heartbeat_time"])
 
     df = df[["capture_ts", "sending_time", "orig_time",
              "msg_seq", "msg_type", "channel", "segment",
-             "n_streams", "raw"]]
+             "n_streams",
+             "appl_last_seq", "end_of_channel", "heartbeat_time",
+             "raw"]]
 
     for c in ("msg_type", "segment", "raw"):
         df[c] = df[c].astype("string")
@@ -567,7 +671,8 @@ def run_day(src=SRC, out_dir=OUT_DIR, chunk_lines=CHUNK_LINES):
     labels = ("trades", "ob_updates", "ob_snapshot", "other")
     totals = dict.fromkeys(labels, 0)
 
-    adds_index = {}    # {(channel_int, appl_seq_int) -> order_id_str}
+    # adds_index now stores (order_id, price) tuples — needed for Fix 9
+    adds_index = {}
     n_chunk    = 0
     n_lines    = 0
     t0         = time.time()
@@ -602,7 +707,6 @@ def run_day(src=SRC, out_dir=OUT_DIR, chunk_lines=CHUNK_LINES):
     print(f"\nPass 1 done: {n_chunk} chunks, {n_lines:,} lines.", flush=True)
     print(f"Row totals  : {totals}", flush=True)
 
-    # ── merge partials → 4 final Parquets, delete partials ───────────────
     print("\nMerging partials …", flush=True)
     for label in labels:
         parts = sorted(out_dir.glob(f"_part_{label}_*.parquet"))
@@ -644,3 +748,4 @@ if __name__ == "__main__":
     # To process all 5 days in one go, replace the line above with:
     # for f in sorted(SRC.parent.glob("*.tar.gz")):
     #     run_day(src=f)
+
