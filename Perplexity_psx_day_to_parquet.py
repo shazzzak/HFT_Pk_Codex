@@ -50,6 +50,8 @@ import pyarrow.parquet as pq
 
 # ─────────────────────────── configuration ───────────────────────────────────
 SRC         = Path(r"C:\Users\shahz\OneDrive\Desktop\Del\Capital Stake\2026-06-30.tar.gz")
+SRC         = Path(r"C:\Users\shahz\Desktop\del\Capital Stake\2026-06-30.tar.gz")
+
 OUT_DIR     = SRC.parent / "parsed" / SRC.name.replace(".tar.gz", "")
 CHUNK_LINES = 250_000      # lines per batch; lower to 100_000 if RAM is tight
 
@@ -426,9 +428,12 @@ def _build_ob_updates(recs, adds_index: dict) -> pd.DataFrame:
         return df
 
     # keep raw_last_px separate; do not use as final price for cancels
-    has_raw_px = "raw_last_px" in df.columns
-    if has_raw_px:
-        df["raw_last_px"] = pd.to_numeric(df["raw_last_px"], errors="coerce")
+    # ALWAYS create this column (even if this chunk has zero cancels) so
+    # every ob_updates chunk has an identical schema for the Parquet merge.
+    if "raw_last_px" not in df.columns:
+        df["raw_last_px"] = np.nan
+    df["raw_last_px"] = pd.to_numeric(df["raw_last_px"], errors="coerce")
+    has_raw_px = True
 
     for c in ("price", "qty"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -486,9 +491,8 @@ def _build_ob_updates(recs, adds_index: dict) -> pd.DataFrame:
             "event", "exec_type_code", "exec_type", "exec_inst",
             "symbol", "side_code", "side",
             "price", "qty", "order_id",
-            "buy_ref", "sell_ref", "resting_ref"]
-    if has_raw_px:
-        cols.append("raw_last_px")   # kept for audit/QA of Fix 9
+            "buy_ref", "sell_ref", "resting_ref",
+            "raw_last_px"]   # kept for audit/QA of Fix 9; always present
     df = df[cols]
 
     for c in ("segment", "market", "event", "exec_type_code", "exec_type",
@@ -713,20 +717,35 @@ def run_day(src=SRC, out_dir=OUT_DIR, chunk_lines=CHUNK_LINES):
         if not parts:
             print(f"  {label}: no data — skipped")
             continue
-        final  = out_dir / f"{day}_{label}.parquet"
+        final = out_dir / f"{day}_{label}.parquet"
+
+        # Schema-tolerant merge: union all part schemas first (promote_options
+        # handles missing/added columns and mismatched nullability across
+        # chunks), then re-write every part's batches against that unified
+        # schema. This prevents ValueError crashes if any chunk had a column
+        # a neighboring chunk lacked (e.g. an all-adds chunk with no cancels).
+        schemas = [pq.ParquetFile(p).schema_arrow for p in parts]
+        try:
+            unified = pa.unify_schemas(schemas, promote_options="permissive")
+        except TypeError:
+            # older pyarrow without promote_options kwarg
+            unified = pa.unify_schemas(schemas)
+
         writer = None
         for p in parts:
             pf = pq.ParquetFile(p)
             try:
                 for batch in pf.iter_batches(batch_size=131_072):
+                    tbl = pa.Table.from_batches([batch]).cast(unified)
                     if writer is None:
-                        writer = pq.ParquetWriter(final, batch.schema,
+                        writer = pq.ParquetWriter(final, unified,
                                                   compression="zstd")
-                    writer.write_batch(batch)
+                    writer.write_table(tbl)
             finally:
                 pf.close()
         if writer:
             writer.close()
+
         for p in parts:
             try:
                 p.unlink()
