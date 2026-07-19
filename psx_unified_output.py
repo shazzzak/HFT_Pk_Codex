@@ -52,7 +52,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 # ─────────────────────────── configuration ───────────────────────────────────
-SRC         = Path(r"C:\Users\shahz\Desktop\del\Capital Stake\2026-06-30.tar.gz")
+SRC         = Path(r"C:\Users\shahz\OneDrive\Desktop\Del\Capital Stake\2026-06-30.tar.gz")
 OUT_DIR     = SRC.parent / "parsed_unified" / SRC.name.replace(".tar.gz", "")
 CHUNK_LINES = 250_000      # lines per batch; lower to 100_000 if RAM is tight
 
