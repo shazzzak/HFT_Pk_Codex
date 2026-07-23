@@ -213,26 +213,35 @@ class Book:
     def snapshot(self, rows):
         """Apply one exchange snapshot (35=W message): FULL replacement.
 
-        `rows` = all BID/OFFER rows sharing one msg_seq — up to 10 levels
-        per side, each row carrying pipe-separated parallel lists of the
-        disclosed orders at that level ("ID1|ID2" / "500|1200").
+            `rows` = ALL rows sharing one msg_seq, including BID/OFFER book
+            levels AND the AGG_BID/AGG_OFFER aggregate rows. The method filters
+            to BID/OFFER for the visible book (up to ~10 levels per side, each
+            row carrying pipe-separated parallel lists of disclosed orders,
+            "ID1|ID2" / "500|1200") and separately reads the AGG rows for L11.
 
-        Build the target book from scratch, then `self.o = tgt` in one
-        assignment = add-missing / remove-stale / correct-every-qty at once.
-        All prior incremental state is deliberately forgotten.
+            Build the target book from scratch, then `self.o = tgt` in one
+            assignment = add-missing / remove-stale / correct-every-qty at once.
+            All prior incremental state (and all synthetic lumps) is
+            deliberately forgotten, so lumps reset every snapshot.
 
-        Undisclosed depth: a level's total qty can exceed the sum of its
-        disclosed orders (hidden/undisclosed orders). The residual is
-        parked in a synthetic order keyed "__H_{side}_{price}" so that
-        depth totals stay correct; the deterministic key means successive
-        snapshots overwrite rather than accumulate.
+            Undisclosed depth WITHIN a visible level: a level's total qty can
+            exceed the sum of its disclosed orders. The residual is parked in a
+            synthetic order keyed "__H_{side}_{price}" so depth totals stay
+            correct; the deterministic key means successive snapshots overwrite
+            rather than accumulate.
 
-        Cost of this design (flagged in the header): the snapshot is
-        truncated to 10 levels/side, so real liquidity deeper than that is
-        erased on every snapshot and only reappears if price moves it into
-        the window. Irrelevant for touch-level quoting; fatal only for
-        full-depth signals, which this feed cannot support anyway.
-        """
+            Deep book BEYOND the visible levels (L11): the feed transmits only
+            the top ~10 price levels per side, but AGG_BID/AGG_OFFER give the
+            WHOLE-side total. The portion not covered by the visible levels
+            (total - sum(visible)) is parked as a "__AGG_{side}" lump one tick
+            past the worst visible level. This preserves whole-book depth for
+            obi(include_deep=True) without affecting bbo() or touch-level
+            quoting. The lump has no per-level detail — the feed doesn't provide
+            it — so it is a single aggregate, correct in total but opaque in
+            composition, and refreshed each snapshot. Zero/absent residual
+            (common pre-open, when the side fits in the window) -> no lump.
+            """
+        
         rows_all = rows  # full msg incl AGG_*
         rows = rows[rows.entry_type.isin(["BID", "OFFER"])]  # visible levels
 
