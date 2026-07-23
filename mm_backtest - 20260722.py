@@ -111,6 +111,16 @@ class Book:
     they are derived on demand (bbo, qty_at). Keeping order-level state is
     what makes exact queue-position tracking possible later.
 
+    The comment is saying: we store every order separately by its ID (not lumped together by price)
+     and recompute price totals whenever we need them — and we accept that recompute cost on purpose,
+     because keeping orders individually distinguishable is the only way to know exactly where our
+     own order sits in the fill queue.
+
+    That trade-off — spend a little CPU re-summing levels, gain exact queue tracking — is a
+    deliberate design choice that pays off precisely because you have order-level PSX data
+    (with individual order IDs) rather than the level-aggregated feed most markets provide.
+
+
     Reconciliation model (validated earlier in this project: 97.9% of
     trades print inside the reconstructed pre-trade touch):
       * incremental adds/cancels/trades mutate the dict between snapshots;
@@ -121,6 +131,8 @@ class Book:
 
     def __init__(self):
         self.o: dict[str, Order] = {}
+        self.b2_hits = 0       # branch-2 decrements applied (audit counter)
+        self.b2_ignored = 0    # cancels with unknown id AND no matching hidden level
 
     # ---- incremental path: ob_updates rows ----
     def add(self, r):
@@ -129,11 +141,35 @@ class Book:
             self.o[str(r.order_id)] = Order(r.side, float(r.price), float(r.qty))
 
     def cancel(self, r):
-        """CANCEL: remove the order. pop(default=None) silently tolerates
-        cancels for ids we never saw — those orders were resting before the
-        capture window began (150 such rows on the sample day); the next
-        snapshot reconciliation squares everything anyway."""
-        self.o.pop(str(r.order_id), None)
+        """Two-branch cancel, in priority order:
+
+        BRANCH 1 — order_id found in the book: remove it exactly.
+          The cancel's price field is IGNORED (it is wrong ~44% of the
+          time; the id is authoritative). Handles 98.5% of cancels.
+
+        BRANCH 2 — id unknown (pre-capture order or wiped by a snapshot
+          replacement): if the cancel's (side, price) matches a HIDDEN
+          lump ("__H_" synthetic order from undisclosed deep-level qty),
+          decrement it: new_qty = qty - min(cancel_qty, qty), floor 0.
+          Only hidden lumps are eligible — disclosed orders are never
+          touched by price. Counted in b2_hits for auditing.
+
+        Neither matches -> no-op (b2_ignored); next snapshot reconciles.
+        """
+        oid = str(r.order_id)
+        if oid in self.o:  # BRANCH 1
+            del self.o[oid]
+            return
+        if pd.notna(r.price) and pd.notna(r.side):  # BRANCH 2
+            px = float(r.price)
+            for k, o in self.o.items():
+                if k.startswith("__H_") and o.side == r.side and o.price == px:
+                    o.qty -= min(float(r.qty), o.qty)
+                    if o.qty <= 0:
+                        del self.o[k]
+                    self.b2_hits += 1
+                    return
+        self.b2_ignored += 1
 
     # ---- trades consume resting liquidity ----
     def trade(self, r):
@@ -145,11 +181,17 @@ class Book:
         Two paths:
           exact    — the trade row identifies the resting order id
                      (r.rest_oid, pre-parsed in load_events): decrement it.
-          fallback — id unknown (~2/3 of trades on the sample day):
-                     consume qty at the trade price on the PASSIVE side
-                     (opposite of the aggressor). Which specific orders get
-                     decremented is arbitrary, but the LEVEL total — the
-                     thing best-bid/ask accuracy depends on — is exact.
+          fallback — id unknown (~2/3 of trades on the sample day): DON'T
+                     guess which resting order was hit. Instead park the
+                     traded qty as a signed "__NEG_{side}_{price}"
+                     placeholder that SUBTRACTS from that level's net total.
+                     This keeps the level aggregate exact for bbo/qty_at/obi
+                     (which net by price and clamp at 0) while leaving the
+                     real orders intact — so if one is later cancelled or
+                     traded by id, branch 1 removes it cleanly with no
+                     double-count. Placeholders are wiped at the next
+                     snapshot (full replacement), bounding any residual
+                     error to one snapshot interval at deep levels.
         """
         oid = r.rest_oid
         if oid and oid in self.o:                          # exact path
@@ -160,14 +202,12 @@ class Book:
         passive = {"BUY": "SELL", "SELL": "BUY"}.get(r.aggressor_side)
         if passive is None:                                # AUCTION print:
             return                                         # snapshot reconciles it
-        rem = float(r.qty)                                 # fallback path
-        for k, o in list(self.o.items()):                  # list(): safe deletion
-            if o.side == passive and o.price == float(r.price):
-                take = min(o.qty, rem); o.qty -= take; rem -= take
-                if o.qty <= 0:
-                    del self.o[k]
-                if rem <= 0:
-                    break
+        px = float(r.price)  # fallback path:
+        key = f"__NEG_{passive}_{px}"  # signed placeholder
+        if key in self.o:
+            self.o[key].qty -= float(r.qty)
+        else:
+            self.o[key] = Order(passive, px, -float(r.qty))
 
     # ---- snapshots replace the whole book ----
     def snapshot(self, rows):
@@ -193,6 +233,9 @@ class Book:
         the window. Irrelevant for touch-level quoting; fatal only for
         full-depth signals, which this feed cannot support anyway.
         """
+        rows_all = rows  # full msg incl AGG_*
+        rows = rows[rows.entry_type.isin(["BID", "OFFER"])]  # visible levels
+
         tgt = {}
         for r in rows.itertuples():
             side = "BUY" if r.entry_type == "BID" else "SELL"
@@ -202,29 +245,47 @@ class Book:
                     tgt[oid] = Order(side, px, float(q)); disc += float(q)
             if float(r.qty) - disc > 0:                    # hidden residual
                 tgt[f"__H_{side}_{px}"] = Order(side, px, float(r.qty) - disc)
+
+        # L11: deep residual beyond the visible 10 levels. AGG_BID/AGG_OFFER
+        # carry the WHOLE-side total; the part not covered by L1-10 is parked
+        # as a "__AGG_" lump one tick past the worst visible level so bbo()
+        # never sees it. Zero/missing residual (pre-open) -> no lump.
+        # Resets each snapshot via the full replacement below.
+        for side, agg_type in (("BUY", "AGG_BID"), ("SELL", "AGG_OFFER")):
+            arow = rows_all[rows_all.entry_type == agg_type]
+            if len(arow) == 0:
+                continue
+            agg_qty = float(arow["qty"].iloc[0])
+            visible = sum(o.qty for o in tgt.values() if o.side == side and o.qty > 0)
+            residual = agg_qty - visible  # L11 = AGG - sum(L1-10)
+            if residual > 0:
+                prices = [o.price for o in tgt.values() if o.side == side]
+                if prices:
+                    edge = (min(prices) - TICK) if side == "BUY" else (max(prices) + TICK)
+                    tgt[f"__AGG_{side}"] = Order(side, edge, residual)
+
         self.o = tgt
 
     # ---- derived views ----
     def bbo(self):
         """Best bid/offer with total qty at each: (bb, bq, ba, aq).
 
-        One O(n) pass over all resting orders, tracking the running best
-        price per side and summing qty at that best. Returns (None, 0,
-        None, 0) components when a side is empty (pre-open, post-close).
+        Aggregates qty per price level across all entries — real orders,
+        hidden "__H_" lumps, and signed "__NEG_" placeholders (which
+        subtract already-traded unidentified qty). Levels whose net qty
+        is <= 0 are treated as empty: a fully netted-out level cannot be
+        the best price. Returns (None, 0.0, None, 0.0) components when a
+        side has no positive level (pre-open, post-close).
         """
-        bb = ba = None; bq = aq = 0.0
-        for o in self.o.values():
-            if o.side == "BUY":
-                if bb is None or o.price > bb:             # new best bid:
-                    bb, bq = o.price, o.qty                #   reset the sum
-                elif o.price == bb:
-                    bq += o.qty                            # same level: accumulate
-            else:
-                if ba is None or o.price < ba:             # new best ask
-                    ba, aq = o.price, o.qty
-                elif o.price == ba:
-                    aq += o.qty
-        return bb, bq, ba, aq
+        bids, asks = {}, {}
+        for o in self.o.values():  # net qty per level
+            d = bids if o.side == "BUY" else asks  # (__NEG_ subtracts)
+            d[o.price] = d.get(o.price, 0.0) + o.qty
+        bids = {p: q for p, q in bids.items() if q > 0}  # clamp: fully netted
+        asks = {p: q for p, q in asks.items() if q > 0}  # level is GONE
+        bb = max(bids) if bids else None
+        ba = min(asks) if asks else None
+        return bb, (bids[bb] if bb else 0.0), ba, (asks[ba] if ba else 0.0)
 
     def qty_at(self, side, price):
         """All resting orders at one (side, price): {order_id: qty}.
@@ -234,9 +295,42 @@ class Book:
         price-time priority. Includes synthetic "__H_" hidden entries,
         which is correct: hidden qty is genuinely ahead of us too.
         """
-        return {k: o.qty for k, o in self.o.items()
-                if o.side == side and o.price == price}
+        d = {k: o.qty for k, o in self.o.items()
+             if o.side == side and o.price == price and not k.startswith("__NEG_")}
+        neg = sum(o.qty for k, o in self.o.items()
+                  if k.startswith("__NEG_") and o.side == side and o.price == price)
+        if neg < 0:  # shrink our queue by
+            for k in list(d):  # the already-traded qty
+                if neg >= 0:
+                    break
+                take = min(d[k], -neg);
+                d[k] -= take;
+                neg += take
+                if d[k] <= 0:
+                    del d[k]
+        return d
 
+    def obi(self, n=None, include_deep=False):
+        """Order book imbalance (Qbid - Qask)/(Qbid + Qask) over the top
+        n price levels per side (n=None -> all levels).
+
+        Use obi(5) as the event-accurate signal (levels 1-5 are ~99%
+        id-disclosed, exact tick by tick). Use obi(None) as the deep
+        signal — snapshot-accurate, patched between snapshots by
+        branch-2 cancels; treat it as the noisier of the two.
+        Returns None when the book is empty.
+        """
+        bids, asks = {}, {}
+        for k, o in self.o.items():
+            if k.startswith("__AGG_") and not include_deep:
+                continue  # skip deep residual
+            d = bids if o.side == "BUY" else asks
+            d[o.price] = d.get(o.price, 0.0) + o.qty
+        bids = {p: q for p, q in bids.items() if q > 0}  # clamp netted levels
+        asks = {p: q for p, q in asks.items() if q > 0}
+        bq = sum(q for _, q in sorted(bids.items(), reverse=True)[:n]) if bids else 0.0
+        aq = sum(q for _, q in sorted(asks.items())[:n]) if asks else 0.0
+        return (bq - aq) / (bq + aq) if bq + aq > 0 else None
 
 @dataclass
 class MyOrder:
@@ -594,7 +688,9 @@ class Backtester:
                 mid = (bb + ba) / 2
                 self.equity.append({"t": ts_exch, "mid": mid,
                                     "equity": self.cash + self.pos * mid,
-                                    "pos": self.pos})
+                                    "pos": self.pos,
+                                    "obi_5": self.book.obi(5),
+                                    "obi_deep": self.book.obi(None)})
             know = max(know, int(obj.ts_cap))                   # (5)
             if t0 <= ts_exch <= t1:
                 self._requote(know)
@@ -696,9 +792,9 @@ def load_events(u_path, s_path, t_path):
     t["rest_oid"] = t["resting_order_id"].map(
         lambda x: ast.literal_eval(x)[0] if isinstance(x, str) and x.startswith("(") else None)
 
-    sb = s[s.entry_type.isin(["BID", "OFFER"])]        # book levels only —
-    #   circuit breakers, session stats etc. are not book content
-    snap_groups = dict(tuple(sb.groupby("msg_seq")))   # one 35=W msg = one event
+    sb = s[s.entry_type.isin(["BID", "OFFER"])]  # book levels (for timing)
+    snap_groups = dict(tuple(s.groupby("msg_seq")))  # FULL msg incl AGG_* rows
+    #   snapshot() itself filters to BID/OFFER and reads AGG_BID/AGG_OFFER
     snap_ev = sb.groupby("msg_seq", as_index=False)[["ts_exch", "ts_cap"]].min()
 
     events = [(r.ts_exch, 1, r.appl_seq, "U", r) for r in u.itertuples()]
