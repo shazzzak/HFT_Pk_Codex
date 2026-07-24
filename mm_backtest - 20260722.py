@@ -78,22 +78,31 @@ import pandas as pd
 # increment across ~500 distinct prices in updates/trades/snapshots = 0.01).
 TICK = 0.01
 
-# ---- FEES (edit as you confirm the real schedule) --------------------------
-# Charged PER SIDE per fill. Percentage fees apply to traded VALUE (price*qty);
-# flat fees per share. Total per-side cost = sum of all components.
-# FLAGGED SIMPLIFICATION: 0.15% is broker commission ONLY. Production must add
-# SECP, PSX transaction fee, CDC/NCCPL, CGT, and any MM-program rebate
-# (which may be NEGATIVE). Fill these in as confirmed.
-FEE_COMMISSION_PCT = 0.0015   # 0.15% broker commission (of traded value)
-FEE_SECP_PCT       = 0.0      # TODO confirm
-FEE_PSX_PCT        = 0.0      # TODO confirm
-FEE_OTHER_PCT      = 0.0      # CDC/NCCPL/etc -- TODO confirm
-FEE_PER_SHARE_FLAT = 0.0      # any flat per-share cost -- TODO confirm
-FEE_MM_REBATE_PCT  = 0.0      # MM-program rebate (of value); ENTER AS NEGATIVE
+# ---- FEES: PSX schedule, charged PER SIDE on traded VALUE (price*qty) ------
+# Source: PSX "PKR per 100,000" schedule converted to decimals.
+FEE_COMMISSION_PCT = 0.0015      # broker commission 0.15% -- REPLACE with your
+                                 #   negotiated HFT rate; this drives everything
+FEE_SST_RATE       = 0.13        # sales tax ON THE COMMISSION (not on value):
+                                 #   13% Sindh (SST) / 16% Punjab (PRA)
+                                 #   -- TODO confirm your BROKER's province
+FEE_PSX_LAGA_PCT   = 0.000035    # PSX trading fee: PKR 3.50 / 100,000 = 0.0035%
+FEE_SECP_PCT       = 0.0000065   # SECP supervisory: PKR 0.65 / 100,000
+FEE_IPF_PCT        = 0.0000062   # PSX regulatory (IPF): PKR 0.62084 / 100,000
+                                 #   was scheduled to end Aug 2025 -- kept in as
+                                 #   the conservative default; zero it once you
+                                 #   confirm it is discontinued
+FEE_CLEARING_PCT   = 0.00003     # NCCPL + CDC, ~0.003-0.005% per leg.
+                                 #   FLAGGED ASSUMPTION: intraday-squared MM ->
+                                 #   CDC delivery waived, NCCPL only -> low end
+                                 #   0.003%. Positions held OVERNIGHT pay CDC
+                                 #   delivery too; not modeled per-fill here.
+FEE_PER_SHARE_FLAT = 0.0         # no flat per-share components in this schedule
+FEE_MM_REBATE_PCT  = 0.0         # MM-program rebate; enter NEGATIVE when known
+# CVT / WHT on turnover: abolished -> intentionally absent.
 
-
-FEE_TOTAL_PCT = (FEE_COMMISSION_PCT + FEE_SECP_PCT + FEE_PSX_PCT
-                 + FEE_OTHER_PCT + FEE_MM_REBATE_PCT)   # per-side % of value
+FEE_TOTAL_PCT = (FEE_COMMISSION_PCT * (1.0 + FEE_SST_RATE)   # commission + tax ON it
+                 + FEE_PSX_LAGA_PCT + FEE_SECP_PCT + FEE_IPF_PCT
+                 + FEE_CLEARING_PCT + FEE_MM_REBATE_PCT)
 
 def fee_for(price, qty):
     """All-in per-side fee for a fill of `qty` shares at `price`."""
@@ -393,6 +402,7 @@ class MyOrder:
     ahead: dict
     t_active: int
     cancel_at: int = None
+    oid: int = 0       # unique id: cancels target THIS order, not just the side
 
 class LatencyModel:
     """Stochastic, two-leg latency (production model).
@@ -483,12 +493,16 @@ class Backtester:
                                     wire_in_tail_ms=0.0, tail_prob=0.0)
         self.book = Book()
         self.work: dict[str, MyOrder] = {}
+        self._oid = 0  # unique id generator for our orders
+        self.ack_until = {"BUY": 0, "SELL": 0}  # side unconfirmed until this ms
+        self.use_ack = 'latency_model' in cfg  # ack realism only in stochastic mode
         self.pending = []
         self._seq = 0
         self.pos = 0.0
         self.cash = 0.0
         self.fills, self.equity = [], []
-        self.stats = {"rejected_crossing": 0, "n_orders_sent": 0, "n_cancels": 0}
+        self.stats = {"rejected_crossing": 0, "n_orders_sent": 0, "n_cancels": 0,
+                      "stale_cancels_ignored": 0, "requotes_blocked_by_ack": 0}
 
     # ================= our-order plumbing (EXCHANGE side) =================
     def _push(self, t, action, payload):
@@ -514,11 +528,14 @@ class Backtester:
             t, _, action, p = heapq.heappop(self.pending)
             if action == "ARRIVE":
                 self._arrive(t, p)
-            elif action == "CANCEL":
-                o = self.work.get(p)
-                if o is not None:
-                    self.work.pop(p, None)
+                elif action == "CANCEL":
+                side, oid = p  # cancel targets a SPECIFIC order
+                o = self.work.get(side)
+                if o is not None and o.oid == oid:  # still the same order -> remove
+                    self.work.pop(side, None)
                     self.stats["n_cancels"] += 1
+                else:  # already filled or replaced:
+                    self.stats["stale_cancels_ignored"] += 1  # exchange cancel-reject
 
     def _arrive(self, t, o: MyOrder):
         """Our new order reaches the exchange. Two things happen:
@@ -716,6 +733,13 @@ class Backtester:
         bb, bq, ba, aq = self.book.bbo()
         want = self.strat.quotes(bb, bq, ba, aq, self.pos)
         for side in ("BUY", "SELL"):
+            # ACK GUARD (stochastic mode only): while this side's last cancel is
+            # unconfirmed (sent, ack not back), don't stack another cancel/replace
+            # on it -- a real risk system treats the old order as possibly-live
+            # until acked. The original cancel+replace pair is unaffected.
+            if self.use_ack and ts_know < self.ack_until[side]:
+                self.stats["requotes_blocked_by_ack"] += 1
+                continue
             w = want.get(side)
             cur = self.work.get(side)
             same = cur is not None and w is not None and \
@@ -725,13 +749,16 @@ class Backtester:
             if cur is not None and cur.cancel_at is None:
                 a_out = self.lat.draw_out()  # independent cancel-send draw
                 cur.cancel_at = ts_know + a_out  # exchange stops matching here
-                self._push(cur.cancel_at, "CANCEL", side)
+                self._push(cur.cancel_at, "CANCEL", (side, cur.oid))
+                if self.use_ack:  # confirmed only after ack
+                    self.ack_until[side] = cur.cancel_at + self.lat.draw_ack()
             if w is not None:
                 self.stats["n_orders_sent"] += 1
                 a_out = self.lat.draw_out()  # independent new-order draw
                 t_land = ts_know + a_out
+                self._oid += 1
                 self._push(t_land, "ARRIVE",
-                           MyOrder(side, w[0], w[1], {}, t_land))
+                           MyOrder(side, w[0], w[1], {}, t_land, oid=self._oid))
 
     # ============================ main loop ================================
     def run(self, events, snap_groups):
