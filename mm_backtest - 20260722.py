@@ -78,6 +78,27 @@ import pandas as pd
 # increment across ~500 distinct prices in updates/trades/snapshots = 0.01).
 TICK = 0.01
 
+# ---- FEES (edit as you confirm the real schedule) --------------------------
+# Charged PER SIDE per fill. Percentage fees apply to traded VALUE (price*qty);
+# flat fees per share. Total per-side cost = sum of all components.
+# FLAGGED SIMPLIFICATION: 0.15% is broker commission ONLY. Production must add
+# SECP, PSX transaction fee, CDC/NCCPL, CGT, and any MM-program rebate
+# (which may be NEGATIVE). Fill these in as confirmed.
+FEE_COMMISSION_PCT = 0.0015   # 0.15% broker commission (of traded value)
+FEE_SECP_PCT       = 0.0      # TODO confirm
+FEE_PSX_PCT        = 0.0      # TODO confirm
+FEE_OTHER_PCT      = 0.0      # CDC/NCCPL/etc -- TODO confirm
+FEE_PER_SHARE_FLAT = 0.0      # any flat per-share cost -- TODO confirm
+FEE_MM_REBATE_PCT  = 0.0      # MM-program rebate (of value); ENTER AS NEGATIVE
+
+
+FEE_TOTAL_PCT = (FEE_COMMISSION_PCT + FEE_SECP_PCT + FEE_PSX_PCT
+                 + FEE_OTHER_PCT + FEE_MM_REBATE_PCT)   # per-side % of value
+
+def fee_for(price, qty):
+    """All-in per-side fee for a fill of `qty` shares at `price`."""
+    return FEE_TOTAL_PCT * price * qty + FEE_PER_SHARE_FLAT * qty
+
 
 def round_tick(p, side):
     """Snap a computed price onto the exchange tick grid, SAFELY.
@@ -241,7 +262,7 @@ class Book:
             composition, and refreshed each snapshot. Zero/absent residual
             (common pre-open, when the side fits in the window) -> no lump.
             """
-        
+
         rows_all = rows  # full msg incl AGG_*
         rows = rows[rows.entry_type.isin(["BID", "OFFER"])]  # visible levels
 
@@ -277,7 +298,13 @@ class Book:
 
     # ---- derived views ----
     def bbo(self):
-        """Best bid/offer with total qty at each: (bb, bq, ba, aq).
+        """Best bid and best offer, each with its total quantity.
+
+        Returns four values as (bb, bq, ba, aq):
+          bb = best bid price   (highest price a buyer will pay)
+          bq = total qty resting at that bid price
+          ba = best offer price (lowest price a seller will accept)
+          aq = total qty resting at that offer price
 
         Aggregates qty per price level across all entries — real orders,
         hidden "__H_" lumps, and signed "__NEG_" placeholders (which
@@ -288,8 +315,8 @@ class Book:
         """
         bids, asks = {}, {}
         for o in self.o.values():  # net qty per level
-            d = bids if o.side == "BUY" else asks  # (__NEG_ subtracts)
-            d[o.price] = d.get(o.price, 0.0) + o.qty
+            d = bids if o.side == "BUY" else asks
+            d[o.price] = d.get(o.price, 0.0) + o.qty  # __NEG_ has negative qty -> subtracts
         bids = {p: q for p, q in bids.items() if q > 0}  # clamp: fully netted
         asks = {p: q for p, q in asks.items() if q > 0}  # level is GONE
         bb = max(bids) if bids else None
@@ -328,9 +355,13 @@ class Book:
         signal — snapshot-accurate, patched between snapshots by
         branch-2 cancels; treat it as the noisier of the two.
         Returns None when the book is empty.
+
+        So you actually have three distinct signals from this one function:
+        obi(5) (near touch, cleanest), obi(None) (all visible levels), and
+        obi(include_deep=True) (whole book including the deep aggregate).
         """
         bids, asks = {}, {}
-        for k, o in self.o.items():
+        for k, o in self.o.items(): # Walk every entry in the book. k is the order ID (the dict key), o is the Order (side, price, qty).
             if k.startswith("__AGG_") and not include_deep:
                 continue  # skip deep residual
             d = bids if o.side == "BUY" else asks
@@ -362,6 +393,46 @@ class MyOrder:
     ahead: dict
     t_active: int
     cancel_at: int = None
+
+class LatencyModel:
+    """Stochastic, two-leg latency (production model).
+
+    Two independent legs:
+      wire_out : you -> exchange. Applies to new orders AND cancel requests.
+                 Median + occasional fat tail (exponential).
+      wire_in  : exchange -> you (ack). Time until you KNOW a cancel landed.
+    decision_ms = feed-in -> order-out compute, folded into the out leg.
+
+    Draws are independent per message. The cancel leg costs money: a cancel
+    racing an adverse trade loses when decision+wire_out(cancel) exceeds the
+    trade's own latency to you.
+
+    FLAGGED SIMPLIFICATION: tail params are PRIORS for PSX-remote access, not
+    measured. Refit from colo telemetry once live. A constant-latency run is
+    recoverable with tail_prob=0 and tail_ms=0.
+    """
+    def __init__(self, decision_ms=5.0, wire_out_median_ms=40.0,
+                 wire_out_tail_ms=400.0, wire_in_median_ms=40.0,
+                 wire_in_tail_ms=10.0, tail_prob=0.02, seed=0):
+        self.decision_ms = decision_ms
+        self.wire_out_median_ms = wire_out_median_ms
+        self.wire_out_tail_ms = wire_out_tail_ms
+        self.wire_in_median_ms = wire_in_median_ms
+        self.wire_in_tail_ms = wire_in_tail_ms
+        self.tail_prob = tail_prob
+        self.rng = np.random.default_rng(seed)
+
+    def draw_out(self):
+        base = self.decision_ms + self.wire_out_median_ms
+        if self.rng.random() < self.tail_prob:
+            base += self.rng.exponential(self.wire_out_tail_ms)
+        return base
+
+    def draw_ack(self):
+        base = self.wire_in_median_ms
+        if self.rng.random() < self.tail_prob:
+            base += self.rng.exponential(self.wire_in_tail_ms)
+        return base
 
 
 class Backtester:
@@ -402,6 +473,14 @@ class Backtester:
     def __init__(self, strategy, cfg):
         self.strat = strategy
         self.cfg = cfg
+        # latency: use provided LatencyModel, else build a CONSTANT-latency
+        # model from cfg['latency_ms'] (back-compat / go-no-go runs)
+        self.lat = cfg.get('latency_model')
+        if self.lat is None:
+            L = cfg.get('latency_ms', 120)
+            self.lat = LatencyModel(decision_ms=0.0, wire_out_median_ms=L,
+                                    wire_out_tail_ms=0.0, wire_in_median_ms=L,
+                                    wire_in_tail_ms=0.0, tail_prob=0.0)
         self.book = Book()
         self.work: dict[str, MyOrder] = {}
         self.pending = []
@@ -489,7 +568,7 @@ class Backtester:
         take = min(o.qty, qty)
         sgn = 1 if side == "BUY" else -1
         self.pos += sgn * take
-        self.cash += -sgn * take * o.price - take * self.cfg["fee_per_share"]
+        self.cash += -sgn * take * o.price - fee_for(o.price, take)
         self.fills.append({"t": t_exch, "side": side, "px": o.price, "qty": take,
                            "reason": reason})
         o.qty -= take
@@ -622,11 +701,12 @@ class Backtester:
                cancel/replace when its answer hasn't changed.
           changed or newly wanted
             -> cancel the incumbent (if any, and not already being
-               cancelled) AND send the replacement. Both messages land at
-               ts_know + latency_ms. Until the cancel lands the old order
-               remains fillable (cancel_at gate in _on_market_trade);
-               the new order only activates on arrival (_arrive), where
-               it may still be rejected as crossing.
+               cancelled) AND send the replacement. Each message gets an
+               independent latency draw from self.lat; the cancel and its
+               replacement land at different times.. Until the cancel
+               lands the old order remains fillable (cancel_at gate in
+               _on_market_trade); the new order only activates on arrival
+               (_arrive), where it may still be rejected as crossing.
 
         Position note (flagged in header): self.pos is read in real time,
         i.e. the strategy 'knows' a fill the moment it happens rather than
@@ -635,19 +715,21 @@ class Backtester:
         """
         bb, bq, ba, aq = self.book.bbo()
         want = self.strat.quotes(bb, bq, ba, aq, self.pos)
-        t_land = ts_know + self.cfg["latency_ms"]
         for side in ("BUY", "SELL"):
             w = want.get(side)
             cur = self.work.get(side)
             same = cur is not None and w is not None and \
-                cur.price == w[0] and cur.qty == w[1] and cur.cancel_at is None
+                   cur.price == w[0] and cur.qty == w[1] and cur.cancel_at is None
             if same:
                 continue
             if cur is not None and cur.cancel_at is None:
-                cur.cancel_at = t_land
-                self._push(t_land, "CANCEL", side)
+                a_out = self.lat.draw_out()  # independent cancel-send draw
+                cur.cancel_at = ts_know + a_out  # exchange stops matching here
+                self._push(cur.cancel_at, "CANCEL", side)
             if w is not None:
                 self.stats["n_orders_sent"] += 1
+                a_out = self.lat.draw_out()  # independent new-order draw
+                t_land = ts_know + a_out
                 self._push(t_land, "ARRIVE",
                            MyOrder(side, w[0], w[1], {}, t_land))
 
