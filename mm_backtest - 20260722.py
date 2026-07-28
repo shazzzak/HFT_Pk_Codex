@@ -161,8 +161,11 @@ class Book:
 
     def __init__(self):
         self.o: dict[str, Order] = {}
-        self.b2_hits = 0       # branch-2 decrements applied (audit counter)
-        self.b2_ignored = 0    # cancels with unknown id AND no matching hidden level
+        self.phase = None          # trading phase from latest snapshot
+        self.limit_up = None       # individual-stock circuit limits (+/-10% prev close)
+        self.limit_dn = None
+        self.b2_hits = 0
+        self.b2_ignored = 0
 
     # ---- incremental path: ob_updates rows ----
     def add(self, r):
@@ -275,6 +278,20 @@ class Book:
         rows_all = rows  # full msg incl AGG_*
         rows = rows[rows.entry_type.isin(["BID", "OFFER"])]  # visible levels
 
+        # --- market state (message-level): phase + individual circuit limits ---
+        if len(rows_all):
+            ph = rows_all["phase"].iloc[0]
+            if isinstance(ph, str):
+                self.phase = ph
+            up = rows_all.loc[rows_all.entry_type == "UPPER_CIRCUIT_BREAKER", "px"]
+            dn = rows_all.loc[rows_all.entry_type == "LOWER_CIRCUIT_BREAKER", "px"]
+            if len(up):
+                self.limit_up = float(up.iloc[0])
+            if len(dn):
+                self.limit_dn = float(dn.iloc[0])
+        if len(rows) == 0:
+            return  # status-only message: update state, KEEP the book
+
         tgt = {}
         for r in rows.itertuples():
             side = "BUY" if r.entry_type == "BID" else "SELL"
@@ -332,6 +349,18 @@ class Book:
         ba = min(asks) if asks else None
         return bb, (bids[bb] if bb else 0.0), ba, (asks[ba] if ba else 0.0)
 
+    def pinned(self):
+        """Best bid at/above upper limit (limit-up) or best ask at/below lower
+        (limit-down): one-sided market -- quoting into it is pure adverse
+        selection, and prints there carry degenerate mids (exclude from
+        markout labels via this flag)."""
+        bb, _, ba, _ = self.bbo()
+        if self.limit_up is not None and bb is not None and bb >= self.limit_up:
+            return True
+        if self.limit_dn is not None and ba is not None and ba <= self.limit_dn:
+            return True
+        return False
+
     def qty_at(self, side, price):
         """All resting orders at one (side, price): {order_id: qty}.
 
@@ -348,8 +377,8 @@ class Book:
             for k in list(d):  # the already-traded qty
                 if neg >= 0:
                     break
-                take = min(d[k], -neg);
-                d[k] -= take;
+                take = min(d[k], -neg)
+                d[k] -= take
                 neg += take
                 if d[k] <= 0:
                     del d[k]
@@ -502,7 +531,8 @@ class Backtester:
         self.cash = 0.0
         self.fills, self.equity = [], []
         self.stats = {"rejected_crossing": 0, "n_orders_sent": 0, "n_cancels": 0,
-                      "stale_cancels_ignored": 0, "requotes_blocked_by_ack": 0}
+                      "stale_cancels_ignored": 0, "requotes_blocked_by_ack": 0,
+                      "halted_requotes": 0}
 
     # ================= our-order plumbing (EXCHANGE side) =================
     def _push(self, t, action, payload):
@@ -528,7 +558,7 @@ class Backtester:
             t, _, action, p = heapq.heappop(self.pending)
             if action == "ARRIVE":
                 self._arrive(t, p)
-                elif action == "CANCEL":
+            elif action == "CANCEL":
                 side, oid = p  # cancel targets a SPECIFIC order
                 o = self.work.get(side)
                 if o is not None and o.oid == oid:  # still the same order -> remove
@@ -730,8 +760,38 @@ class Backtester:
         one ack-latency later. At ~100ms ack vs a 5.6s median trade gap
         the distortion is negligible; a production harness acks fills.
         """
+        # HALT / BAND-PIN GATE: quote only in continuous trading, never into a
+        # pinned band. On any other phase (TRADING_BREAK, OPEN_CALL_AUCTION,
+        # MARKET_CLOSED...) pull all working quotes via the normal latency path.
+        # FLAGGED ASSUMPTION: orders persist through halts until our cancel
+        # lands; PSX may purge on some halt types -- verify with broker.
+
+        quotable = self.book.phase in (None, "CONTINUOUS_AUCTION") and not self.book.pinned()
+        if not quotable:
+            self.stats["halted_requotes"] += 1
+            for side, cur in list(self.work.items()):
+                if cur.cancel_at is None:
+                    a_out = self.lat.draw_out()
+                    cur.cancel_at = ts_know + a_out
+                    self._push(cur.cancel_at, "CANCEL", (side, cur.oid))
+                    if self.use_ack:
+                        self.ack_until[side] = cur.cancel_at + self.lat.draw_ack()
+            return
+
         bb, bq, ba, aq = self.book.bbo()
         want = self.strat.quotes(bb, bq, ba, aq, self.pos)
+
+        # BAND CLAMP: exchange rejects orders outside [limit_dn, limit_up]
+        for side in ("BUY", "SELL"):
+            w = want.get(side)
+            if w is not None:
+                px = w[0]
+                if self.book.limit_up is not None:
+                    px = min(px, self.book.limit_up)
+                if self.book.limit_dn is not None:
+                    px = max(px, self.book.limit_dn)
+                want[side] = (round(px, 2), w[1])
+
         for side in ("BUY", "SELL"):
             # ACK GUARD (stochastic mode only): while this side's last cancel is
             # unconfirmed (sent, ack not back), don't stack another cancel/replace
@@ -913,7 +973,7 @@ def load_events(u_path, s_path, t_path):
     sb = s[s.entry_type.isin(["BID", "OFFER"])]  # book levels (for timing)
     snap_groups = dict(tuple(s.groupby("msg_seq")))  # FULL msg incl AGG_* rows
     #   snapshot() itself filters to BID/OFFER and reads AGG_BID/AGG_OFFER
-    snap_ev = sb.groupby("msg_seq", as_index=False)[["ts_exch", "ts_cap"]].min()
+    snap_ev = s.groupby("msg_seq", as_index=False)[["ts_exch", "ts_cap"]].min()
 
     events = [(r.ts_exch, 1, r.appl_seq, "U", r) for r in u.itertuples()]
     events += [(r.ts_exch, 1, r.appl_seq, "T", r) for r in t.itertuples()]
