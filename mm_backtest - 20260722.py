@@ -407,15 +407,11 @@ class Book:
             d = bids if o.side == "BUY" else asks  # point d at the correct side's dict (buys -> bids, sells -> asks). d is a reference, not a copy.
             d[o.price] = d.get(o.price,
                                0.0) + o.qty  # add this entry's qty into its price level. .get(price, 0.0) = "total so far here, or 0 if new". __NEG_ has negative qty, so this SUBTRACTS for those entries (netting).
-        bids = {p: q for p, q in bids.items() if
-                q > 0}  # clamp: keep only price levels with positive net qty. A level netted to <=0 (e.g. __NEG_ cancelled the real orders) is dropped as empty.
+        bids = {p: q for p, q in bids.items() if q > 0}  # clamp: keep only price levels with positive net qty. A level netted to <=0 (e.g. __NEG_ cancelled the real orders) is dropped as empty.
         asks = {p: q for p, q in asks.items() if q > 0}  # same clamp for the ask side.
-        bq = sum(q for _, q in sorted(bids.items(), reverse=True)[
-            :n]) if bids else 0.0  # bid depth: sort levels HIGH-to-LOW (best bid first), take top n (n=None -> all), sum their qty. 0.0 if no bids (guards empty side).
-        aq = sum(q for _, q in sorted(asks.items())[
-            :n]) if asks else 0.0  # ask depth: sort levels LOW-to-HIGH (best ask first, no reverse), take top n, sum. 0.0 if no asks.
-        return (bq - aq) / (
-                    bq + aq) if bq + aq > 0 else None  # imbalance = (bid depth - ask depth)/(total depth). Range [-1,+1]: +ve = buy pressure, -ve = sell pressure. None if book empty (avoid /0).
+        bq = sum(q for _, q in sorted(bids.items(), reverse=True)[:n]) if bids else 0.0  # bid depth: sort levels HIGH-to-LOW (best bid first), take top n (n=None -> all), sum their qty. 0.0 if no bids (guards empty side).
+        aq = sum(q for _, q in sorted(asks.items())[:n]) if asks else 0.0  # ask depth: sort levels LOW-to-HIGH (best ask first, no reverse), take top n, sum. 0.0 if no asks.
+        return (bq - aq) / (bq + aq) if bq + aq > 0 else None  # imbalance = (bid depth - ask depth)/(total depth). Range [-1,+1]: +ve = buy pressure, -ve = sell pressure. None if book empty (avoid /0).
 
 @dataclass
 class MyOrder:
@@ -457,28 +453,31 @@ class LatencyModel:
     measured. Refit from colo telemetry once live. A constant-latency run is
     recoverable with tail_prob=0 and tail_ms=0.
     """
+
     def __init__(self, decision_ms=5.0, wire_out_median_ms=40.0,
+                 # constructor. All args have defaults = PRIORS for PSX-remote access (not measured); refit from your colo telemetry once live.
                  wire_out_tail_ms=400.0, wire_in_median_ms=40.0,
                  wire_in_tail_ms=10.0, tail_prob=0.02, seed=0):
-        self.decision_ms = decision_ms
-        self.wire_out_median_ms = wire_out_median_ms
-        self.wire_out_tail_ms = wire_out_tail_ms
-        self.wire_in_median_ms = wire_in_median_ms
-        self.wire_in_tail_ms = wire_in_tail_ms
-        self.tail_prob = tail_prob
-        self.rng = np.random.default_rng(seed)
+        self.decision_ms = decision_ms  # your compute time: feed-in -> order-out (strategy decides). Typical 5ms.
+        self.wire_out_median_ms = wire_out_median_ms  # typical one-way network delay YOU -> exchange gateway. Applies to new orders AND cancels. ~40ms.
+        self.wire_out_tail_ms = wire_out_tail_ms  # size of the OCCASIONAL spike on the send leg (GC pause, congestion). Mean of the tail draw. ~400ms.
+        self.wire_in_median_ms = wire_in_median_ms  # typical delay exchange -> YOU for an ACK (confirmation a cancel landed). ~40ms.
+        self.wire_in_tail_ms = wire_in_tail_ms  # size of the occasional spike on the ack leg. Smaller than send-side. ~10ms.
+        self.tail_prob = tail_prob  # probability ANY given message hits the fat tail. 0.02 = 2% of messages spike.
+        self.rng = np.random.default_rng(
+            seed)  # seeded random generator. Same seed -> identical latency draws every run -> reproducible backtests.
 
-    def draw_out(self):
-        base = self.decision_ms + self.wire_out_median_ms
-        if self.rng.random() < self.tail_prob:
-            base += self.rng.exponential(self.wire_out_tail_ms)
-        return base
+    def draw_out(self):  # returns ONE random send latency (ms), for a new order OR a cancel request.
+        base = self.decision_ms + self.wire_out_median_ms  # start with the normal case: your compute time + typical wire delay (5 + 40 = 45ms).
+        if self.rng.random() < self.tail_prob:  # roll a die in [0,1): with probability tail_prob (2%), this message spikes.
+            base += self.rng.exponential(self.wire_out_tail_ms)  # add a random spike drawn from an exponential distribution (mean = tail_ms). Most spikes small, occasionally huge -> models real fat tails.
+        return base  # total one-way send latency for this message.
 
-    def draw_ack(self):
-        base = self.wire_in_median_ms
-        if self.rng.random() < self.tail_prob:
-            base += self.rng.exponential(self.wire_in_tail_ms)
-        return base
+    def draw_ack(self):  # returns ONE random ACK latency (ms) -- time to LEARN a cancel succeeded.
+        base = self.wire_in_median_ms  # normal case: typical return-path delay (40ms). No decision_ms here -- an ack is passive, no compute.
+        if self.rng.random() < self.tail_prob:  # same 2% chance of a spike on the return path.
+            base += self.rng.exponential(self.wire_in_tail_ms)  # add an exponential spike (smaller mean than send side).
+        return base  # total ack latency for this message.
 
 
 class Backtester:
@@ -516,30 +515,40 @@ class Backtester:
       fills/equity  accounting logs -> DataFrames returned by run().
     """
 
-    def __init__(self, strategy, cfg):
-        self.strat = strategy
-        self.cfg = cfg
+    def __init__(self, strategy,
+                 cfg):  # constructor. strategy = the quoting logic (e.g. NaiveSymmetricMM); cfg = config dict (latency, fees, session window, fill rules).
+        self.strat = strategy  # store the strategy object; _requote() calls self.strat.quotes(...) each event to ask where to quote.
+        self.cfg = cfg  # store the config dict; read throughout for session window, fill rules, etc.
         # latency: use provided LatencyModel, else build a CONSTANT-latency
         # model from cfg['latency_ms'] (back-compat / go-no-go runs)
-        self.lat = cfg.get('latency_model')
-        if self.lat is None:
-            L = cfg.get('latency_ms', 120)
-            self.lat = LatencyModel(decision_ms=0.0, wire_out_median_ms=L,
-                                    wire_out_tail_ms=0.0, wire_in_median_ms=L,
-                                    wire_in_tail_ms=0.0, tail_prob=0.0)
-        self.book = Book()
-        self.work: dict[str, MyOrder] = {}
-        self._oid = 0  # unique id generator for our orders
-        self.ack_until = {"BUY": 0, "SELL": 0}  # side unconfirmed until this ms
-        self.use_ack = 'latency_model' in cfg  # ack realism only in stochastic mode
-        self.pending = []
-        self._seq = 0
-        self.pos = 0.0
-        self.cash = 0.0
-        self.fills, self.equity = [], []
+        self.lat = cfg.get(
+            'latency_model')  # try to get a LatencyModel from cfg. Returns None if the caller didn't supply one.
+        if self.lat is None:  # no stochastic model given -> caller wants simple constant latency.
+            L = cfg.get('latency_ms', 120)  # read the fixed one-way latency in ms; default 120 if not specified.
+            self.lat = LatencyModel(decision_ms=0.0,
+                                    wire_out_median_ms=L, wire_out_tail_ms=0.0,
+                                    # build a LatencyModel with ALL randomness zeroed: no compute time,
+                                    wire_in_median_ms=L, wire_in_tail_ms=0.0,
+                                    # no tail spikes (tail_ms=0), send & ack both = L.
+                                    tail_prob=0.0)  # tail_prob=0 -> spike branch never fires -> every draw returns exactly L. A "constant latency" disguised as the same LatencyModel interface.
+        self.book = Book()  # the reconstructed real order book (everyone else's orders). Empty until the first snapshot/update.
+        self.work: dict[
+            str, MyOrder] = {}  # OUR live orders, keyed by side: {"BUY": MyOrder, "SELL": MyOrder}. At most one per side.
+        self._oid = 0  # counter that generates a unique id for each order we send (cancels target a specific oid, not just a side).
+        self.ack_until = {"BUY": 0,
+                          "SELL": 0}  # per side: exchange-ms until which that side's last cancel is UNCONFIRMED (ack not yet back). 0 = nothing pending.
+        self.use_ack = 'latency_model' in cfg  # ack-realism gate: only enforce the "don't restack an unconfirmed side" rule in stochastic mode (when a real LatencyModel was given).
+        self.pending = []  # min-heap of OUR in-flight messages (orders/cancels traveling to the exchange). Ordered by land-time.
+        self._seq = 0  # monotonic counter: breaks ties in the heap FIFO AND stops heapq from ever comparing MyOrder payloads.
+        self.pos = 0.0  # our current position in shares (signed: + long, - short). Updated on every fill.
+        self.cash = 0.0  # our running cash in PKR (signed). Fills add/subtract price*qty and deduct fees.
+        self.fills, self.equity = [], []  # accounting logs: fills = every trade we got; equity = mark-to-market curve (one row per event). Returned as DataFrames by run().
         self.stats = {"rejected_crossing": 0, "n_orders_sent": 0, "n_cancels": 0,
+                      # diagnostic counters, all start at 0:
                       "stale_cancels_ignored": 0, "requotes_blocked_by_ack": 0,
-                      "halted_requotes": 0}
+                      # rejected_crossing = post-only rejects; n_orders_sent/n_cancels = message counts;
+                      "halted_requotes": 0}  # stale_cancels_ignored = cancels for already-gone orders; requotes_blocked_by_ack = requotes skipped by ack guard; halted_requotes = requotes skipped during halts.
+
 
     # ================= our-order plumbing (EXCHANGE side) =================
     def _push(self, t, action, payload):
@@ -561,20 +570,20 @@ class Backtester:
                   (self.work.get returns None) the cancel is simply void —
                   which is exactly what an exchange cancel-reject is.
         """
-        while self.pending and self.pending[0][0] < t_exch:
-            t, _, action, p = heapq.heappop(self.pending)
-            if action == "ARRIVE":
-                self._arrive(t, p)
-            elif action == "CANCEL":
-                side, oid = p  # cancel targets a SPECIFIC order
-                o = self.work.get(side)
-                if o is not None and o.oid == oid:  # still the same order -> remove
-                    self.work.pop(side, None)
-                    self.stats["n_cancels"] += 1
-                else:  # already filled or replaced:
-                    self.stats["stale_cancels_ignored"] += 1  # exchange cancel-reject
+        while self.pending and self.pending[0][0] < t_exch:  # loop while the heap is non-empty AND its earliest message's land-time (pending[0][0]) is before t_exch. Strict '<' = same-ms messages process AFTER the market event (conservative).
+            t, _, action, p = heapq.heappop(self.pending)  # pop the earliest message off the heap. Unpack: t = land-time, _ = the _seq tiebreaker (ignored), action = "ARRIVE"/"CANCEL", p = payload.
+            if action == "ARRIVE":  # this message is a NEW order reaching the exchange.
+                self._arrive(t,p)  # hand it to _arrive(), which checks if it crosses the book (reject) and otherwise makes it live + snapshots its queue position.
+            elif action == "CANCEL":  # this message is a CANCEL request reaching the exchange.
+                side, oid = p  # unpack the payload: which side, and the SPECIFIC order id this cancel was meant for.
+                o = self.work.get(side)  # look up our current working order on that side (or None if there isn't one).
+                if o is not None and o.oid == oid:  # is there an order on that side AND is it the SAME order this cancel targeted (matching oid)?
+                    self.work.pop(side, None)  # yes -> remove it from our working orders (the cancel succeeded).
+                    self.stats["n_cancels"] += 1  # count a successful cancel.
+                else:  # no matching order: it was already filled, or already replaced by a newer order.
+                    self.stats["stale_cancels_ignored"] += 1  # count a no-op cancel. This mirrors a real exchange CANCEL-REJECT (nothing there to cancel).
 
-    def _arrive(self, t, o: MyOrder):
+    def _arrive(self, t, o: MyOrder): # called when OUR order o reaches the exchange at time t (after its send latency). o is a MyOrder (side, price, qty, ...).
         """Our new order reaches the exchange. Two things happen:
 
         1. Marketability check against the CURRENT book (which may have
@@ -589,22 +598,24 @@ class Backtester:
            ahead of us. Captured once here; maintained incrementally by
            the market-event handlers below.
         """
-        bb, _, ba, _ = self.book.bbo()
-        crosses = ((o.side == "BUY" and ba is not None and o.price >= ba) or
-                   (o.side == "SELL" and bb is not None and o.price <= bb))
-        if crosses:
-            self.stats["rejected_crossing"] += 1
-            return
-        o.ahead = self.book.qty_at(o.side, o.price)
-        o.t_active = t
-        self.work[o.side] = o
+        bb, _, ba, _ = self.book.bbo()  # get the CURRENT best bid (bb) and best ask (ba) from the real book. The _ discard the qty fields (bq, aq) -- not needed here. Note: the book may have MOVED during our latency window.
+        crosses = ((o.side == "BUY" and ba is not None and o.price >= ba) or  # would our order execute immediately instead of resting? For a BUY: our bid at/above the best ask means we'd cross and take.
+                   (o.side == "SELL" and bb is not None and o.price <= bb))  # for a SELL: our ask at/below the best bid means we'd cross and take. (the 'is not None' guards an empty side.)
+        if crosses:  # our order would be marketable (take liquidity) rather than post passively.
+            self.stats["rejected_crossing"] += 1  # count it as a rejected crossing order.
+            return  # FLAGGED SIMPLIFICATION: reject it (post-only behavior) instead of executing as a taker. The order never enters the book. Exit early.
+        o.ahead = self.book.qty_at(o.side, o.price)  # order rests: snapshot our QUEUE POSITION -- {order_id: qty} of every order already resting at our price (all ahead of us under price-time priority).
+        o.t_active = t  # record the exchange-time the order became live (used for timing/diagnostics).
+        self.work[o.side] = o  # store the order as our working order on this side. It's now live and eligible to be filled by incoming flow.
 
     # ============ fill engine (runs BEFORE the event mutates the book) ====
     # Ordering matters: fills are judged against the book AS IT WAS when
     # the aggressive order hit it. The main loop therefore calls these
     # handlers first, and only then applies the event to self.book.
 
-    def _fill(self, side, price, qty, t_exch, reason):
+    def _fill(self, side, price, qty, t_exch, reason): # book a fill of OUR order. side = BUY/SELL; price = the trade's print price (not used for our cash);
+        # qty = shares offered to us; t_exch = fill time; reason = provenance tag ("through"/"at_queue"/etc).
+
         """Book a (possibly partial) fill of our working order on `side`.
 
         take   = min(our remaining qty, the aggressive qty offered to us)
@@ -617,17 +628,36 @@ class Backtester:
                | 'crossing_add' — the fills DataFrame lets you audit how
                much PnL depends on each fill rule.
         Fully consumed orders leave self.work; partials stay with reduced qty.
+
+        The reason tag is for honest attribution, not decoration. Each fill records
+        why it happened — was it a trade printing through your price (certain fill
+        by price priority), at your price after your queue drained, or a crossing add?
+        When you later analyze PnL, you can group by reason and see how much of your profit
+        depends on each fill rule. If most of your PnL comes from the more sp712577eculative rules
+        (like crossing-add fills, which rely on a counterfactual assumption), that's a signal
+        your edge is fragile. It turns the fill log into an auditable record rather than a
+        black box.
+
+        One thing to flag about what this method does not do: it never touches self.book
+        (the real order book). When you get filled, the historical trade that filled you
+        also consumed its real historical counterparty inside Book.trade() — your fill is
+        recorded only in your ledger (pos, cash, fills), running in parallel. That's the
+        "shadow fill" assumption: your simulated presence doesn't remove real liquidity or
+        alter history. Correct for a backtest; the honest caveat is that it's mildly
+        optimistic, since a real order of yours would have consumed that liquidity and
+        changed what followed.
+
         """
-        o = self.work.get(side)
-        take = min(o.qty, qty)
-        sgn = 1 if side == "BUY" else -1
-        self.pos += sgn * take
-        self.cash += -sgn * take * o.price - fee_for(o.price, take)
-        self.fills.append({"t": t_exch, "side": side, "px": o.price, "qty": take,
-                           "reason": reason})
-        o.qty -= take
-        if o.qty <= 0:
-            self.work.pop(side, None)
+        o = self.work.get(side)                       # fetch our working order on this side (the one being filled).
+        take = min(o.qty, qty)                        # we can only fill up to OUR remaining size; if the incoming qty is larger, we take our whole order, not more. This is the actual fill amount.
+        sgn = 1 if side == "BUY" else -1              # sign of the position change: a BUY adds shares (+1), a SELL removes them (-1).
+        self.pos += sgn * take                        # update our position: +take if we bought, -take if we sold.
+        self.cash += -sgn * take * o.price - fee_for(o.price, take)   # update cash: money moves OPPOSITE to position (buying spends cash, selling earns it), always at OUR limit price o.price -- then subtract the fee. Note: fee uses o.price, the price we transacted at.
+        self.fills.append({"t": t_exch, "side": side, "px": o.price, "qty": take,   # log this fill: time, side, OUR price, and the amount filled...
+                           "reason": reason})          # ...plus WHY it filled (through/at-queue/crossing-add) so you can audit which fill rule produced which PnL.
+        o.qty -= take                                 # reduce our order's remaining quantity by what just filled.
+        if o.qty <= 0:                                # if the order is now fully filled...
+            self.work.pop(side, None)                 # ...remove it from working orders (it's done). A partial fill leaves it in place with reduced qty.
 
     def _on_market_trade(self, r):
         """A historical trade printed. Could its aggressive flow have hit us?
