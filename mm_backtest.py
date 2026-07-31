@@ -1230,8 +1230,11 @@ def load_events(u_path, s_path, t_path):
     Returns:
       events      list of (ts_exch, kind_rank, appl_seq, kind, row),
                   fully sorted — see ordering rationale below
-      snap_groups {msg_seq: DataFrame of that snapshot's BID/OFFER rows},
-                  pre-split once so the replay loop does O(1) lookups
+      snap_groups {msg_seq: DataFrame of ALL rows of that snapshot message}
+                  — book levels (BID/OFFER), the AGG_BID/AGG_OFFER totals,
+                  and the status/circuit-breaker rows. snapshot() does its
+                  own filtering. Pre-split once so the replay loop does
+                  O(1) lookups.
       t           the trades DataFrame (with ts_exch/ts_cap/rest_oid added),
                   returned because callers use it to define the session
                   window and for post-run analysis
@@ -1250,6 +1253,12 @@ def load_events(u_path, s_path, t_path):
       id (never eval() on data from disk). ~1/3 of trades resolve; the rest
       use the Book.trade fallback.
 
+    Snapshot EVENTS come from ALL messages, not just book-bearing ones:
+      a status-only 35=W (MARKET_CLOSED, TRADING_BREAK, ...) carries no
+      BID/OFFER rows but must still reach snapshot() so Book.phase updates
+      and the halt gate in _requote can pull quotes. snapshot() returns
+      early on those, updating state without wiping the book.
+
     Event ordering — the load-bearing detail of the whole harness:
       key = (ts_exch, kind_rank, appl_seq)
       * ts_exch    exchange time first: the matching engine's own sequence.
@@ -1263,28 +1272,41 @@ def load_events(u_path, s_path, t_path):
                    clock needed. Snapshots ride channel 1011 (different
                    sequence space), hence their 0 placeholder.
     """
+    # Read the three raw tables. index_col=0 drops the writer's index column.
     u = pd.read_csv(u_path, index_col=0)
     s = pd.read_csv(s_path, index_col=0)
     t = pd.read_csv(t_path, index_col=0)
 
+    # Helper: ISO timestamp column -> int64 milliseconds since epoch.
     def ms(df, c):
+        # as_unit("ns") first, so .astype("int64") is nanoseconds on any pandas
+        # version; //1e6 then gives exact ms (this feed is ms-precision).
         return (pd.to_datetime(df[c], utc=True, format="ISO8601")
                 .dt.as_unit("ns").astype("int64") // 1_000_000)
 
+    # Exchange clock per table: tag 60 for updates/trades, tag 42 for snapshots.
     u["ts_exch"], t["ts_exch"], s["ts_exch"] = \
         ms(u, "transact_time"), ms(t, "transact_time"), ms(s, "orig_time")
+    # Capture clock on all three: feeds knowledge time (what we could have known).
     for df, c in ((u, "capture_ts"), (t, "capture_ts"), (s, "capture_ts")):
         df["ts_cap"] = ms(df, c)
+    # Extract the resting order id from the stringified tuple; None when absent.
     t["rest_oid"] = t["resting_order_id"].map(
         lambda x: ast.literal_eval(x)[0] if isinstance(x, str) and x.startswith("(") else None)
 
-    sb = s[s.entry_type.isin(["BID", "OFFER"])]  # book levels (for timing)
-    snap_groups = dict(tuple(s.groupby("msg_seq")))  # FULL msg incl AGG_* rows
-    #   snapshot() itself filters to BID/OFFER and reads AGG_BID/AGG_OFFER
+    # One dict entry per snapshot message, holding ALL its rows (book + AGG +
+    # status). snapshot() filters internally; it needs the AGG and phase rows.
+    snap_groups = dict(tuple(s.groupby("msg_seq")))
+    # One (ts_exch, ts_cap) pair per snapshot message. Grouping on the FULL
+    # frame means status-only messages also become events (phase changes).
     snap_ev = s.groupby("msg_seq", as_index=False)[["ts_exch", "ts_cap"]].min()
 
+    # Updates: kind "U", rank 1, ordered within a ms by appl_seq.
     events = [(r.ts_exch, 1, r.appl_seq, "U", r) for r in u.itertuples()]
+    # Trades: kind "T", rank 1, sharing the same appl_seq sequence as updates.
     events += [(r.ts_exch, 1, r.appl_seq, "T", r) for r in t.itertuples()]
+    # Snapshots: kind "S", rank 0 (apply first on ties), appl_seq not comparable.
     events += [(r.ts_exch, 0, 0, "S", r) for r in snap_ev.itertuples()]
+    # Sort on the first three fields only; the payload row is carried, not compared.
     events.sort(key=lambda e: (e[0], e[1], e[2]))
     return events, snap_groups, t
