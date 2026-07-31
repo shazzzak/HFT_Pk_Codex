@@ -1106,51 +1106,51 @@ class Backtester:
             elif ts_exch > t1:
                 for side in list(self.work):
                     self.work.pop(side)
-                    # EOD FLATTEN (production): the FIRST time we cross session end,
-                    # liquidate remaining inventory by walking the real book instead of
-                    # marking it at mid. Mid-marking assumes an impossible exit at the
-                    # midpoint; walking the book pays the spread and eats successively
-                    # worse levels, which is what getting flat actually costs.
-                    if self.eod is None:
-                        # Void all in-flight messages: nothing of ours may land, fill,
-                        # or change position after this report (makes eod final).
-                        self.pending.clear()
-                        # Walk the book to flatten the position, fees included.
-                        liq_cash, unfilled, vwap = self.book.liquidation_value(self.pos, fee_fn=fee_for)
-                        # Read the closing touch for the comparison mid-mark.
-                        bb_e, _, ba_e, _ = self.book.bbo()
-                        # Mid only exists if both sides are present.
-                        mid_e = (bb_e + ba_e) / 2 if (bb_e is not None and ba_e is not None) else None
-                        # The report: both numbers side by side so the overstatement is visible.
-                        # Residual the book could not absorb. Mark it at the last good
-                        # mid with a haircut, because we demonstrably could NOT trade
-                        # out of it -- and flag the run as not cleanly liquidated.
-                        # Reporting cash as equity here books an unclosed position as profit.
-                        ref = mid_e if mid_e is not None else self.last_good_mid
-                        residual_mark = 0.0
-                        if unfilled > 0 and ref is not None:
-                            haircut = self.cfg.get("unfilled_haircut_pct", 0.10)
-                            sgn = 1.0 if self.pos > 0 else -1.0
-                            residual_mark = sgn * unfilled * ref * (1.0 - sgn * haircut)
-                        self.eod = {
-                            # Position we carried into the close.
-                            "pos_at_close": self.pos,
-                            # Mid at session end (None if the book was one-sided).
-                            "mid_at_close": mid_e,
-                            # What the old mid-mark WOULD have reported (diagnostic only).
-                            "equity_mid_mark": (self.cash + self.pos * mid_e) if mid_e is not None else None,
-                            # False means equity_liquidated is an estimate, not a realisable number.
-                            "liquidation_clean": (unfilled == 0),
-                            "residual_marked": residual_mark,
-                            "equity_liquidated": self.cash + liq_cash + residual_mark,
-                            # Achieved liquidation vwap.
-                            "liq_vwap": vwap,
-                            # Slippage vs mid, per share.
-                            "liq_slippage_per_sh": (
-                                abs(vwap - mid_e) if (vwap is not None and mid_e is not None) else None),
-                            # Size the visible book could not absorb -- genuinely unpriceable.
-                            "unfilled_sh": unfilled,
-                        }
+                # EOD FLATTEN (production): the FIRST time we cross session end,
+                # liquidate remaining inventory by walking the real book instead of
+                # marking it at mid. Mid-marking assumes an impossible exit at the
+                # midpoint; walking the book pays the spread and eats successively
+                # worse levels, which is what getting flat actually costs.
+                if self.eod is None:
+                    # Void all in-flight messages: nothing of ours may land, fill,
+                    # or change position after this report (makes eod final).
+                    self.pending.clear()
+                    # Walk the book to flatten the position, fees included.
+                    liq_cash, unfilled, vwap = self.book.liquidation_value(self.pos, fee_fn=fee_for)
+                    # Read the closing touch for the comparison mid-mark.
+                    bb_e, _, ba_e, _ = self.book.bbo()
+                    # Mid only exists if both sides are present.
+                    mid_e = (bb_e + ba_e) / 2 if (bb_e is not None and ba_e is not None) else None
+                    # The report: both numbers side by side so the overstatement is visible.
+                    # Residual the book could not absorb. Mark it at the last good
+                    # mid with a haircut, because we demonstrably could NOT trade
+                    # out of it -- and flag the run as not cleanly liquidated.
+                    # Reporting cash as equity here books an unclosed position as profit.
+                    ref = mid_e if mid_e is not None else self.last_good_mid
+                    residual_mark = 0.0
+                    if unfilled > 0 and ref is not None:
+                        haircut = self.cfg.get("unfilled_haircut_pct", 0.10)
+                        sgn = 1.0 if self.pos > 0 else -1.0
+                        residual_mark = sgn * unfilled * ref * (1.0 - sgn * haircut)
+                    self.eod = {
+                        # Position we carried into the close.
+                        "pos_at_close": self.pos,
+                        # Mid at session end (None if the book was one-sided).
+                        "mid_at_close": mid_e,
+                        # What the old mid-mark WOULD have reported (diagnostic only).
+                        "equity_mid_mark": (self.cash + self.pos * mid_e) if mid_e is not None else None,
+                        # False means equity_liquidated is an estimate, not a realisable number.
+                        "liquidation_clean": (unfilled == 0),
+                        "residual_marked": residual_mark,
+                        "equity_liquidated": self.cash + liq_cash + residual_mark,
+                        # Achieved liquidation vwap.
+                        "liq_vwap": vwap,
+                        # Slippage vs mid, per share.
+                        "liq_slippage_per_sh": (
+                            abs(vwap - mid_e) if (vwap is not None and mid_e is not None) else None),
+                        # Size the visible book could not absorb -- genuinely unpriceable.
+                        "unfilled_sh": unfilled,
+                    }
         # Return the accounting logs as DataFrames, plus the diagnostic counters.
         return pd.DataFrame(self.fills), pd.DataFrame(self.equity), self.stats
 
@@ -1274,7 +1274,7 @@ def load_events(u_path, s_path, t_path):
     """
     # Read the three raw tables. index_col=0 drops the writer's index column.
     u = pd.read_csv(u_path, index_col=0)
-    s = pd.read_csv(s_path, index_col=0)
+    s = pd.read_csv(s_path, index_col=0, dtype={"prev_close": "float64"})
     t = pd.read_csv(t_path, index_col=0)
 
     # Helper: ISO timestamp column -> int64 milliseconds since epoch.
