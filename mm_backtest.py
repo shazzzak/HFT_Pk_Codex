@@ -349,6 +349,76 @@ class Book:
         ba = min(asks) if asks else None
         return bb, (bids[bb] if bb else 0.0), ba, (asks[ba] if ba else 0.0)
 
+
+    def liquidation_value(self, pos, fee_fn=None):
+        """Cash realised by flattening `pos` shares RIGHT NOW by walking the book.
+
+        pos > 0 (long)  -> we SELL into the bids, best (highest) bid first.
+        pos < 0 (short) -> we BUY from the asks, best (lowest) ask first.
+
+        Returns (cash_realised, shares_unfilled, vwap).
+          cash_realised  : signed cash from the liquidating trades, fees deducted.
+          shares_unfilled: size the book could NOT absorb (book too thin). Genuinely
+                           unpriceable residual -- do NOT silently mark it at mid.
+          vwap           : volume-weighted avg price achieved, or None if nothing filled.
+
+        Production alternative to marking inventory at mid. Mid-marking assumes an
+        exit at the midpoint, which is impossible: you must cross the spread and eat
+        successively worse levels. Includes __H_ hidden lumps; EXCLUDES the __AGG_
+        deep residual (its price is a synthetic placeholder, not a tradable level).
+        """
+        # Nothing to liquidate -> zero cash, zero unfilled, no vwap.
+        if pos == 0:
+            return 0.0, 0.0, None
+        # We hit the OPPOSITE side of the book: long sells into resting BUYs (bids),
+        # short buys back from resting SELLs (asks).
+        side_wanted = "BUY" if pos > 0 else "SELL"
+        # Build net qty per price level on that side.
+        levels = {}
+        for k, o in self.o.items():
+            # Skip the deep-residual lump: its price is a placeholder, not tradable.
+            if k.startswith("__AGG_"):
+                continue
+            # Keep only orders on the side we are hitting.
+            if o.side != side_wanted:
+                continue
+            # Accumulate qty at this price. __NEG_ entries are negative -> they net down.
+            levels[o.price] = levels.get(o.price, 0.0) + o.qty
+        # Clamp: a level netted to <= 0 has no real liquidity -> drop it.
+        levels = {p: q for p, q in levels.items() if q > 0}
+        # Order levels best-first: selling a long -> highest bid first (reverse=True);
+        # buying back a short -> lowest ask first (reverse=False).
+        ordered = sorted(levels.items(), reverse=(pos > 0))
+        # Shares still to flatten.
+        remaining = abs(float(pos))
+        # Running signed cash from the liquidating trades.
+        cash = 0.0
+        # Shares actually filled (for the vwap).
+        filled = 0.0
+        # Sum of price*qty actually filled (for the vwap).
+        notional = 0.0
+        # Walk the levels best-first, consuming each until we are flat or the book runs out.
+        for px, avail in ordered:
+            # Fully flattened -> stop walking.
+            if remaining <= 0:
+                break
+            # Take the smaller of this level's size or what we still need.
+            take = min(avail, remaining)
+            # Selling a long brings cash IN (+); buying back a short pays cash OUT (-).
+            cash += (take * px) if pos > 0 else (-take * px)
+            # Fees are a cost in either direction.
+            if fee_fn is not None:
+                cash -= fee_fn(px, take)
+            # Track fill totals for the vwap.
+            notional += take * px
+            filled += take
+            # Reduce what is left to flatten.
+            remaining -= take
+        # Volume-weighted average execution price, or None if the book had nothing.
+        vwap = (notional / filled) if filled > 0 else None
+        # remaining > 0 means the visible book could not absorb the full position.
+        return cash, remaining, vwap
+
     def pinned(self):
         """Best bid at/above upper limit (limit-up) or best ask at/below lower
         (limit-down): one-sided market -- quoting into it is pure adverse
@@ -543,6 +613,9 @@ class Backtester:
         self.pos = 0.0  # our current position in shares (signed: + long, - short). Updated on every fill.
         self.cash = 0.0  # our running cash in PKR (signed). Fills add/subtract price*qty and deduct fees.
         self.fills, self.equity = [], []  # accounting logs: fills = every trade we got; equity = mark-to-market curve (one row per event). Returned as DataFrames by run().
+        self.eod = None        # EOD book-walk liquidation report (filled once, at session end).
+        # Last mid seen with a two-sided book -- EOD reference if the close is one-sided.
+        self.last_good_mid = None
         self.stats = {"rejected_crossing": 0, "n_orders_sent": 0, "n_cancels": 0,
                       # diagnostic counters, all start at 0:
                       "stale_cancels_ignored": 0, "requotes_blocked_by_ack": 0,
@@ -687,40 +760,71 @@ class Backtester:
           BEHIND our price — the print didn't reach our level; no fill.
             (Implicit: neither branch triggers.)
         """
+        # Auction prints have no continuous-market aggressor -> skip.
         if r.initiator == "AUCTION":
             return
+        # Which side was the aggressor (taker): BUY lifted an ask, SELL hit a bid.
         aggr = r.aggressor_side
+        # PASSIVE side is the opposite: BUY aggressor hits resting SELLs, SELL hits BUYs.
+        # This is the side OUR order must be on to get hit.
         passive_side = {"BUY": "SELL", "SELL": "BUY"}.get(aggr)
+        # Fetch OUR working order on that passive side (None if we have none).
         o = self.work.get(passive_side)
+        # Skip if no order, OR our in-flight cancel has ALREADY landed (trade time >= cancel_at).
+        # Before cancel_at the order is still fillable -- that is in-flight cancel risk.
         if o is None or (o.cancel_at is not None and r.ts_exch >= o.cancel_at):
             return
+        # The trade's execution (print) price.
         px = float(r.price)
+        # Did the trade print PAST our price? SELL: print above our ask. BUY: print below our bid.
+        # A through-print forces a fill by price priority.
         through = (px > o.price) if passive_side == "SELL" else (px < o.price)
+        # Trade went through our price -> CERTAIN fill.
         if through:
+            # Fill us for the whole trade qty (capped to our size inside _fill).
             self._fill(passive_side, px, float(r.qty), r.ts_exch, "through")
+        # Trade printed EXACTLY at our price -> queue / time priority decides.
         elif px == o.price:
+            # At-price fill policy: "never" | "always" | "queue".
             mode = self.cfg["at_price_mode"]
+            # Conservative lower bound: never fill at our price.
             if mode == "never":
                 return
+            # Optimistic upper bound: assume we are first in line -> fill fully.
             if mode == "always":
                 self._fill(passive_side, px, float(r.qty), r.ts_exch, "at_optimistic")
                 return
+            # "queue" mode (realistic): rem = aggressive qty available, starts at full trade size.
             rem = float(r.qty)
-            if r.rest_oid and r.rest_oid in o.ahead:       # surgical drain
+            # SURGICAL DRAIN: trade names the specific resting order it hit, and it is in our queue.
+            if r.rest_oid and r.rest_oid in o.ahead:
+                # Consume the smaller of that order's remaining qty or the available flow.
                 take = min(o.ahead[r.rest_oid], rem)
+                # Shrink that specific order in our queue.
                 o.ahead[r.rest_oid] -= take
+                # If it is fully consumed, remove it from our queue-ahead.
                 if o.ahead[r.rest_oid] <= 0:
                     del o.ahead[r.rest_oid]
+                # Reduce remaining flow by what it consumed.
                 rem -= take
-            else:                                          # pool drain
+            # POOL DRAIN: id unknown or not in our queue -> consume front-to-back.
+            else:
+                # Walk the orders ahead of us. list() allows safe deletion while iterating.
                 for k in list(o.ahead):
+                    # Flow exhausted before reaching us -> stop.
                     if rem <= 0:
                         break
+                    # Consume the smaller of this order's qty or remaining flow.
                     take = min(o.ahead[k], rem)
-                    o.ahead[k] -= take; rem -= take
+                    # Shrink this order and the remaining flow.
+                    o.ahead[k] -= take
+                    rem -= take
+                    # Order fully consumed -> remove it.
                     if o.ahead[k] <= 0:
                         del o.ahead[k]
-            if rem > 0:                                    # flow reached us
+            # After clearing everyone ahead of us, is there STILL flow left?
+            if rem > 0:
+                # Yes -> remaining qty reaches US -> fill us for rem, tagged "at_queue".
                 self._fill(passive_side, px, rem, r.ts_exch, "at_queue")
 
     def _on_market_add(self, r):
@@ -738,13 +842,21 @@ class Backtester:
         Loop reads: for our SELL order, a crossing add is an opposing BUY
         at px >= our ask; for our BUY, a SELL at px <= our bid.
         """
+        # Check both of our sides. opp = the opposing side an add must be on to cross us.
+        # For our SELL (ask), a crossing add is a BUY; for our BUY (bid), it is a SELL.
         for side, opp in (("SELL", "BUY"), ("BUY", "SELL")):
+            # Fetch OUR working order on this side (None if we have none there).
             o = self.work.get(side)
+            # Skip if we have no order on this side, OR the add is not on the opposing side.
             if o is None or r.side != opp:
                 continue
+            # Only fill off crossing adds if the config enables this (it is optional/optimistic).
             if self.cfg["fill_on_crossing_adds"]:
+                # The incoming order's price.
                 px = float(r.price)
+                # Does it cross us? Our SELL: add's buy price at/above our ask. Our BUY: add's sell price at/below our bid.
                 if (side == "SELL" and px >= o.price) or (side == "BUY" and px <= o.price):
+                    # It would have matched against us -> fill us AT OUR PRICE (o.price), tagged "crossing_add".
                     self._fill(side, o.price, float(r.qty), r.ts_exch, "crossing_add")
 
     def _on_market_cancel(self, r):
@@ -803,63 +915,108 @@ class Backtester:
         # FLAGGED ASSUMPTION: orders persist through halts until our cancel
         # lands; PSX may purge on some halt types -- verify with broker.
 
+        # Quotable only in continuous trading AND when not pinned at a circuit limit.
         quotable = self.book.phase in (None, "CONTINUOUS_AUCTION") and not self.book.pinned()
+        # Not quotable (halt / auction / closed / pinned) -> pull all our quotes and stand down.
         if not quotable:
+            # Count this halted requote for diagnostics.
             self.stats["halted_requotes"] += 1
+            # Cancel every working order that isn't already being cancelled.
             for side, cur in list(self.work.items()):
+                # Skip orders that already have a cancel in flight.
                 if cur.cancel_at is None:
+                    # Draw a send latency for this cancel.
                     a_out = self.lat.draw_out()
+                    # The cancel lands (exchange stops matching) at knowledge time + latency.
                     cur.cancel_at = ts_know + a_out
+                    # Schedule the cancel to land, targeting this specific order (side, oid).
                     self._push(cur.cancel_at, "CANCEL", (side, cur.oid))
+                    # In stochastic mode, mark this side unconfirmed until the ack returns.
                     if self.use_ack:
                         self.ack_until[side] = cur.cancel_at + self.lat.draw_ack()
+            # Done -- no new quotes while not quotable.
             return
 
+        # Read the current best bid/offer (with qtys) from the reconstructed book.
         bb, bq, ba, aq = self.book.bbo()
+        # Ask the strategy where it wants to quote: {side: (price, qty)}, sides may be omitted.
         want = self.strat.quotes(bb, bq, ba, aq, self.pos)
 
         # BAND CLAMP: exchange rejects orders outside [limit_dn, limit_up]
+        # Clamp each desired price into the allowed circuit band before sending.
         for side in ("BUY", "SELL"):
+            # The desired quote for this side (or None if the strategy omitted it).
             w = want.get(side)
+            # Only clamp if the strategy actually wants a quote on this side.
             if w is not None:
+                # The desired price.
                 px = w[0]
+                # Never send above the upper circuit limit.
                 if self.book.limit_up is not None:
                     px = min(px, self.book.limit_up)
+                # Never send below the lower circuit limit.
                 if self.book.limit_dn is not None:
                     px = max(px, self.book.limit_dn)
+                # Write the clamped, tick-rounded price back into the desired quote.
                 want[side] = (round(px, 2), w[1])
 
+        # Reconcile desired quotes against what we already have working, per side.
         for side in ("BUY", "SELL"):
             # ACK GUARD (stochastic mode only): while this side's last cancel is
             # unconfirmed (sent, ack not back), don't stack another cancel/replace
             # on it -- a real risk system treats the old order as possibly-live
             # until acked. The original cancel+replace pair is unaffected.
+
+            # If this side is still awaiting a cancel ack, skip repricing it for now.
             if self.use_ack and ts_know < self.ack_until[side]:
+                # Count the blocked requote for diagnostics.
                 self.stats["requotes_blocked_by_ack"] += 1
                 continue
+            # The desired quote for this side (or None).
             w = want.get(side)
+            # Our current working order on this side (or None).
             cur = self.work.get(side)
+            # "same" = we already have exactly this quote live, with no cancel racing -> no churn.
             same = cur is not None and w is not None and \
                    cur.price == w[0] and cur.qty == w[1] and cur.cancel_at is None
+            # If nothing changed, do nothing (avoid needless cancel/replace spam).
             if same:
                 continue
+            # If we have a live incumbent not already being cancelled, cancel it.
             if cur is not None and cur.cancel_at is None:
+                # Independent send-latency draw for the cancel.
                 a_out = self.lat.draw_out()  # independent cancel-send draw
+                # Cancel lands (exchange stops matching) at knowledge time + latency.
                 cur.cancel_at = ts_know + a_out  # exchange stops matching here
+                # Schedule the cancel to land, targeting this specific order (side, oid).
                 self._push(cur.cancel_at, "CANCEL", (side, cur.oid))
+                # In stochastic mode, this side stays unconfirmed until the ack returns.
                 if self.use_ack:  # confirmed only after ack
                     self.ack_until[side] = cur.cancel_at + self.lat.draw_ack()
+            # If the strategy wants a quote on this side, send the replacement order.
             if w is not None:
+                # Count an order sent.
                 self.stats["n_orders_sent"] += 1
+                # Independent send-latency draw for the new order (separate from the cancel).
                 a_out = self.lat.draw_out()  # independent new-order draw
+                # The new order lands (becomes eligible to rest) at knowledge time + latency.
                 t_land = ts_know + a_out
+                # Assign a unique id so a future cancel can target THIS specific order.
                 self._oid += 1
+                # Schedule the new order to arrive; empty {} = queue-ahead filled at _arrive.
                 self._push(t_land, "ARRIVE",
                            MyOrder(side, w[0], w[1], {}, t_land, oid=self._oid))
 
     # ============================ main loop ================================
     def run(self, events, snap_groups):
-        """Single pass over the merged event stream. Per event, IN ORDER:
+        """Single pass over the merged event stream: the main replay loop.
+
+        Two clocks are in play throughout (the core anti-lookahead rule):
+        `ts_exch` (exchange time) drives the book and all fill decisions,
+        while `know` (running max of ts_cap) drives what the strategy is
+        allowed to see and act on.
+
+        Per event, IN ORDER:
 
         1. _activate_until: land our in-flight messages due before this
            event (exchange timeline catches up).
@@ -870,48 +1027,131 @@ class Backtester:
         3. Apply the event to the historical book (snapshot = full replace,
            then rebuild our queue dicts; update = add/cancel; trade =
            consume liquidity).
-        4. Mark to market: equity = cash + pos * mid, one row per event
-           with a valid two-sided book. This is the equity curve.
+        4. Mark to market: equity = cash + pos * mid, plus the OBI feature
+           columns (obi_5 near-touch, obi_deep all visible levels). One row
+           per event that has a valid TWO-SIDED book; events during
+           one-sided or empty books are skipped, so the equity curve can be
+           shorter than the event stream.
         5. Advance knowledge time (running max of ts_cap — receive
            timestamps jitter, knowledge never runs backwards) and, inside
-           the session window, let the strategy requote. After session end,
-           pull all working orders (instant, latency-free — acceptable at
-           the close boundary; the closing auction is not modelled).
+           the session window, let the strategy requote. _requote itself
+           applies the halt/band-pin gate and the circuit-band clamp, so
+           quotes are pulled automatically outside continuous trading.
+           After session end, pull all working orders.
+
+        FLAGGED SIMPLIFICATION: the end-of-session pull is instant and
+        latency-free, and final inventory is marked at the last mid — the
+        closing auction and a book-walk liquidation are not modelled.
 
         Returns (fills DataFrame, equity DataFrame, stats dict).
         """
+        # Session window: quote only between t0 and t1 (exchange-ms).
         t0, t1 = self.cfg["session"]
+        # Knowledge time: earliest wall-clock ms by which we could know the current state.
         know = 0
+        # Walk the merged, time-ordered event stream. kind: "S"=snapshot, "U"=update, "T"=trade.
         for ts_exch, _, _, kind, obj in events:
-            self._activate_until(ts_exch)                       # (1)
-            if kind == "T":                                     # (2)
+            # (1) Land any of OUR in-flight orders/cancels due before this event.
+            self._activate_until(ts_exch)
+            # (2) FILL CHECKS -- run against the PRE-event book, before it mutates below.
+            # A trade: could its aggressive flow have hit our resting quote?
+            if kind == "T":
                 self._on_market_trade(obj)
+            # An update: either a new order (may cross us) or a cancel (shrinks our queue).
             elif kind == "U":
+                # A crossing add is marketable flow that would have matched against us.
                 if obj.event == "ORDER_ADD":
                     self._on_market_add(obj)
+                # A cancel of an order ahead of us improves our queue position.
                 else:
                     self._on_market_cancel(obj)
-            if kind == "S":                                     # (3)
+            # (3) APPLY the event to the historical book.
+            # Snapshot: full replacement of the book, then rebuild our queue dicts.
+            if kind == "S":
                 self.book.snapshot(snap_groups[obj.msg_seq])
                 self._on_snapshot_queue_reset()
+            # Update: dispatch to add or cancel on the book.
             elif kind == "U":
                 (self.book.add if obj.event == "ORDER_ADD" else self.book.cancel)(obj)
+            # Otherwise it's a trade: consume the resting liquidity it hit.
             else:
                 self.book.trade(obj)
-            bb, _, ba, _ = self.book.bbo()                      # (4)
+            # (4) MARK TO MARKET -- read the post-event touch.
+            bb, _, ba, _ = self.book.bbo()
+            # Only record a row when both sides exist (skips pre-open, halts, one-sided books).
             if bb is not None and ba is not None:
+                # Mid price used for marking inventory.
                 mid = (bb + ba) / 2
+                # Remember this as the last reliable reference price.
+                self.last_good_mid = mid
+                # One equity row per event: PnL state plus the OBI features for later analysis.
                 self.equity.append({"t": ts_exch, "mid": mid,
                                     "equity": self.cash + self.pos * mid,
                                     "pos": self.pos,
                                     "obi_5": self.book.obi(5),
                                     "obi_deep": self.book.obi(None)})
-            know = max(know, int(obj.ts_cap))                   # (5)
+
+            # Feed the event to the strategy so it can calibrate sigma / flow / quiet time.
+            if hasattr(self.strat, "observe"):
+                _bb, _, _ba, _ = self.book.bbo()
+                _mid = (_bb + _ba) / 2 if (_bb is not None and _ba is not None) else None
+                self.strat.observe(kind, obj, ts_exch, _mid)
+
+            # (5) Advance knowledge time. cummax: receive times jitter, knowledge never rewinds.
+            know = max(know, int(obj.ts_cap))
+            # Inside the session window: let the strategy react to this event.
             if t0 <= ts_exch <= t1:
                 self._requote(know)
+            # Past session end: pull every working quote (instant -- flagged simplification).
             elif ts_exch > t1:
                 for side in list(self.work):
                     self.work.pop(side)
+                    # EOD FLATTEN (production): the FIRST time we cross session end,
+                    # liquidate remaining inventory by walking the real book instead of
+                    # marking it at mid. Mid-marking assumes an impossible exit at the
+                    # midpoint; walking the book pays the spread and eats successively
+                    # worse levels, which is what getting flat actually costs.
+                    if self.eod is None:
+                        # Void all in-flight messages: nothing of ours may land, fill,
+                        # or change position after this report (makes eod final).
+                        self.pending.clear()
+                        # Walk the book to flatten the position, fees included.
+                        liq_cash, unfilled, vwap = self.book.liquidation_value(self.pos, fee_fn=fee_for)
+                        # Read the closing touch for the comparison mid-mark.
+                        bb_e, _, ba_e, _ = self.book.bbo()
+                        # Mid only exists if both sides are present.
+                        mid_e = (bb_e + ba_e) / 2 if (bb_e is not None and ba_e is not None) else None
+                        # The report: both numbers side by side so the overstatement is visible.
+                        # Residual the book could not absorb. Mark it at the last good
+                        # mid with a haircut, because we demonstrably could NOT trade
+                        # out of it -- and flag the run as not cleanly liquidated.
+                        # Reporting cash as equity here books an unclosed position as profit.
+                        ref = mid_e if mid_e is not None else self.last_good_mid
+                        residual_mark = 0.0
+                        if unfilled > 0 and ref is not None:
+                            haircut = self.cfg.get("unfilled_haircut_pct", 0.10)
+                            sgn = 1.0 if self.pos > 0 else -1.0
+                            residual_mark = sgn * unfilled * ref * (1.0 - sgn * haircut)
+                        self.eod = {
+                            # Position we carried into the close.
+                            "pos_at_close": self.pos,
+                            # Mid at session end (None if the book was one-sided).
+                            "mid_at_close": mid_e,
+                            # What the old mid-mark WOULD have reported (diagnostic only).
+                            "equity_mid_mark": (self.cash + self.pos * mid_e) if mid_e is not None else None,
+                            # False means equity_liquidated is an estimate, not a realisable number.
+                            "liquidation_clean": (unfilled == 0),
+                            "residual_marked": residual_mark,
+                            "equity_liquidated": self.cash + liq_cash + residual_mark,
+                            # Achieved liquidation vwap.
+                            "liq_vwap": vwap,
+                            # Slippage vs mid, per share.
+                            "liq_slippage_per_sh": (
+                                abs(vwap - mid_e) if (vwap is not None and mid_e is not None) else None),
+                            # Size the visible book could not absorb -- genuinely unpriceable.
+                            "unfilled_sh": unfilled,
+                        }
+        # Return the accounting logs as DataFrames, plus the diagnostic counters.
         return pd.DataFrame(self.fills), pd.DataFrame(self.equity), self.stats
 
 
@@ -919,34 +1159,65 @@ class NaiveSymmetricMM:
     """Baseline strategy: symmetric quotes at mid ± half_spread.
 
     Exists to exercise the harness and set the bar every smarter strategy
-    must beat. Logic per evaluation:
-      * no two-sided book -> no quotes (pre-open, halts);
+    must beat. It is deliberately naive: no inventory skew, no toxicity
+    gating, no spread-regime awareness.
+
+    Logic per evaluation:
+      * no two-sided book -> no quotes (pre-open, halts, one-sided book);
       * hard inventory gate: long >= max_inv stops bidding, short <= -max_inv
-        stops offering (a gate, not a skew — the measured -437 PKR baseline
-        loss is largely this gate pinning at the cap through a trending
-        day; inventory SKEW is the first improvement to make);
-      * price = mid -/+ half_spread, safe-rounded (round_tick), then
+        stops offering. This is a GATE, not a skew, and it is the baseline's
+        main weakness: on the MCB sample day inventory pinned at the cap
+        (|pos| reached 548 vs a 500 cap, and sat at >=90% of cap for 34.7%
+        of the session) through a trending day. Inventory SKEW — shifting
+        both quotes against the position instead of switching a side off —
+        is the first improvement to make;
+      * price = mid -/+ half_spread, safe-rounded (round_tick: bids floor,
+        asks ceil, so rounding never makes a quote more aggressive), then
         post-only clipped one tick inside the opposite touch so the sent
-        order is never marketable against the book we can see (it can
-        still cross the book as it stands after latency -> _arrive check);
+        order is never marketable against the book we can see. It can still
+        cross the book as it stands after latency -> handled by the
+        crossing-reject check in _arrive;
       * round(px, 2) kills float dust (405.16999... -> 405.17) so the
         no-churn comparison in _requote sees identical prices as identical.
+
+    Reference numbers (MCB 2026-06-30, hs=0.20, size=50, max_inv=500,
+    constant 120ms latency, full 17.73 bps/side fee schedule, book-walk EOD
+    liquidation): 417 fills, PnL -5,611 PKR. Note the loss is dominated by
+    fees at this schedule, not by fill quality — see the fee analysis.
+
+    Strategy interface contract: quotes() returns {side: (price, qty)} and
+    may omit a side to mean 'no quote there'. Any replacement strategy needs
+    only this method with the same signature.
     """
 
     def __init__(self, half_spread=0.20, size=50, max_inv=500):
+        # hs = half-spread in PKR (distance from mid to each quote).
+        # size = shares per quote. max_inv = hard inventory cap in shares.
         self.hs, self.size, self.max_inv = half_spread, size, max_inv
 
     def quotes(self, bb, bq, ba, aq, pos):
+        # No two-sided book (pre-open, halt, one side empty) -> quote nothing.
         if bb is None or ba is None:
             return {}
+        # Reference price: the arithmetic midpoint of the touch.
         mid = (bb + ba) / 2
+        # Desired quotes, keyed by side. A missing key means 'no quote there'.
         out = {}
+        # Bid only while we are not already at the long inventory cap.
         if pos < self.max_inv:
+            # Target bid = mid - half_spread, floored onto the tick grid;
+            # then post-only clip to one tick BELOW the best ask so it cannot take.
             px = min(round_tick(mid - self.hs, "BUY"), ba - TICK)
+            # Store the bid, rounded to 2dp to kill float dust for the no-churn check.
             out["BUY"] = (round(px, 2), self.size)
+        # Offer only while we are not already at the short inventory cap.
         if pos > -self.max_inv:
+            # Target ask = mid + half_spread, ceiled onto the tick grid;
+            # then post-only clip to one tick ABOVE the best bid so it cannot take.
             px = max(round_tick(mid + self.hs, "SELL"), bb + TICK)
+            # Store the ask, rounded to 2dp for the same reason.
             out["SELL"] = (round(px, 2), self.size)
+        # Return the desired quote set; _requote reconciles it against what's working.
         return out
 
 
