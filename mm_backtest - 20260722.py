@@ -373,15 +373,16 @@ class Book:
              if o.side == side and o.price == price and not k.startswith("__NEG_")}
         neg = sum(o.qty for k, o in self.o.items()
                   if k.startswith("__NEG_") and o.side == side and o.price == price)
-        if neg < 0:  # shrink our queue by
-            for k in list(d):  # the already-traded qty
-                if neg >= 0:
-                    break
-                take = min(d[k], -neg)
-                d[k] -= take
-                neg += take
-                if d[k] <= 0:
-                    del d[k]
+        if neg < 0:  # only if there's traded-away qty to account for
+            for k in list(d):  # walk the real orders in d
+                if neg >= 0:  # once the full __NEG_ amount is absorbed,
+                    break  # stop
+                take = min(d[k], -neg)  # remove from THIS order: the smaller of
+                #   its size or the remaining amount to absorb
+                d[k] -= take  # shrink this order in our queue view
+                neg += take  # move neg toward 0 by what we just absorbed
+                if d[k] <= 0:  # order fully consumed ->
+                    del d[k]  # remove it from the queue
         return d
 
     def obi(self, n=None, include_deep=False):
@@ -398,17 +399,23 @@ class Book:
         obi(5) (near touch, cleanest), obi(None) (all visible levels), and
         obi(include_deep=True) (whole book including the deep aggregate).
         """
-        bids, asks = {}, {}
-        for k, o in self.o.items(): # Walk every entry in the book. k is the order ID (the dict key), o is the Order (side, price, qty).
-            if k.startswith("__AGG_") and not include_deep:
-                continue  # skip deep residual
-            d = bids if o.side == "BUY" else asks
-            d[o.price] = d.get(o.price, 0.0) + o.qty
-        bids = {p: q for p, q in bids.items() if q > 0}  # clamp netted levels
-        asks = {p: q for p, q in asks.items() if q > 0}
-        bq = sum(q for _, q in sorted(bids.items(), reverse=True)[:n]) if bids else 0.0
-        aq = sum(q for _, q in sorted(asks.items())[:n]) if asks else 0.0
-        return (bq - aq) / (bq + aq) if bq + aq > 0 else None
+        bids, asks = {}, {}  # two empty dicts to accumulate total qty per price: {price: qty}. bids = buy side, asks = sell side.
+        for k, o in self.o.items():  # walk every entry in the book. k = order ID (dict key), o = the Order (side, price, qty).
+            if k.startswith(
+                    "__AGG_") and not include_deep:  # __AGG_ = the deep-book residual lump (liquidity beyond level 10).
+                continue  # skip it UNLESS include_deep=True was requested; otherwise it would swamp the near-touch imbalance.
+            d = bids if o.side == "BUY" else asks  # point d at the correct side's dict (buys -> bids, sells -> asks). d is a reference, not a copy.
+            d[o.price] = d.get(o.price,
+                               0.0) + o.qty  # add this entry's qty into its price level. .get(price, 0.0) = "total so far here, or 0 if new". __NEG_ has negative qty, so this SUBTRACTS for those entries (netting).
+        bids = {p: q for p, q in bids.items() if
+                q > 0}  # clamp: keep only price levels with positive net qty. A level netted to <=0 (e.g. __NEG_ cancelled the real orders) is dropped as empty.
+        asks = {p: q for p, q in asks.items() if q > 0}  # same clamp for the ask side.
+        bq = sum(q for _, q in sorted(bids.items(), reverse=True)[
+            :n]) if bids else 0.0  # bid depth: sort levels HIGH-to-LOW (best bid first), take top n (n=None -> all), sum their qty. 0.0 if no bids (guards empty side).
+        aq = sum(q for _, q in sorted(asks.items())[
+            :n]) if asks else 0.0  # ask depth: sort levels LOW-to-HIGH (best ask first, no reverse), take top n, sum. 0.0 if no asks.
+        return (bq - aq) / (
+                    bq + aq) if bq + aq > 0 else None  # imbalance = (bid depth - ask depth)/(total depth). Range [-1,+1]: +ve = buy pressure, -ve = sell pressure. None if book empty (avoid /0).
 
 @dataclass
 class MyOrder:
