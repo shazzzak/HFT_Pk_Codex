@@ -564,8 +564,12 @@ def _build_trades(recs, adds_index: dict) -> pd.DataFrame:
     keys = zip(df["channel"].astype("object"),
                df["resting_ref"].astype("float").fillna(-1).astype(int))
 
+    # PRODUCTION FIX: Extract index [0] to avoid Tuple injection.
+    # Use pd.NA instead of None to ensure zero-overhead casting to string[pyarrow] later.
+    # We explicitly use .get() here (not .pop()) because trades can be PARTIAL fills;
+    # popping the order here would break subsequent partial fills on the same order.
     df["resting_order_id"] = [
-        adds_index.get(k, (None, None))[0]  # only order_id
+        adds_index.get(k, (pd.NA, None))[0]
         for k in keys
     ]
 
