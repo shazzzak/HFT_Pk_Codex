@@ -47,6 +47,57 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import psutil, os
+proc = psutil.Process(os.getpid())
+
+import sqlite3
+
+import resource
+
+class DiskBackedIndex:
+    """
+    Bounded-memory replacement for the plain adds_index dict. Keeps a hot
+    LRU-style cache in memory and spills everything else to SQLite, so
+    per-chunk memory growth stops being a function of total resting-order
+    count for the day. Fixes the unbounded growth seen at chunks 1-5
+    (43k -> 410k entries and climbing).
+    """
+    def __init__(self, db_path, hot_cache_size=200_000):
+        self.conn = sqlite3.connect(db_path)
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS idx (k TEXT PRIMARY KEY, oid TEXT, px REAL)"
+        )
+        self.hot = {}
+        self.hot_cache_size = hot_cache_size
+
+    def __setitem__(self, key, value):
+        self.hot[key] = value
+        if len(self.hot) > self.hot_cache_size:
+            self._flush()
+
+    def get(self, key, default=(None, None)):
+        if key in self.hot:
+            return self.hot[key]
+        row = self.conn.execute("SELECT oid, px FROM idx WHERE k=?", (str(key),)).fetchone()
+        return row if row else default
+
+    def __contains__(self, key):
+        return key in self.hot or self.get(key) != (None, None)
+
+    def __len__(self):
+        count = self.conn.execute("SELECT COUNT(*) FROM idx").fetchone()[0]
+        return count + len(self.hot)
+
+    def _flush(self):
+        rows = [(str(k), v[0], v[1]) for k, v in self.hot.items()]
+        self.conn.executemany("INSERT OR REPLACE INTO idx (k, oid, px) VALUES (?, ?, ?)", rows)
+        self.conn.commit()
+        self.hot.clear()
+
+    def close(self):
+        self._flush()
+        self.conn.close()
+
 
 # ─────────────────────────── configuration ───────────────────────────────────
 IN_DIR      = Path("/Users/shazzak/Library/CloudStorage/"
@@ -154,6 +205,103 @@ BREAK_REASON_MAP = {
     "4": "BEFORE_POST_CLOSE",
 }
 
+
+# ─────────────────────── canonical schemas (Fix 16) ───────────────────────
+
+TRADES_RAW_COLS = {
+    "capture_ts": "datetime64[ns, UTC]", "msg_seq": "Int64",
+    "sending_time": "datetime64[ns, UTC]", "channel": "Int64",
+    "segment": "string", "appl_seq": "Int64", "symbol": "string",
+    "price": "float64", "qty": "float64",
+    "transact_time": "datetime64[ns, UTC]",
+    "exec_type_code": "string", "exec_inst": "string",
+    "buy_ref": "Int64", "sell_ref": "Int64",
+}
+
+TRADES_FINAL_COLS = {
+    "transact_time": "datetime64[ns, UTC]", "sending_time": "datetime64[ns, UTC]",
+    "capture_ts": "datetime64[ns, UTC]", "msg_seq": "Int64", "appl_seq": "Int64",
+    "channel": "Int64", "segment": "string", "market": "string",
+    "exec_type_code": "string", "exec_type": "string", "exec_inst": "string",
+    "symbol": "string", "price": "float64", "qty": "float64",
+    "buy_ref": "Int64", "sell_ref": "Int64", "resting_ref": "Int64",
+    "resting_order_id": "string", "initiator": "string", "aggressor_side": "string",
+}
+
+OB_UPDATES_RAW_COLS = {
+    "capture_ts": "datetime64[ns, UTC]", "msg_seq": "Int64",
+    "sending_time": "datetime64[ns, UTC]", "channel": "Int64",
+    "segment": "string", "event": "string", "appl_seq": "Int64",
+    "symbol": "string", "side_code": "string", "price": "float64",
+    "qty": "float64", "order_id": "string",
+    "transact_time": "datetime64[ns, UTC]",
+    "exec_type_code": "string", "exec_inst": "string",
+    "buy_ref": "Int64", "sell_ref": "Int64", "raw_last_px": "float64",
+}
+
+OB_UPDATES_FINAL_COLS = {
+    "transact_time": "datetime64[ns, UTC]", "sending_time": "datetime64[ns, UTC]",
+    "capture_ts": "datetime64[ns, UTC]", "msg_seq": "Int64", "appl_seq": "Int64",
+    "channel": "Int64", "segment": "string", "market": "string",
+    "event": "string", "exec_type_code": "string", "exec_type": "string",
+    "exec_inst": "string", "symbol": "string", "side_code": "string",
+    "side": "string", "price": "float64", "qty": "float64", "order_id": "string",
+    "buy_ref": "Int64", "sell_ref": "Int64", "resting_ref": "Int64",
+    "raw_last_px": "float64",
+}
+
+OB_SNAPSHOT_RAW_COLS = {
+    "capture_ts": "datetime64[ns, UTC]", "msg_seq": "Int64",
+    "sending_time": "datetime64[ns, UTC]", "channel": "Int64",
+    "segment": "string", "orig_time": "datetime64[ns, UTC]",
+    "symbol": "string", "trading_status": "string",
+    "prev_close": "float64", "num_trades": "Int64",
+    "cum_volume": "float64", "cum_value": "float64", "n_entries": "Int64",
+    "entry_type_code": "string", "px": "float64", "qty": "float64",
+    "level": "Int64", "n_orders_at_level": "Int64", "n_orders_detailed": "Int64",
+    "order_ids": "object", "order_qtys": "object",
+}
+
+OB_SNAPSHOT_FINAL_COLS = {
+    "snapshot_time": "datetime64[ns, UTC]", "orig_time": "datetime64[ns, UTC]",
+    "capture_ts": "datetime64[ns, UTC]", "msg_seq": "Int64",
+    "channel": "Int64", "segment": "string", "market": "string",
+    "symbol": "string", "trading_status": "string", "phase": "string",
+    "suspended_all_day": "boolean", "break_reason": "string",
+    "prev_close": "float64", "num_trades": "Int64",
+    "cum_volume": "float64", "cum_value": "float64",
+    "entry_type_code": "string", "entry_type": "string",
+    "level": "Int64", "px": "float64", "qty": "float64",
+    "n_orders_at_level": "Int64", "n_orders_detailed": "Int64",
+    "order_ids": "string", "order_qtys": "string", "visible_qty_sum": "float64",
+    "is_xf_tick_floor": "boolean",
+}
+
+OTHER_RAW_COLS = {
+    "capture_ts": "datetime64[ns, UTC]", "msg_seq": "Int64",
+    "sending_time": "datetime64[ns, UTC]", "msg_type": "string",
+    "channel": "Int64", "segment": "string", "raw": "string",
+    "orig_time": "datetime64[ns, UTC]", "n_streams": "Int64",
+    "appl_last_seq": "Int64", "end_of_channel": "Int64",
+    "heartbeat_time": "datetime64[ns, UTC]",
+}
+
+OTHER_FINAL_COLS = {
+    "capture_ts": "datetime64[ns, UTC]", "sending_time": "datetime64[ns, UTC]",
+    "orig_time": "datetime64[ns, UTC]", "msg_seq": "Int64", "msg_type": "string",
+    "channel": "Int64", "segment": "string", "n_streams": "Int64",
+    "appl_last_seq": "Int64", "end_of_channel": "Int64",
+    "heartbeat_time": "datetime64[ns, UTC]", "raw": "string",
+}
+
+def _ensure_cols(df: pd.DataFrame, col_dtypes: dict) -> pd.DataFrame:
+    """Guarantee every column in col_dtypes exists on df with the correct
+    dtype, even when the source chunk contributed zero matching records.
+    """
+    for c, dtype in col_dtypes.items():
+        if c not in df.columns:
+            df[c] = pd.Series(pd.NA, index=df.index, dtype=dtype)
+    return df
 
 # ─────────────────────────── low-level parsing ───────────────────────────────
 
@@ -361,7 +509,8 @@ def _build_trades(recs, adds_index: dict) -> pd.DataFrame:
     """
     df = pd.DataFrame(recs)
     if df.empty:
-        return df
+        return _ensure_cols(df, TRADES_FINAL_COLS)
+    df = _ensure_cols(df, TRADES_RAW_COLS)
 
     for c in ("price", "qty"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -401,17 +550,12 @@ def _build_trades(recs, adds_index: dict) -> pd.DataFrame:
         {"BUYER_INITIATED": "BUY", "SELLER_INITIATED": "SELL",
          "AUCTION": "AUCTION"})
 
-    df = df[["transact_time", "sending_time", "capture_ts", "msg_seq",
-             "appl_seq", "channel", "segment", "market",
-             "exec_type_code", "exec_type", "exec_inst",
-             "symbol", "price", "qty",
-             "buy_ref", "sell_ref", "resting_ref", "resting_order_id",
-             "initiator", "aggressor_side"]]
+    df = df[list(TRADES_FINAL_COLS.keys())]
 
-    for c in ("segment", "market", "exec_type_code", "exec_type",
-              "exec_inst", "symbol", "resting_order_id",
-              "initiator", "aggressor_side"):
-        df[c] = df[c].astype("string")
+    for c, dtype in TRADES_FINAL_COLS.items():
+        if dtype in ("string", "Int64", "boolean", "float64"):
+            df[c] = df[c].astype(dtype)
+
     return df
 
 
@@ -427,7 +571,8 @@ def _build_ob_updates(recs, adds_index: dict) -> pd.DataFrame:
     """
     df = pd.DataFrame(recs)
     if df.empty:
-        return df
+        return _ensure_cols(df, OB_UPDATES_FINAL_COLS)
+    df = _ensure_cols(df, OB_UPDATES_RAW_COLS)
 
     # keep raw_last_px separate; do not use as final price for cancels
     # ALWAYS create this column (even if this chunk has zero cancels) so
@@ -488,18 +633,12 @@ def _build_ob_updates(recs, adds_index: dict) -> pd.DataFrame:
     df.loc[is_cxl, "side_code"] = cxl_side[is_cxl]
     df.loc[is_cxl, "side"]      = df.loc[is_cxl, "side_code"].map(SIDE_MAP)
 
-    cols = ["transact_time", "sending_time", "capture_ts", "msg_seq",
-            "appl_seq", "channel", "segment", "market",
-            "event", "exec_type_code", "exec_type", "exec_inst",
-            "symbol", "side_code", "side",
-            "price", "qty", "order_id",
-            "buy_ref", "sell_ref", "resting_ref",
-            "raw_last_px"]   # kept for audit/QA of Fix 9; always present
-    df = df[cols]
+    df = df[list(OB_UPDATES_FINAL_COLS.keys())]
 
-    for c in ("segment", "market", "event", "exec_type_code", "exec_type",
-              "exec_inst", "symbol", "side_code", "side", "order_id"):
-        df[c] = df[c].astype("string")
+    for c, dtype in OB_UPDATES_FINAL_COLS.items():
+        if dtype in ("string", "Int64", "boolean", "float64"):
+            df[c] = df[c].astype(dtype)
+
     return df
 
 
@@ -517,7 +656,8 @@ def _build_ob_snapshot(recs) -> pd.DataFrame:
     """
     df = pd.DataFrame(recs)
     if df.empty:
-        return df
+        return _ensure_cols(df, OB_SNAPSHOT_FINAL_COLS)
+    df = _ensure_cols(df, OB_SNAPSHOT_RAW_COLS)
 
     for c in ("px", "qty", "prev_close", "cum_volume", "cum_value"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -569,20 +709,12 @@ def _build_ob_snapshot(recs) -> pd.DataFrame:
     df["order_qtys"] = df["order_qtys"].map(
         lambda x: "|".join(x) if isinstance(x, list) else None)
 
-    df = df[["snapshot_time", "orig_time", "capture_ts", "msg_seq",
-             "channel", "segment", "market",
-             "symbol", "trading_status", "phase",
-             "suspended_all_day", "break_reason",
-             "prev_close", "num_trades", "cum_volume", "cum_value",
-             "entry_type_code", "entry_type",
-             "level", "px", "qty",
-             "n_orders_at_level", "n_orders_detailed",
-             "order_ids", "order_qtys", "visible_qty_sum",
-             "is_xf_tick_floor"]]
+    df = df[list(OB_SNAPSHOT_FINAL_COLS.keys())]
 
-    for c in ("segment", "market", "symbol", "trading_status",
-              "entry_type_code", "entry_type", "order_ids", "order_qtys"):
-        df[c] = df[c].astype("string")
+    for c, dtype in OB_SNAPSHOT_FINAL_COLS.items():
+        if dtype in ("string", "Int64", "boolean", "float64"):
+            df[c] = df[c].astype(dtype)
+
     return df
 
 
@@ -594,7 +726,8 @@ def _build_other(recs) -> pd.DataFrame:
     """
     df = pd.DataFrame(recs)
     if df.empty:
-        return df
+        return _ensure_cols(df, OTHER_FINAL_COLS)
+    df = _ensure_cols(df, OTHER_RAW_COLS)
 
     df["msg_seq"] = pd.to_numeric(df["msg_seq"], errors="coerce").astype("Int64")
     df["channel"] = pd.to_numeric(df["channel"], errors="coerce").astype("Int64")
@@ -621,14 +754,12 @@ def _build_other(recs) -> pd.DataFrame:
     df["end_of_channel"] = pd.to_numeric(df["end_of_channel"], errors="coerce").astype("Int64")
     df["heartbeat_time"] = _to_utc(df["heartbeat_time"])
 
-    df = df[["capture_ts", "sending_time", "orig_time",
-             "msg_seq", "msg_type", "channel", "segment",
-             "n_streams",
-             "appl_last_seq", "end_of_channel", "heartbeat_time",
-             "raw"]]
+    df = df[list(OTHER_FINAL_COLS.keys())]
 
-    for c in ("msg_type", "segment", "raw"):
-        df[c] = df[c].astype("string")
+    for c, dtype in OTHER_FINAL_COLS.items():
+        if dtype in ("string", "Int64", "boolean", "float64"):
+            df[c] = df[c].astype(dtype)
+
     return df
 
 
@@ -678,7 +809,8 @@ def run_day(src, parsed_root=PARSED_ROOT, chunk_lines=CHUNK_LINES):
     totals  = dict.fromkeys(labels, 0)
 
     # adds_index now stores (order_id, price) tuples — needed for Fix 9
-    adds_index = {}
+    #adds_index = {}
+    adds_index = DiskBackedIndex(out_dir / f"{day}_adds_index.sqlite")
     n_chunk    = 0
     n_lines    = 0
     t0         = time.time()
@@ -700,6 +832,14 @@ def run_day(src, parsed_root=PARSED_ROOT, chunk_lines=CHUNK_LINES):
                       flush=True)
             if len(buf) >= chunk_lines:
                 n_chunk += 1
+
+                proc = psutil.Process()
+                rss_mb = proc.memory_info().rss / (1024 ** 2)  # live current RSS, not historical peak
+                vm = psutil.virtual_memory()
+                print(f"  [chunk {n_chunk}] adds_index size={len(adds_index):,} entries, "
+                      f"live RSS={rss_mb:,.0f} MB, system available={vm.available / (1024 ** 2):,.0f} MB, "
+                      f"swap used={psutil.swap_memory().used / (1024 ** 2):,.0f} MB")
+
                 _write_chunk(buf, n_chunk, adds_index, out_dir, day, totals, t0)
                 buf = []
 
@@ -708,10 +848,14 @@ def run_day(src, parsed_root=PARSED_ROOT, chunk_lines=CHUNK_LINES):
             _write_chunk(buf, n_chunk, adds_index, out_dir, day, totals, t0)
             del buf
 
+    adds_index.close()
     del adds_index
+
+
     gc.collect()
     print(f"\nPass 1 done: {n_chunk} chunks, {n_lines:,} lines.", flush=True)
     print(f"Row totals  : {totals}", flush=True)
+    print(f"    RSS {proc.memory_info().rss / 1e9:.2f} GB")
 
     print("\nMerging partials …", flush=True)
     for label in labels:
