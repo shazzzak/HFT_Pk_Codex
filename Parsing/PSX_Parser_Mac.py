@@ -294,14 +294,40 @@ OTHER_FINAL_COLS = {
     "heartbeat_time": "datetime64[ns, UTC]", "raw": "string",
 }
 
-def _ensure_cols(df: pd.DataFrame, col_dtypes: dict) -> pd.DataFrame:
-    """Guarantee every column in col_dtypes exists on df with the correct
-    dtype, even when the source chunk contributed zero matching records.
+
+def _ensure_cols(df: pd.DataFrame, cols: dict[str, str]) -> pd.DataFrame:
     """
-    for c, dtype in col_dtypes.items():
+    Ensure all columns in `cols` exist with the given dtype.
+    `cols` maps column_name -> dtype string (e.g. "Int64", "float64", "string").
+    """
+    for c, dtype in cols.items():
         if c not in df.columns:
-            df[c] = pd.Series(pd.NA, index=df.index, dtype=dtype)
+            # Column missing: create with appropriate nulls
+            if dtype in ("Int64", "Float64", "boolean", "string"):
+                df[c] = pd.Series(pd.NA, index=df.index, dtype=dtype)
+            elif dtype == "float64":
+                df[c] = pd.Series(np.nan, index=df.index, dtype=dtype)
+            else:
+                # fallback: treat other numeric vs non-numeric
+                if dtype.startswith("float") or dtype.startswith("int"):
+                    df[c] = pd.Series(np.nan, index=df.index, dtype=dtype)
+                else:
+                    df[c] = pd.Series(pd.NA, index=df.index, dtype=dtype)
+        else:
+            # Column exists: enforce dtype safely
+            if dtype in ("Int64", "Float64"):
+                # coerce bad literals (e.g. 'N') to NA before casting
+                df[c] = pd.to_numeric(df[c], errors="coerce").astype(dtype)
+            elif dtype == "float64":
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            elif dtype in ("boolean", "string"):
+                df[c] = df[c].astype(dtype)
+            else:
+                # generic fallback, still ok for object/string-like
+                df[c] = df[c].astype(dtype)
+
     return df
+
 
 # ─────────────────────────── low-level parsing ───────────────────────────────
 
@@ -537,7 +563,12 @@ def _build_trades(recs, adds_index: dict) -> pd.DataFrame:
 
     keys = zip(df["channel"].astype("object"),
                df["resting_ref"].astype("float").fillna(-1).astype(int))
-    df["resting_order_id"] = [adds_index.get(k) for k in keys]
+
+    df["resting_order_id"] = [
+        adds_index.get(k, (None, None))[0]  # only order_id
+        for k in keys
+    ]
+
     df.loc[is_auction, "resting_order_id"] = pd.NA        # Fix 8
 
     init = pd.Series(pd.NA, index=df.index, dtype="object")
@@ -604,12 +635,15 @@ def _build_ob_updates(recs, adds_index: dict) -> pd.DataFrame:
     df.loc[is_add, "exec_inst"] = pd.NA
 
     # populate adds_index with (order_id, price) so cancels can resolve both
-    for ch, sq, oid, px in zip(df.loc[is_add, "channel"],
-                                df.loc[is_add, "appl_seq"],
-                                df.loc[is_add, "order_id"],
-                                df.loc[is_add, "price"]):
-        if pd.notna(sq) and pd.notna(ch):
-            adds_index[(int(ch), int(sq))] = (oid, px)
+    mask = is_add & df["channel"].notna() & df["appl_seq"].notna()
+
+    for ch, sq, oid, px in zip(
+            df.loc[mask, "channel"].astype(int),
+            df.loc[mask, "appl_seq"].astype(int),
+            df.loc[mask, "order_id"],
+            df.loc[mask, "price"],
+    ):
+        adds_index[(ch, sq)] = (oid, px)
 
     ref = df["buy_ref"].where(df["buy_ref"].fillna(0) > 0, df["sell_ref"])
     df["resting_ref"] = ref.where(ref.fillna(0) > 0).astype("Int64")
