@@ -847,9 +847,9 @@ def run_day(src, parsed_root=PARSED_ROOT, chunk_lines=CHUNK_LINES):
     totals  = dict.fromkeys(labels, 0)
 
     # adds_index now stores (order_id, price) tuples — needed for Fix 9
-    #adds_index = {}
-    adds_index = DiskBackedIndex(out_dir / f"{day}_adds_index.sqlite")
-    n_chunk    = 0
+    sqlite_path = out_dir / f"{day}_adds_index.sqlite"
+    adds_index = DiskBackedIndex(sqlite_path)
+    n_chunk = 0
     n_lines    = 0
     t0         = time.time()
 
@@ -889,8 +889,18 @@ def run_day(src, parsed_root=PARSED_ROOT, chunk_lines=CHUNK_LINES):
     adds_index.close()
     del adds_index
 
+    # PRODUCTION FIX: Delete the temporary SQLite cache file from the drive.
+    # If we don't do this, out_dir.rmdir() at the end of the script will fail
+    # because the directory isn't empty, leaving ghost folders behind.
+    try:
+        sqlite_path.unlink()
+    except FileNotFoundError:
+        pass
+    except PermissionError:
+        print(f"  WARNING: could not delete {sqlite_path.name} (locked?) — delete manually")
 
     gc.collect()
+
     print(f"\nPass 1 done: {n_chunk} chunks, {n_lines:,} lines.", flush=True)
     print(f"Row totals  : {totals}", flush=True)
     print(f"    RSS {proc.memory_info().rss / 1e9:.2f} GB")
