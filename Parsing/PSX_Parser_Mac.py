@@ -738,13 +738,26 @@ def _build_ob_snapshot(recs) -> pd.DataFrame:
     df = pd.DataFrame(recs)
     if df.empty:
         return _ensure_cols(df, OB_SNAPSHOT_FINAL_COLS)
+
+    _t = time.time() # DELETE
+
     df = _ensure_cols(df, OB_SNAPSHOT_RAW_COLS)
+
+    print(f"      snap 1: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
+    _t = time.time() # DELETE
 
     for c in ("px", "qty", "prev_close", "cum_volume", "cum_value"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    print(f"      snap 2: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
+    _t = time.time() # DELETE
+
     for c in ("msg_seq", "num_trades", "n_entries", "level",
               "n_orders_at_level", "n_orders_detailed"):
         df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+
+    print(f"      snap 3: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
+    _t = time.time() # DELETE
 
     df["channel"] = pd.to_numeric(df["channel"], errors="coerce").astype("Int64")
 
@@ -753,8 +766,19 @@ def _build_ob_snapshot(recs) -> pd.DataFrame:
     df["capture_ts"]    = pd.to_datetime(df["capture_ts"], utc=True,
                                          format="mixed", errors="coerce")
 
+    print(f"      snap 4: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
+    _t = time.time() # DELETE
+
+
     df["entry_type"] = df["entry_type_code"].map(MDENTRY_MAP)   # Fix 11
+
+    print(f"      snap 5: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
+    _t = time.time() # DELETE
+
     df["market"]     = df["segment"].map(SNAPSHOT_SEGMENT_MAP)
+
+    print(f"      snap 6: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
+    _t = time.time() # DELETE
 
     # Fix 12: xe no-limit sentinel -> NULL. xf intentionally left untouched;
     # instead flag rows where px looks like a tick-size floor (heuristic:
@@ -778,23 +802,42 @@ def _build_ob_snapshot(recs) -> pd.DataFrame:
         phase_char == "B", break_char.map(BREAK_REASON_MAP), None)
     df["break_reason"] = df["break_reason"].astype("string")
 
+    print(f"      snap 7: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
+    _t = time.time() # DELETE
+
+
     # Fix 14: level/order-count columns already Int64 (nullable) — after-hour
     # (phase A) rows will naturally carry <NA> since spec releases only
     # 269/270/271 in that phase and the source message omits 1023/346/73.
 
+    # np.sum() on a small Python list builds a numpy array per call -- ~8x
+    # slower than the builtin sum() for lists of a few elements, and this runs
+    # once per snapshot row (millions per chunk). Results are identical.
     df["visible_qty_sum"] = df["order_qtys"].map(
-        lambda q: float(np.sum([float(x) for x in q]))
-        if isinstance(q, list) else np.nan)
+        lambda q: sum(map(float, q)) if isinstance(q, list) else np.nan)
+
+    print(f"      snap 8: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
+    _t = time.time() # DELETE
+
     df["order_ids"]  = df["order_ids"].map(
         lambda x: "|".join(x) if isinstance(x, list) else None)
+
+    print(f"      snap 9: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
+    _t = time.time() # DELETE
+
     df["order_qtys"] = df["order_qtys"].map(
         lambda x: "|".join(x) if isinstance(x, list) else None)
+
+    print(f"      snap 10: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
+    _t = time.time() # DELETE
 
     df = df[list(OB_SNAPSHOT_FINAL_COLS.keys())]
 
     for c, dtype in OB_SNAPSHOT_FINAL_COLS.items():
         if dtype in ("string", "Int64", "boolean", "float64"):
             df[c] = df[c].astype(dtype)
+
+    print(f"      snap 11: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
 
     return df
 
