@@ -55,6 +55,7 @@ import sqlite3
 import resource
 import duckdb
 
+
 # Sort keys per table: symbol first (enables parquet row-group pruning on
 # single-symbol reads), then the exchange's own sequence number -- exact wire
 # order within a symbol, immune to string-timestamp formatting quirks.
@@ -336,6 +337,7 @@ def _ensure_cols(df: pd.DataFrame, cols: dict[str, str]) -> pd.DataFrame:
     `cols` maps column_name -> dtype string (e.g. "Int64", "float64", "string").
     """
     for c, dtype in cols.items():
+        _tc = time.time()
         if c not in df.columns:
             # Column missing: create with appropriate nulls
             if dtype in ("Int64", "Float64", "boolean", "string"):
@@ -360,6 +362,8 @@ def _ensure_cols(df: pd.DataFrame, cols: dict[str, str]) -> pd.DataFrame:
             else:
                 # generic fallback, still ok for object/string-like
                 df[c] = df[c].astype(dtype)
+
+        print(f"        ensure {c:>20s} {dtype:>8s} {time.time() - _tc:5.2f}s", flush=True)
 
     return df
 
@@ -739,25 +743,14 @@ def _build_ob_snapshot(recs) -> pd.DataFrame:
     if df.empty:
         return _ensure_cols(df, OB_SNAPSHOT_FINAL_COLS)
 
-    _t = time.time() # DELETE
-
     df = _ensure_cols(df, OB_SNAPSHOT_RAW_COLS)
-
-    print(f"      snap 1: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
-    _t = time.time() # DELETE
 
     for c in ("px", "qty", "prev_close", "cum_volume", "cum_value"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    print(f"      snap 2: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
-    _t = time.time() # DELETE
-
     for c in ("msg_seq", "num_trades", "n_entries", "level",
               "n_orders_at_level", "n_orders_detailed"):
         df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
-
-    print(f"      snap 3: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
-    _t = time.time() # DELETE
 
     df["channel"] = pd.to_numeric(df["channel"], errors="coerce").astype("Int64")
 
@@ -766,19 +759,10 @@ def _build_ob_snapshot(recs) -> pd.DataFrame:
     df["capture_ts"]    = pd.to_datetime(df["capture_ts"], utc=True,
                                          format="mixed", errors="coerce")
 
-    print(f"      snap 4: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
-    _t = time.time() # DELETE
-
 
     df["entry_type"] = df["entry_type_code"].map(MDENTRY_MAP)   # Fix 11
 
-    print(f"      snap 5: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
-    _t = time.time() # DELETE
-
     df["market"]     = df["segment"].map(SNAPSHOT_SEGMENT_MAP)
-
-    print(f"      snap 6: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
-    _t = time.time() # DELETE
 
     # Fix 12: xe no-limit sentinel -> NULL. xf intentionally left untouched;
     # instead flag rows where px looks like a tick-size floor (heuristic:
@@ -802,9 +786,6 @@ def _build_ob_snapshot(recs) -> pd.DataFrame:
         phase_char == "B", break_char.map(BREAK_REASON_MAP), None)
     df["break_reason"] = df["break_reason"].astype("string")
 
-    print(f"      snap 7: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
-    _t = time.time() # DELETE
-
 
     # Fix 14: level/order-count columns already Int64 (nullable) — after-hour
     # (phase A) rows will naturally carry <NA> since spec releases only
@@ -816,20 +797,11 @@ def _build_ob_snapshot(recs) -> pd.DataFrame:
     df["visible_qty_sum"] = df["order_qtys"].map(
         lambda q: sum(map(float, q)) if isinstance(q, list) else np.nan)
 
-    print(f"      snap 8: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
-    _t = time.time() # DELETE
-
     df["order_ids"]  = df["order_ids"].map(
         lambda x: "|".join(x) if isinstance(x, list) else None)
 
-    print(f"      snap 9: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
-    _t = time.time() # DELETE
-
     df["order_qtys"] = df["order_qtys"].map(
         lambda x: "|".join(x) if isinstance(x, list) else None)
-
-    print(f"      snap 10: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
-    _t = time.time() # DELETE
 
     df = df[list(OB_SNAPSHOT_FINAL_COLS.keys())]
 
@@ -837,7 +809,6 @@ def _build_ob_snapshot(recs) -> pd.DataFrame:
         if dtype in ("string", "Int64", "boolean", "float64"):
             df[c] = df[c].astype(dtype)
 
-    print(f"      snap 11: frame+cols {time.time() - _t:.1f}s", flush=True) # DELETE
 
     return df
 
