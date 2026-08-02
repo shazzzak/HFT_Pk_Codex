@@ -967,8 +967,11 @@ def run_day(src, parsed_root=PARSED_ROOT, chunk_lines=CHUNK_LINES):
         if final.exists():
             final.unlink()  # COPY must not hit a stale file
         con = duckdb.connect()
-        # Cap sort memory and spill into the day's tmp dir (cleaned up below).
-        con.execute("SET memory_limit='4GB'")
+        # Let DuckDB use real memory: a hard 4GB cap forces an external
+        # (disk-based) merge sort on 40M+ row tables, which is what made this
+        # 3x slower. Set generously; DuckDB spills only if it must.
+        con.execute("SET memory_limit='10GB'")
+        # Spill directory only used if the limit is genuinely exceeded.
         con.execute(f"SET temp_directory='{(out_dir / 'duck_spill').as_posix()}'")
         con.execute(f"""
                     COPY (
