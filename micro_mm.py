@@ -64,8 +64,9 @@ class MicrostructureMM:
 
     def __init__(self, size=50, max_inv=500, gamma=0.15, kappa=1.5,
                  session_ms=(0, 1), fee_pct=None, min_edge_pct=0.0,
-                 sigma_window=200, flow_window=50, tick=0.01,
-                 quiet_ms=2000, require_viable=True, as_base_weight=0.0):
+                 flow_window=50, tick=0.01,
+                 quiet_ms=2000, require_viable=True, as_base_weight=0.0,
+                 improve_ticks=1.0, size_notional=None, tol_ticks=0.0, vol_alpha=0.05):
         # Baseline quote size in shares (Ch 3.4: this gets cut when flow is toxic).
         self.size0 = size
         # Hard inventory cap in shares (a backstop; the skew is the real control).
@@ -91,8 +92,7 @@ class MicrostructureMM:
         self.require_viable = require_viable
         # Weight on the A-S base half-spread; 0 until kappa is calibrated.
         self.as_base_weight = as_base_weight
-        # Rolling mid history for the volatility estimate.
-        self.mids = deque(maxlen=sigma_window)
+
         # Rolling signed trade volume for the toxicity estimate.
         self.flow = deque(maxlen=flow_window)
         # Current exchange time, updated by observe().
@@ -101,6 +101,22 @@ class MicrostructureMM:
         self.last_trade_ms = None
         # Rolling per-event return volatility.
         self.sigma = 0.0
+
+        # Placement: quote at most this many ticks inside the prevailing touch.
+        self.improve_ticks = improve_ticks
+        # PKR per quote (overrides share-count sizing when set).
+        self.size_notional = size_notional
+        # Pegging tolerance in ticks (0 = off).
+        self.tol_ticks = tol_ticks
+        # EMA decay for the volatility estimator (0.05 ~ 13.5-move half-life).
+        self.vol_alpha = vol_alpha
+        # Last observed mid (EMA vol updates only on actual mid moves).
+        self.last_mid = None
+        # Running EMA of squared mid returns.
+        self.ema_var = 0.0
+        # Our last DESIRED quotes, for the pegging hysteresis.
+        self.last_desired = {}
+
         # Diagnostics: how often the viability gate refused to quote.
         self.stats = {"no_quote_unviable": 0, "quotes_made": 0}
 
@@ -108,20 +124,22 @@ class MicrostructureMM:
     def observe(self, kind, obj, ts_exch, mid):
         # Advance our clock so the Ho-Stoll horizon tau is current.
         self.now = ts_exch
-        # Track the mid only when the book is two-sided.
+
+        # EMA volatility: O(1) per event, updated only when the mid actually
+        # moves (unchanged mids carry no volatility information). Replaces the
+        # O(window) recompute over the mids deque.
         if mid is not None:
-            self.mids.append(mid)
-            # Need a minimum sample before a volatility estimate means anything.
-            if len(self.mids) >= 20:
-                m = list(self.mids)
-                # Simple returns between consecutive observed mids.
-                rets = [(m[i] - m[i - 1]) / m[i - 1] for i in range(1, len(m))
-                        if m[i - 1] > 0]
-                if rets:
-                    mu = sum(rets) / len(rets)
-                    var = sum((r - mu) ** 2 for r in rets) / len(rets)
-                    # Per-event return volatility (NOT annualised; scale-free here).
-                    self.sigma = math.sqrt(var)
+            if self.last_mid is not None and mid != self.last_mid and self.last_mid > 0:
+                # Simple return since the last DIFFERENT mid.
+                ret = (mid - self.last_mid) / self.last_mid
+                # Seed on first move; RiskMetrics-style EMA thereafter.
+                if self.ema_var == 0.0:
+                    self.ema_var = ret * ret
+                else:
+                    self.ema_var = self.vol_alpha * ret * ret + (1.0 - self.vol_alpha) * self.ema_var
+                self.sigma = math.sqrt(self.ema_var)
+            self.last_mid = mid
+
         # Trades carry the direction signal Glosten-Milgrom conditions on.
         if kind == "T":
             side = getattr(obj, "aggressor_side", None)
@@ -201,8 +219,21 @@ class MicrostructureMM:
         if self.require_viable and (ba - bb) < 2.0 * half:
             self.stats["no_quote_unviable"] += 1
             return {}
+
         # Ch 3.4: informed flow prefers size, so cut OUR size when flow is toxic.
-        size = self.size0 * (0.5 if tox > 0.5 else 1.0)
+
+        # WIDE-MARKET PLACEMENT (the key change for KTML-class names): the gate
+        # above checked economic viability with the COST-based half. For placement,
+        # never quote tighter than one improve_ticks inside the prevailing touch --
+        # on a 53bps market, capture ~the full spread instead of compressing it
+        # to our 35bps floor and donating the difference.
+        mkt_half = (ba - bb) / 2.0
+        half = max(half, mkt_half - self.improve_ticks * self.tick)
+        # NOTIONAL SIZING: 50 shares is 2.8k PKR on KTML but 20k on MCB. Fix the
+        # PKR-at-risk per quote instead; fall back to share count if unset.
+        base_size = (self.size_notional / fair) if self.size_notional else self.size0
+        size = base_size * (0.5 if tox > 0.5 else 1.0)
+
         size = max(1.0, round(size))
         out = {}
         # Bid unless we are already at the long cap.
@@ -219,6 +250,23 @@ class MicrostructureMM:
             # Post-only clip: stay at least one tick outside the bid.
             px = max(px, bb + self.tick)
             out["SELL"] = (round(px, 2), size)
-        if out:
-            self.stats["quotes_made"] += 1
-        return out
+
+            # QUOTE PEGGING (burst-flow names): hold the previous desired quote until
+            # the ideal drifts >= tol_ticks. Returns the FULL desired state (our
+            # protocol: an omitted side means cancel) and tracks only our own last
+            # DESIRE -- never a claim about what rests on the exchange.
+            if self.tol_ticks > 0:
+                tol = self.tol_ticks * self.tick
+                pegged = {}
+                for s_, w_ in out.items():
+                    prev = self.last_desired.get(s_)
+                    # Close enough to the previous desire -> hold it (keep queue position).
+                    if prev is not None and abs(w_[0] - prev[0]) < tol and w_[1] == prev[1]:
+                        pegged[s_] = prev
+                    else:
+                        pegged[s_] = w_
+                out = pegged
+                self.last_desired = dict(out)
+            if out:
+                self.stats["quotes_made"] += 1
+            return out
