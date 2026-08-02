@@ -702,7 +702,7 @@ def _build_ob_updates(recs, adds_index: dict) -> pd.DataFrame:
                          df.loc[need, "resting_ref"].astype(int)))
         pairs = [adds_index.get(k, (None, None)) for k in rkeys]  # one lookup/row, not two
         resolved_oid.loc[need] = [p[0] for p in pairs]
-        resolved_px.loc[need] = [p[1] for p in pairs]
+        resolved_px.loc[need] = np.array([p[1] for p in pairs], dtype=float)
 
     df.loc[not_add, "order_id"] = resolved_oid[not_add]
 
