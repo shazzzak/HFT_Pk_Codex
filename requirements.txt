@@ -22,3 +22,4 @@ flowpylib==1.2.2
 bokeh==3.8.0
 questdb==4.1.0
 psycopg2-binary==2.9.12
+duckdb==1.5.5
