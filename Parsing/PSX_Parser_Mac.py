@@ -336,35 +336,61 @@ def _ensure_cols(df: pd.DataFrame, cols: dict[str, str]) -> pd.DataFrame:
     Ensure all columns in `cols` exist with the given dtype.
     `cols` maps column_name -> dtype string (e.g. "Int64", "float64", "string").
     """
+    # Walk the canonical schema. Every chunk must emit these columns in these
+    # dtypes so the per-chunk parquet partials merge without schema drift.
     for c, dtype in cols.items():
-        _tc = time.time()
+        # Column absent from this chunk's records -> create it as all-null.
         if c not in df.columns:
             # Column missing: create with appropriate nulls
+            # Nullable extension dtypes take pd.NA as their null.
             if dtype in ("Int64", "Float64", "boolean", "string"):
                 df[c] = pd.Series(pd.NA, index=df.index, dtype=dtype)
+            # Plain numpy float takes np.nan.
             elif dtype == "float64":
                 df[c] = pd.Series(np.nan, index=df.index, dtype=dtype)
             else:
                 # fallback: treat other numeric vs non-numeric
+                # Any other numeric dtype -> NaN.
                 if dtype.startswith("float") or dtype.startswith("int"):
                     df[c] = pd.Series(np.nan, index=df.index, dtype=dtype)
+                # Non-numeric (object, datetime) -> pd.NA.
                 else:
                     df[c] = pd.Series(pd.NA, index=df.index, dtype=dtype)
+        # Column present -> coerce it to the declared dtype.
         else:
             # Column exists: enforce dtype safely
+            # Nullable ints: to_numeric first so junk becomes NA, then cast.
             if dtype in ("Int64", "Float64"):
                 # coerce bad literals (e.g. 'N') to NA before casting
                 df[c] = pd.to_numeric(df[c], errors="coerce").astype(dtype)
+            # Plain float: to_numeric already yields float64.
             elif dtype == "float64":
                 df[c] = pd.to_numeric(df[c], errors="coerce")
+            # Extension string/boolean: a direct cast is the fast path.
             elif dtype in ("boolean", "string"):
                 df[c] = df[c].astype(dtype)
+            # Datetimes need pd.to_datetime, NOT .astype -- see below.
+            elif dtype.startswith("datetime64"):
+                # .astype("datetime64[ns, UTC]") on FIX strings falls back to
+                # per-element dateutil parsing (~44 us/row). Use pd.to_datetime.
+                # Idempotence guard: skip columns already parsed upstream.
+                if not pd.api.types.is_datetime64_any_dtype(df[c]):
+                    # capture_ts is our own receive clock, not a FIX tag.
+                    if c == "capture_ts":
+                        # Already ISO-like ("2025-10-08 09:19:28.324 +0500").
+                        # _to_utc's dash-replace mangles it into a non-standard
+                        # form that parses ~8x slower. Parse it directly.
+                        df[c] = pd.to_datetime(df[c], utc=True,
+                                               format="ISO8601", errors="coerce")
+                    # FIX tags 52/60/42: YYYYMMDD-HH:MM:SS[.mmm]; _to_utc swaps
+                    # the date/time separator before parsing.
+                    else:
+                        df[c] = _to_utc(df[c])
             else:
                 # generic fallback, still ok for object/string-like
                 df[c] = df[c].astype(dtype)
 
-        print(f"        ensure {c:>20s} {dtype:>8s} {time.time() - _tc:5.2f}s", flush=True)
-
+    # Mutated in place and returned, so callers can chain or reassign.
     return df
 
 
@@ -726,7 +752,6 @@ def _build_ob_updates(recs, adds_index: dict) -> pd.DataFrame:
 
     return df
 
-
 def _build_ob_snapshot(recs) -> pd.DataFrame:
     """
     Order book full-snapshot DataFrame from 35=W records.
@@ -739,53 +764,84 @@ def _build_ob_snapshot(recs) -> pd.DataFrame:
     Fix 14: level/order-count columns remain nullable for phase A rows
             (already nullable by construction; documented here).
     """
+    # One row per market-data entry, not per message: a 10-level two-sided
+    # snapshot expands to ~20+ rows sharing one msg_seq.
     df = pd.DataFrame(recs)
+    # No snapshot records in this chunk -> return an empty frame with the
+    # canonical schema so the parquet partials still merge cleanly.
     if df.empty:
         return _ensure_cols(df, OB_SNAPSHOT_FINAL_COLS)
 
+    # Force the raw schema: creates any column this chunk's records lacked and
+    # coerces dtypes. This is where the datetime columns get parsed.
     df = _ensure_cols(df, OB_SNAPSHOT_RAW_COLS)
 
+    # Price/quantity fields -> plain float64; junk literals become NaN.
     for c in ("px", "qty", "prev_close", "cum_volume", "cum_value"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
+    # Counters -> nullable Int64, so a missing count is <NA> rather than 0.
     for c in ("msg_seq", "num_trades", "n_entries", "level",
               "n_orders_at_level", "n_orders_detailed"):
         df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
 
+    # Feed channel id (1011 = snapshot channel on this feed).
     df["channel"] = pd.to_numeric(df["channel"], errors="coerce").astype("Int64")
 
+    # Rename tag 52 (SendingTime) to snapshot_time for the output schema.
+    # NOTE: _ensure_cols already parsed this column; _to_utc round-trips it
+    # datetime -> str -> datetime, Redundant but harmless.
     df["snapshot_time"] = _to_utc(df["sending_time"])
+    # Tag 42 (OrigTime): the exchange's own stamp for the snapshot. Second
+    # precision only. Also already parsed by _ensure_cols.
     df["orig_time"]     = _to_utc(df["orig_time"])
+    # Our receive clock. Already parsed by _ensure_cols; this re-parse is a
+    # cheap no-op on an existing datetime column.
     df["capture_ts"]    = pd.to_datetime(df["capture_ts"], utc=True,
                                          format="mixed", errors="coerce")
 
-
+    # MDEntryType code -> readable label (BID / OFFER / AGG_BID / circuit
+    # breakers / etc). Fix 11 corrected this mapping.
     df["entry_type"] = df["entry_type_code"].map(MDENTRY_MAP)   # Fix 11
 
+    # Market segment code -> readable market name.
     df["market"]     = df["segment"].map(SNAPSHOT_SEGMENT_MAP)
 
     # Fix 12: xe no-limit sentinel -> NULL. xf intentionally left untouched;
     # instead flag rows where px looks like a tick-size floor (heuristic:
     # px <= 1.0 for xf entries) so downstream users can decide per market.
+    # Rows carrying the "no upper/lower limit" entry type.
     is_xe = df["entry_type_code"] == "xe"
+    # Blank the magic 999999999.9999 sentinel so it never reads as a real price.
     df.loc[is_xe & (df["px"] == XE_NO_LIMIT_SENTINEL), "px"] = np.nan
 
+    # Rows carrying the tick-size / price-band entry type.
     is_xf = df["entry_type_code"] == "xf"
+    # Default the flag to <NA> for every row (only xf rows get a value).
     df["is_xf_tick_floor"] = pd.NA
+    # Heuristic flag: an xf px at or below 1.0 is probably a tick floor, not
+    # a price band. Flagged rather than nulled -- downstream decides.
     df.loc[is_xf, "is_xf_tick_floor"] = df.loc[is_xf, "px"] <= 1.0
 
     # Fix 13: decode TradingPhaseCode(8538) -> phase / suspended / break
+    # The code is a fixed-width string: [phase][suspended][break_reason].
     ts = df["trading_status"].astype(str)
+    # Char 1: trading phase (T=continuous, O=open auction, B=break, ...).
     phase_char     = ts.str.slice(0, 1)
+    # Char 2: all-day suspension flag.
     suspended_char = ts.str.slice(1, 2)
+    # Char 3: reason code, meaningful only when the phase is a break.
     break_char     = ts.str.slice(2, 3)
 
+    # Readable phase name (CONTINUOUS_AUCTION, TRADING_BREAK, ...).
     df["phase"]             = phase_char.map(PHASE_MAP).astype("string")
+    # Suspension as a nullable boolean.
     df["suspended_all_day"] = suspended_char.map({"1": True, "0": False})
+    # Break reason only when phase == B; otherwise None.
     df["break_reason"]      = np.where(
         phase_char == "B", break_char.map(BREAK_REASON_MAP), None)
+    # np.where returns object dtype -> pin it to the extension string dtype.
     df["break_reason"] = df["break_reason"].astype("string")
-
 
     # Fix 14: level/order-count columns already Int64 (nullable) — after-hour
     # (phase A) rows will naturally carry <NA> since spec releases only
@@ -794,21 +850,30 @@ def _build_ob_snapshot(recs) -> pd.DataFrame:
     # np.sum() on a small Python list builds a numpy array per call -- ~8x
     # slower than the builtin sum() for lists of a few elements, and this runs
     # once per snapshot row (millions per chunk). Results are identical.
+    # Total DISCLOSED quantity at this level; the level's own qty may exceed it
+    # (the difference is the undisclosed residual the book models as __H_).
     df["visible_qty_sum"] = df["order_qtys"].map(
         lambda q: sum(map(float, q)) if isinstance(q, list) else np.nan)
 
+    # Collapse the per-level order-id list into a pipe-delimited string so the
+    # column is a flat scalar type in parquet.
     df["order_ids"]  = df["order_ids"].map(
         lambda x: "|".join(x) if isinstance(x, list) else None)
 
+    # Same for the matching per-order quantities. Position i in order_ids
+    # corresponds to position i here.
     df["order_qtys"] = df["order_qtys"].map(
         lambda x: "|".join(x) if isinstance(x, list) else None)
 
+    # Select and order the output columns; drops raw/intermediate columns.
     df = df[list(OB_SNAPSHOT_FINAL_COLS.keys())]
 
+    # Final dtype pin so every chunk writes an identical parquet schema.
+    # Datetime columns are deliberately excluded (already correct, and .astype
+    # on them is the slow path).
     for c, dtype in OB_SNAPSHOT_FINAL_COLS.items():
         if dtype in ("string", "Int64", "boolean", "float64"):
             df[c] = df[c].astype(dtype)
-
 
     return df
 
@@ -859,37 +924,52 @@ def _build_other(recs) -> pd.DataFrame:
 
 
 # ─────────────────────────── chunk writer ────────────────────────────────────
-
 def _write_chunk(buf, n_chunk, adds_index, out_dir, day, totals, t0):
+    # Phase clock: reset after each phase so the prints below report
+    # elapsed-per-phase, not cumulative.
     _tp = time.time()
     print(f"chunk {n_chunk:>3}: parsing  {len(buf):>9,} lines …", flush=True)
+    # Split the raw FIX lines into four record lists by message type.
     trades, ob_upd, ob_snap, other = parse_fix_chunk(buf)
 
     print(f"    parse  {time.time() - _tp:.1f}s", flush=True)
     _tp = time.time()
     print(f"chunk {n_chunk:>3}: building frames …", flush=True)
+    # Trades: resolves each trade's resting order via adds_index.
     df_trades  = _build_trades(trades, adds_index)
+    # Updates: POPULATES adds_index from ADD rows, then resolves cancels
+    # against it -- so this must run before/with the trades lookup path.
     df_ob_upd  = _build_ob_updates(ob_upd, adds_index)
+    # Full-book snapshots (35=W): the biggest table by far, ~2M rows/chunk.
     df_ob_snap = _build_ob_snapshot(ob_snap)
+    # Everything else: session status, heartbeats, channel stats.
     df_other   = _build_other(other)
 
     print(f"    frames {time.time() - _tp:.1f}s", flush=True)
     _tp = time.time()
     print(f"chunk {n_chunk:>3}: writing parquet …", flush=True)
 
+    # Write one partial per table per chunk. The merge step in run_day()
+    # later concatenates and sorts these into the final day file.
     for label, df in (("trades",      df_trades),
                       ("ob_updates",  df_ob_upd),
                       ("ob_snapshot", df_ob_snap),
                       ("misc",        df_other)):
+        # Skip empty tables (e.g. no trades during the pre-open chunk) so we
+        # never write a zero-row partial.
         if df.empty:
             continue
+        # Zero-padded chunk number keeps the glob in run_day() sorted.
         path = out_dir / f"_part_{label}_{n_chunk:04d}.parquet"
+        # preserve_index=False: the pandas RangeIndex carries no information.
         pq.write_table(pa.Table.from_pandas(df, preserve_index=False),
                        path, compression="zstd")
+        # Running row count per table, printed at the end of run_day().
         totals[label] += len(df)
 
     print(f"    write  {time.time() - _tp:.1f}s", flush=True)
 
+    # Cumulative elapsed for the whole day so far (t0 is set in run_day).
     elapsed = time.time() - t0
     print(f"chunk {n_chunk:>3} DONE ({elapsed:6.1f}s) | "
           f"trades {len(df_trades):>8,} | "
@@ -897,8 +977,12 @@ def _write_chunk(buf, n_chunk, adds_index, out_dir, day, totals, t0):
           f"ob_snap {len(df_ob_snap):>9,} | "
           f"other {len(df_other):>7,}", flush=True)
 
+    # Drop the raw record lists and the frames explicitly: without this the
+    # ~2M-row snapshot frame stays referenced until the next chunk rebinds it,
+    # doubling peak RSS at the chunk boundary.
     del trades, ob_upd, ob_snap, other
     del df_trades, df_ob_upd, df_ob_snap, df_other
+    # Force collection now rather than letting it fire mid-parse next chunk.
     gc.collect()
 
 
