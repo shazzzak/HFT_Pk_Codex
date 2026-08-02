@@ -847,16 +847,22 @@ def _build_other(recs) -> pd.DataFrame:
 # ─────────────────────────── chunk writer ────────────────────────────────────
 
 def _write_chunk(buf, n_chunk, adds_index, out_dir, day, totals, t0):
+    _tp = time.time()
     print(f"chunk {n_chunk:>3}: parsing  {len(buf):>9,} lines …", flush=True)
     trades, ob_upd, ob_snap, other = parse_fix_chunk(buf)
 
+    print(f"    parse  {time.time() - _tp:.1f}s", flush=True)
+    _tp = time.time()
     print(f"chunk {n_chunk:>3}: building frames …", flush=True)
     df_trades  = _build_trades(trades, adds_index)
     df_ob_upd  = _build_ob_updates(ob_upd, adds_index)
     df_ob_snap = _build_ob_snapshot(ob_snap)
     df_other   = _build_other(other)
 
+    print(f"    frames {time.time() - _tp:.1f}s", flush=True)
+    _tp = time.time()
     print(f"chunk {n_chunk:>3}: writing parquet …", flush=True)
+
     for label, df in (("trades",      df_trades),
                       ("ob_updates",  df_ob_upd),
                       ("ob_snapshot", df_ob_snap),
@@ -867,6 +873,8 @@ def _write_chunk(buf, n_chunk, adds_index, out_dir, day, totals, t0):
         pq.write_table(pa.Table.from_pandas(df, preserve_index=False),
                        path, compression="zstd")
         totals[label] += len(df)
+
+    print(f"    write  {time.time() - _tp:.1f}s", flush=True)
 
     elapsed = time.time() - t0
     print(f"chunk {n_chunk:>3} DONE ({elapsed:6.1f}s) | "
