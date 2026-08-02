@@ -7,10 +7,14 @@ import duckdb
 import pyarrow.parquet as pq
 
 PARSED = Path(r"/Users/shazzak/Capital Stake - Parsed")          # <- your parsed_root
-SORT_KEYS = {"trades": "symbol, appl_seq",
-             "ob_updates": "symbol, appl_seq",
-             "ob_snapshot": "symbol, msg_seq",
-             "misc": "symbol, msg_seq"}
+
+SORT_KEYS = {
+    "trades":      "symbol, appl_seq",
+    "ob_updates":  "symbol, appl_seq",
+    "ob_snapshot": "symbol, msg_seq, entry_type, level",
+    "misc":        "symbol, msg_seq",
+}
+
 
 # Only rewrite September 2025 days; later days were born sorted.
 DATE_PREFIX = "2025-09"
