@@ -77,11 +77,16 @@ class DiskBackedIndex:
     count for the day. Fixes the unbounded growth seen at chunks 1-5
     (43k -> 410k entries and climbing).
     """
+
     def __init__(self, db_path, hot_cache_size=200_000):
         self.conn = sqlite3.connect(db_path)
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS idx (k TEXT PRIMARY KEY, oid TEXT, px REAL)"
         )
+        # Scratch index — unlinked at end of run, so durability is irrelevant.
+        # Disable journal/fsync so any overflow spill can't stall the parse loop.
+        self.conn.execute("PRAGMA journal_mode=MEMORY")
+        self.conn.execute("PRAGMA synchronous=OFF")
         self.hot = {}
         self.hot_cache_size = hot_cache_size
 
@@ -681,19 +686,27 @@ def _build_ob_updates(recs, adds_index: dict) -> pd.DataFrame:
 
     ref = df["buy_ref"].where(df["buy_ref"].fillna(0) > 0, df["sell_ref"])
     df["resting_ref"] = ref.where(ref.fillna(0) > 0).astype("Int64")
-    keys = list(zip(df["channel"].astype("object"),
-                    df["resting_ref"].astype("float").fillna(-1).astype(int)))
-
-    resolved_oid = pd.Series(
-        [adds_index.get(k, (None, None))[0] for k in keys], index=df.index)
-    resolved_px = pd.Series(
-        [adds_index.get(k, (None, None))[1] for k in keys], index=df.index)
-
     not_add = ~is_add
+    is_cxl = df["event"] == "CANCEL"
+
+    # Only resolve rows that actually reference a resting order. ADD rows carry no
+    # resting_ref; the old code hashed them to (channel, -1) — a guaranteed index
+    # miss whose result is discarded (resolved_* is read only on not_add / is_cxl).
+    # Under DiskBackedIndex every such miss was a full SQLite point query, and ADD
+    # rows are the majority of updates. Skipping them removes most of the lookups.
+    need = not_add & df["resting_ref"].notna() & df["channel"].notna()
+    resolved_oid = pd.Series(pd.NA, index=df.index, dtype="object")
+    resolved_px = pd.Series(np.nan, index=df.index)  # float64
+    if need.any():
+        rkeys = list(zip(df.loc[need, "channel"].astype(int),
+                         df.loc[need, "resting_ref"].astype(int)))
+        pairs = [adds_index.get(k, (None, None)) for k in rkeys]  # one lookup/row, not two
+        resolved_oid.loc[need] = [p[0] for p in pairs]
+        resolved_px.loc[need] = [p[1] for p in pairs]
+
     df.loc[not_add, "order_id"] = resolved_oid[not_add]
 
     # Fix 9: overwrite cancel price with the resolved order price
-    is_cxl = df["event"] == "CANCEL"
     df.loc[is_cxl, "price"] = resolved_px[is_cxl]
 
     cxl_side = np.where(df["buy_ref"].fillna(0)  > 0, "1",
@@ -878,7 +891,7 @@ def run_day(src, parsed_root=PARSED_ROOT, chunk_lines=CHUNK_LINES):
 
     # adds_index now stores (order_id, price) tuples — needed for Fix 9
     sqlite_path = out_dir / f"{day}_adds_index.sqlite"
-    adds_index = DiskBackedIndex(sqlite_path)
+    adds_index = DiskBackedIndex(sqlite_path, hot_cache_size=2_000_000)
     n_chunk = 0
     n_lines    = 0
     t0         = time.time()
