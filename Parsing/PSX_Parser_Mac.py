@@ -66,7 +66,7 @@ SORT_KEYS = {
     "trades":      "symbol, appl_seq",
     "ob_updates":  "symbol, appl_seq",
     "ob_snapshot": "symbol, msg_seq, entry_type, level",
-    "misc":        "symbol, msg_seq",
+    "misc": "channel, msg_seq",
 }
 
 class DiskBackedIndex:
@@ -308,6 +308,21 @@ OTHER_FINAL_COLS = {
     "appl_last_seq": "Int64", "end_of_channel": "Int64",
     "heartbeat_time": "datetime64[ns, UTC]", "raw": "string",
 }
+
+# Fail-fast: every SORT_KEYS column must exist in that table's final schema.
+# Catches sort-key/schema drift at import, not after a full-day parse.
+# ── module-level guard: runs at import, no function ──
+_FINAL_COLS = {
+    "trades":      TRADES_FINAL_COLS,
+    "ob_updates":  OB_UPDATES_FINAL_COLS,
+    "ob_snapshot": OB_SNAPSHOT_FINAL_COLS,
+    "misc":        OTHER_FINAL_COLS,
+}
+for _lbl, _key in SORT_KEYS.items():
+    _cols = [c.split()[0].strip() for c in _key.split(",")]
+    _missing = [c for c in _cols if c not in _FINAL_COLS[_lbl]]
+    assert not _missing, f"SORT_KEYS[{_lbl!r}] references missing columns {_missing}; " \
+                         f"schema has {list(_FINAL_COLS[_lbl])}"
 
 
 def _ensure_cols(df: pd.DataFrame, cols: dict[str, str]) -> pd.DataFrame:
