@@ -39,6 +39,7 @@
 
 import gc
 import io
+import shutil
 import tarfile
 import time
 from pathlib import Path
@@ -51,8 +52,18 @@ import psutil, os
 proc = psutil.Process(os.getpid())
 
 import sqlite3
-
 import resource
+import duckdb
+
+# Sort keys per table: symbol first (enables parquet row-group pruning on
+# single-symbol reads), then the exchange's own sequence number -- exact wire
+# order within a symbol, immune to string-timestamp formatting quirks.
+SORT_KEYS = {
+    "trades":      "symbol, appl_seq",
+    "ob_updates":  "symbol, appl_seq",
+    "ob_snapshot": "symbol, msg_seq",
+    "misc":        "symbol, msg_seq",
+}
 
 class DiskBackedIndex:
     """
@@ -915,32 +926,28 @@ def run_day(src, parsed_root=PARSED_ROOT, chunk_lines=CHUNK_LINES):
         final_dir.mkdir(parents=True, exist_ok=True)
         final = final_dir / f"{day}_{label}.parquet"
 
-        # Schema-tolerant merge: union all part schemas first (promote_options
-        # handles missing/added columns and mismatched nullability across
-        # chunks), then re-write every part's batches against that unified
-        # schema. This prevents ValueError crashes if any chunk had a column
-        # a neighboring chunk lacked (e.g. an all-adds chunk with no cancels).
-        schemas = [pq.ParquetFile(p).schema_arrow for p in parts]
-        try:
-            unified = pa.unify_schemas(schemas, promote_options="permissive")
-        except TypeError:
-            # older pyarrow without promote_options kwarg
-            unified = pa.unify_schemas(schemas)
-
-        writer = None
-        for p in parts:
-            pf = pq.ParquetFile(p)
-            try:
-                for batch in pf.iter_batches(batch_size=131_072):
-                    tbl = pa.Table.from_batches([batch]).cast(unified)
-                    if writer is None:
-                        writer = pq.ParquetWriter(final, unified,
-                                                  compression="zstd")
-                    writer.write_table(tbl)
-            finally:
-                pf.close()
-        if writer:
-            writer.close()
+        # Merge + GLOBAL SORT in one pass. DuckDB's external sort spills to
+        # disk, so a 58M-row snapshot day cannot recreate the chunk-10 RAM
+        # cliff. union_by_name=true absorbs schema drift across partials
+        # (replaces the pa.unify_schemas logic). Sorting by (symbol, seq)
+        # gives every row group a narrow symbol range, so single-symbol
+        # reads skip the rest of the file via min/max statistics.
+        if final.exists():
+            final.unlink()  # COPY must not hit a stale file
+        con = duckdb.connect()
+        # Cap sort memory and spill into the day's tmp dir (cleaned up below).
+        con.execute("SET memory_limit='4GB'")
+        con.execute(f"SET temp_directory='{(out_dir / 'duck_spill').as_posix()}'")
+        con.execute(f"""
+                    COPY (
+                        SELECT * FROM read_parquet('{(out_dir / f"_part_{label}_*.parquet").as_posix()}',
+                                                   union_by_name=true)
+                        ORDER BY {SORT_KEYS[label]}
+                    )
+                    TO '{final.as_posix()}'
+                    (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 262144)
+                """)
+        con.close()
 
         for p in parts:
             try:
@@ -952,11 +959,14 @@ def run_day(src, parsed_root=PARSED_ROOT, chunk_lines=CHUNK_LINES):
         print(f"  {label:<12}: {totals[label]:>12,} rows  →  "
               f"{final.name}  ({mb:.1f} MB)")
 
-    try:                                   # remove empty tmp dir
+        # Remove DuckDB's spill directory (created by the sorting merge's
+        # temp_directory setting) so the rmdir below finds an empty tmp dir.
+    shutil.rmtree(out_dir / "duck_spill", ignore_errors=True)
+    try:  # remove empty tmp dir
         out_dir.rmdir()
     except OSError:
         pass
-    print(f"\nAll done in {time.time()-t0:.1f}s", flush=True)
+    print(f"\nAll done in {time.time() - t0:.1f}s", flush=True)
     print(f"Output : {parsed_root}/<table>/date={day}/", flush=True)
 
 
