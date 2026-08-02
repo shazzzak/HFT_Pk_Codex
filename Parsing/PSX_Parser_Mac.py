@@ -58,10 +58,14 @@ import duckdb
 # Sort keys per table: symbol first (enables parquet row-group pruning on
 # single-symbol reads), then the exchange's own sequence number -- exact wire
 # order within a symbol, immune to string-timestamp formatting quirks.
+# ob_snapshot additionally pins intra-message row order (side, then level
+# 1..10) so a snapshot reads top-of-book-down when inspected by eye. Purely
+# cosmetic: all consumers key on entry_type/level, never on row position.
+# Rows without a level (AGG_*, circuit breakers, status) sort last per side.
 SORT_KEYS = {
     "trades":      "symbol, appl_seq",
     "ob_updates":  "symbol, appl_seq",
-    "ob_snapshot": "symbol, msg_seq",
+    "ob_snapshot": "symbol, msg_seq, entry_type, level",
     "misc":        "symbol, msg_seq",
 }
 
@@ -959,8 +963,8 @@ def run_day(src, parsed_root=PARSED_ROOT, chunk_lines=CHUNK_LINES):
         print(f"  {label:<12}: {totals[label]:>12,} rows  →  "
               f"{final.name}  ({mb:.1f} MB)")
 
-        # Remove DuckDB's spill directory (created by the sorting merge's
-        # temp_directory setting) so the rmdir below finds an empty tmp dir.
+    # Remove DuckDB's spill directory (created by the sorting merge's
+    # temp_directory setting) so the rmdir below finds an empty tmp dir.
     shutil.rmtree(out_dir / "duck_spill", ignore_errors=True)
     try:  # remove empty tmp dir
         out_dir.rmdir()
