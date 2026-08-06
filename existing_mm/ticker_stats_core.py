@@ -114,10 +114,16 @@ def stats_for_symbol(snap, trades, symbol):
         row[f"ceiling_paired_rt{tag}"] = ub * pair_ratio
         # Share of the day's volume that cleared the fee at this level.
         row[f"pct_vol_qual_rt{tag}"] = (float(q["qty"].sum()) / total_vol) if total_vol else 0.0
+        # Qualifying NOTIONAL (PKR millions) at this fee level -- consumed by the screen.
+        row[f"qual_notional_m_rt{tag}"] = float((q["qty"] * q["price"]).sum()) / 1e6
 
     # Legacy alias: current-schedule ceiling, kept for existing queries/notebooks.
     _cur = f"_{2 * FEE_TOTAL_PCT * 1e4:.2f}".replace(".", "p")
     row["ceiling_pkr"] = row[f"ceiling_pkr_rt{_cur}"]
+
+    # Current-schedule aliases consumed by run_all_tickers' screen columns.
+    row["pct_vol_qualifying"] = row[f"pct_vol_qual_rt{_cur}"]
+    row["qualifying_notional_m"] = row[f"qual_notional_m_rt{_cur}"]
 
     # One completed stats row for this symbol.
     return row

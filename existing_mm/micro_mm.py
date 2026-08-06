@@ -251,22 +251,22 @@ class MicrostructureMM:
             px = max(px, bb + self.tick)
             out["SELL"] = (round(px, 2), size)
 
-            # QUOTE PEGGING (burst-flow names): hold the previous desired quote until
-            # the ideal drifts >= tol_ticks. Returns the FULL desired state (our
-            # protocol: an omitted side means cancel) and tracks only our own last
-            # DESIRE -- never a claim about what rests on the exchange.
-            if self.tol_ticks > 0:
-                tol = self.tol_ticks * self.tick
-                pegged = {}
-                for s_, w_ in out.items():
-                    prev = self.last_desired.get(s_)
-                    # Close enough to the previous desire -> hold it (keep queue position).
-                    if prev is not None and abs(w_[0] - prev[0]) < tol and w_[1] == prev[1]:
-                        pegged[s_] = prev
-                    else:
-                        pegged[s_] = w_
-                out = pegged
-                self.last_desired = dict(out)
-            if out:
-                self.stats["quotes_made"] += 1
-            return out
+        # QUOTE PEGGING (burst-flow names): hold the previous desired quote until
+        # the ideal drifts >= tol_ticks. Returns the FULL desired state (our
+        # protocol: an omitted side means cancel) and tracks only our own last
+        # DESIRE -- never a claim about what rests on the exchange.
+        if self.tol_ticks > 0:
+            tol = self.tol_ticks * self.tick
+            pegged = {}
+            for s_, w_ in out.items():
+                prev = self.last_desired.get(s_)
+                # Close enough to the previous desire -> hold it (keep queue position).
+                if prev is not None and abs(w_[0] - prev[0]) < tol and w_[1] == prev[1]:
+                    pegged[s_] = prev
+                else:
+                    pegged[s_] = w_
+            out = pegged
+            self.last_desired = dict(out)
+        if out:
+            self.stats["quotes_made"] += 1
+        return out

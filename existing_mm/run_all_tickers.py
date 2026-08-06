@@ -26,7 +26,7 @@ OUT     = Path(f"ticker_stats_{DATE}.csv")
 
 # only the columns each stat needs -> less I/O, less RAM
 SNAP_COLS  = ["symbol", "msg_seq", "orig_time", "entry_type", "level", "px"]
-TRADE_COLS = ["symbol", "transact_time", "initiator", "price", "qty"]
+TRADE_COLS = ["symbol", "transact_time", "initiator", "price", "qty", "aggressor_side"]
 
 
 def list_symbols(dataset):
