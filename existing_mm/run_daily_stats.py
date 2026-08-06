@@ -345,6 +345,25 @@ def inspect_one():
     # Close the connection.
     con.close()
 
+# Classify WHY a symbol-day is unscreenable, so skips are recorded rather than
+# silently vanishing from daily_stats. Mirrors stats_for_symbol's guards without
+# touching that validated function.
+def skip_reason(snap_df, trades_df):
+    if trades_df is None or len(trades_df) == 0:
+        return "no_trades"
+    if snap_df is None or len(snap_df) == 0:
+        return "no_snapshot"
+    sb = snap_df[snap_df["entry_type"].isin(["BID", "OFFER"]) & (snap_df["level"] == 1)]
+    if len(sb) == 0:
+        return "no_l1_book"
+    has_bid = bool((sb["entry_type"] == "BID").any())
+    has_ask = bool((sb["entry_type"] == "OFFER").any())
+    if not (has_bid and has_ask):
+        # DMC 2025-09-23: locked limit-up, bid at the cap, zero offers all session.
+        return "one_sided_bid_only" if has_bid else "one_sided_ask_only"
+    if int((trades_df["initiator"] != "AUCTION").sum()) == 0:
+        return "auction_only"
+    return "other"
 
 # Command-line entry point.
 def main():
