@@ -16,7 +16,7 @@ from pathlib import Path
 import pandas as pd
 import pyarrow.dataset as ds
 
-from Stats_ticker_stats_core import stats_for_symbol, ROUND_TRIP_BPS, WIDE_BPS
+from ticker_stats_core import stats_for_symbol, ROUND_TRIP_BPS, WIDE_BPS
 
 BASE = Path(r"G:\My Drive\HFT\Capital Stake Day\parsed\2026-06-30")
 DATE = "2026-06-30"
@@ -94,7 +94,7 @@ def main():
     print(screen[show].to_string(index=False, float_format=lambda x: f"{x:,.2f}"))
 
     # Sensitivity: how many symbols become viable if MM program cuts fees to ~1bp/side
-    from Stats_ticker_stats_core import FEE_TOTAL_PCT
+    from ticker_stats_core import FEE_TOTAL_PCT
     print(f"\nSymbols with ANY qualifying volume at current fees: "
           f"{(df['ceiling_pkr'] > 0).sum()} / {len(df)}")
     print("(Re-run with reduced FEE_* in ticker_stats_core.py to test the MM-program scenario.)")
