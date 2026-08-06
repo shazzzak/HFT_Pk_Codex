@@ -68,6 +68,13 @@ def stats_for_symbol(snap, trades, symbol):
         return None
     # One row per snapshot message, with BID and OFFER as separate columns.
     l1 = sb.pivot_table(index="msg_seq", columns="entry_type", values="px", aggfunc="first")
+    # A symbol whose level-1 book was one-sided for the WHOLE session (bid-only,
+    # offer-only, or pinned at a circuit limit) yields a pivot with the other
+    # column absent entirely -- so dropna(subset=[...]) would raise KeyError.
+    # This is a legitimate "not screenable" case, not an error: skip it cleanly
+    # like the other guards, so it does not pollute the error count.
+    if not {"BID", "OFFER"}.issubset(l1.columns):
+        return None
     # Timestamp each message with the earliest ts among its rows.
     l1["ts"] = sb.groupby("msg_seq")["ts"].min()
     # Drop one-sided quotes (no valid spread) and order chronologically.
