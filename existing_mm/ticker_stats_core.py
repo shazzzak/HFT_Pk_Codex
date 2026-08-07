@@ -201,6 +201,69 @@ def stats_for_symbol(snap, trades, symbol):
     row["pct_vol_qualifying"] = row[f"pct_vol_qual_rt{_cur}"]
     # Qualifying notional (PKR m) at the current schedule.
     row["qualifying_notional_m"] = row[f"qual_notional_m_rt{_cur}"]
+    # ---- ADVERSE SELECTION / MARKOUTS (ported verbatim from multi_sym.py) ----
+    # Reuses the SAME session-filtered L1 mid series built above (l1["ts"],
+    # l1["mid"]) -- no new data. The ceiling is an UPPER bound on opportunity;
+    # these measure how much of it SURVIVES adverse selection, which is what
+    # actually determines realized MM edge. net60_bps > 0 is THE viability test.
+    # Mid series as arrays for forward/backward lookups.
+    mt, mv = l1["ts"].to_numpy(), l1["mid"].to_numpy()
+
+    # First mid at or AFTER time w, unless the nearest quote is stale (> tol ms).
+    def m_at(w, tol=20000):
+        # Index of the first quote at or after w.
+        i = np.searchsorted(mt, w, side="left")
+        # Return it only if it exists and is within tol milliseconds.
+        return mv[i] if i < len(mt) and mt[i] - w <= tol else np.nan
+
+    # Last mid at or BEFORE time w (the pre-trade reference).
+    def m_bf(w):
+        # Index of the last quote at or before w.
+        i = np.searchsorted(mt, w, side="right") - 1
+        # Return it only if such a quote exists.
+        return mv[i] if i >= 0 else np.nan
+
+    # Accumulate one record per signable continuous trade.
+    rows = []
+    # Walk the continuous-session trades.
+    for x in tc.itertuples():
+        # Need a known aggressor to sign the trade.
+        if x.aggressor_side not in ("BUY", "SELL"):
+            # Skip unsignable prints.
+            continue
+        # Sign from the AGGRESSOR's perspective: +1 buy, -1 sell.
+        d = 1 if x.aggressor_side == "BUY" else -1
+        # Mid immediately before the trade.
+        m0 = m_bf(x.ts)
+        # No prior quote -> cannot measure this trade.
+        if np.isnan(m0):
+            # Skip it.
+            continue
+        # Effective half-spread the AGGRESSOR paid (positive = paid up).
+        rec = {"eff": d * (x.price - m0)}
+        # Forward markouts across horizons. Short ones (1-10s) matter for HFT:
+        # a maker who flattens in seconds never holds long enough to eat the
+        # 60s+ directional drift, so 60s understates a fast strategy's edge.
+        for h in (1, 5, 10, 30, 60, 300):
+            # Mid h seconds after the trade.
+            mh = m_at(x.ts + h * 1000)
+            # Realized half-spread the PASSIVE side kept after h seconds.
+            # Positive = passive side profited; negative = adverse selection.
+            rec[f"r{h}"] = d * (x.price - mh) if not np.isnan(mh) else np.nan
+        # Store this trade's record.
+        rows.append(rec)
+    # Assemble the per-trade markout records.
+    dec = pd.DataFrame(rows)
+    # Average effective half-spread paid, in bps of the median price.
+    row["eff_bps"] = 1e4 * dec["eff"].mean() / row["median_px"] if len(dec) else np.nan
+    # Average passive realized half-spread at each horizon, in bps.
+    for h in (1, 5, 10, 30, 60, 300):
+        # Mean realized markout at horizon h, in bps of median price.
+        row[f"mk{h}_bps"] = 1e4 * dec[f"r{h}"].mean() / row["median_px"] if len(dec) else np.nan
+    # THE DECISION NUMBER: gross passive edge at 60s minus ONE side's fee.
+    # Positive -> passive MM is viable on this symbol; negative -> the fee exceeds
+    # the surviving edge and no strategy quality can fix it.
+    row["net60_bps"] = row["mk60_bps"] - FEE_TOTAL_PCT * 1e4
 
     # One completed stats row for this symbol.
     return row

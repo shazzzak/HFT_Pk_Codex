@@ -82,10 +82,14 @@ LEVEL_REGIMES = ("normal", "friday")
 TOP_N = 20
 
 # Economic floor (PKR/day of pairing-adjusted ceiling) a symbol-day must clear to
-# count as materially attractive. See correction 1 above: rank alone is not
-# enough. Set from YOUR economics -- the ceiling is an upper bound and realistic
-# capture is 10-25% of it, so 20,000 here implies roughly 2,000-5,000 PKR gross.
-MATERIAL_PKR = 200_000
+# count as materially attractive -- PER FEE, because the ceiling scales with the
+# fee. The two scenarios live on different scales: REG normal-day median ceiling
+# is 6,641 at 2bps but 2,149 at 35bps (p90 82,575 vs 10,365). One constant would
+# starve one scenario or water down the other. Each value sits ~p75-p85 of its
+# own distribution, which is what "the same economic floor" means once the scales
+# differ. Anchor: the daily gross below which quoting is not worth the risk,
+# deflated by ~10-25% realistic capture of this upper-bound ceiling.
+MATERIAL_PKR = {"2p00": 30_000, "35p45": 5_000}
 
 # Lag, in trading days, for the leaderboard rank autocorrelation.
 AUTOCORR_LAG = 5
@@ -209,7 +213,7 @@ def add_daily_rank(df, fee_tag):
     df["rank_in_day"] = (df.groupby(["date", "segment"])[col]
                            .rank(ascending=False, method="min"))
     # Materiality gate: the day must also be worth a meaningful amount of money.
-    df["is_material"] = df[col] >= MATERIAL_PKR
+    df["is_material"] = df[col] >= MATERIAL_PKR[fee_tag]
     # THE metric: top-N AND materially large. Rank on this.
     df["in_top_n"] = (df["rank_in_day"] <= TOP_N) & df["is_material"]
     # Rank-only version retained so the two can be compared (see correction 1).
@@ -369,7 +373,7 @@ def friday_ratio_check(ds, fee_tag):
         # Cannot compare without a baseline.
         return pd.DataFrame()
     # Restrict to symbols above the money floor on normal days.
-    piv = piv[piv["normal"] > MATERIAL_PKR]
+    piv = piv[piv["normal"] > MATERIAL_PKR[fee_tag]]
     # Accumulated ratios.
     rows = []
     # Compare each non-normal regime against normal.
@@ -392,6 +396,10 @@ def friday_ratio_check(ds, fee_tag):
 # --------------------------------- driver -----------------------------------
 # Orchestrate: calendar -> enrich -> metrics per segment per fee scenario.
 def main():
+    # Every fee scenario must have a money floor, or add_daily_rank KeyErrors deep
+    # in the loop. Fail here with a clear message instead.
+    missing = [t for t in FEE_TAGS if t not in MATERIAL_PKR]
+    assert not missing, f"MATERIAL_PKR missing floors for {missing}"
     # DuckDB is used only for reading parquet; all metrics are pandas.
     import duckdb
     # In-memory connection.
@@ -439,6 +447,11 @@ def main():
         ds = ds.merge(build_segment_map(con), on=["date", "symbol"], how="left")
     # Any row without a segment becomes UNKNOWN rather than being dropped.
     ds["segment"] = ds["segment"].fillna("UNKNOWN")
+    # PSX segment codes -> readable names (011 ready equities, 031 deliverable
+    # futures, 041 cash-settled futures). Output files are then named by instrument
+    # (persistence_REG_2p00.csv) and the REG filter in the Friday check matches.
+    ds["segment"] = ds["segment"].map(
+        {"011": "REG", "031": "STOCK_DEL_FUT", "041": "STOCK_CS_FUT"}).fillna(ds["segment"])
     # Attach the regime, traded hours and day index by date.
     ds = ds.merge(cal[["date", "regime", "traded_h", "day_idx", "dow"]],
                   on="date", how="left")
@@ -465,21 +478,35 @@ def main():
     # ---- 4. Friday regime diagnostic ----
     # Announce the step.
     print("\n4/5 regime comparability check (informs LEVEL_REGIMES) ...")
-    # Compare only within ready equities, the main market-making universe.
-    reg_only = ds[ds["segment"] == "REG"] if (ds["segment"] == "REG").any() else ds
-    # Paired per-symbol ratio versus normal days, at the operative fee.
-    fr = friday_ratio_check(reg_only, FEE_TAGS[0])
-    # Show it if computable.
-    if len(fr):
-        # Print the ratios.
-        print(fr.to_string(index=False))
-        # Explain how to act on the number.
-        print(f"  LEVEL_REGIMES is currently {LEVEL_REGIMES}. If friday's ratio is")
-        print("  near the time ratio (~0.79) rather than ~1.0, set it to ('normal',).")
-    # Otherwise say why not.
-    else:
-        # No baseline available.
-        print("  not computable (no normal-regime baseline above MATERIAL_PKR)")
+    # Friday-vs-normal ceiling ratio is instrument-specific: futures roll and
+    # thin out differently from equities, so measure it PER SEGMENT rather than
+    # pooling. LEVEL_REGIMES is one global switch, so if the segments disagree
+    # (e.g. equities ~0.86 but futures ~0.75) that is itself the finding -- you
+    # may want Fridays in for REG level metrics but out for futures.
+    for seg_name in sorted(ds["segment"].unique()):
+        # This segment's rows only.
+        seg_df = ds[ds["segment"] == seg_name]
+        # Paired per-symbol ratio versus normal days, at the operative fee.
+        fr = friday_ratio_check(seg_df, FEE_TAGS[0])
+        # Show it if computable.
+        if len(fr):
+            # Pull out just the friday row for the headline call.
+            fri = fr[fr["regime"] == "friday"]
+            # Format the friday ratio, or note its absence.
+            fri_txt = (f"friday={fri['median_ratio_vs_normal'].iloc[0]:.3f} "
+                       f"(n={int(fri['n_symbols'].iloc[0])})") if len(fri) else "friday=n/a"
+            # One headline line per segment.
+            print(f"  {seg_name:15s} {fri_txt}")
+            # Full breakdown (friday / ramadan / ramadan_friday) indented under it.
+            print(fr.to_string(index=False).replace("\n", "\n    "))
+        # Otherwise say why not, per segment.
+        else:
+            # No normal-regime baseline above the money floor for this segment.
+            print(f"  {seg_name:15s} not computable (no normal baseline above MATERIAL_PKR)")
+    # Reminder of the current global switch and how to read the per-segment numbers.
+    print(f"  LEVEL_REGIMES is currently {LEVEL_REGIMES}. Decide on the REG row:")
+    print("  keep Fridays if REG friday >= ~0.82, else set ('normal',). Note if")
+    print("  futures disagree -- that is a real instrument difference, not noise.")
 
     # ---- 5. persistence metrics per segment per fee scenario ----
     # Announce the step.
