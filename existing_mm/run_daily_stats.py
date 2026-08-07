@@ -139,9 +139,15 @@ def compute_date(date, symbol_limit=None):
     tcols = ", ".join(TRADE_COLS)
     # Read the whole day's trades once (small table); pull only needed columns.
     t_all = con.execute(
-        # Restrict to rows that actually carry a symbol.
+        # Continuous order-book trades only. NDM is the Negotiated Deals Market:
+        # bilaterally agreed blocks reported to the exchange, with no book behind
+        # them -- averaging ~300x a REG trade, so one block can dominate a day's
+        # volume-weighted ceiling with flow a market maker could never capture.
+        # ODD_LOT is sub-round-lot flow, also not continuous-board matching.
+        # NOTE: exclusion, NOT market='REG' -- STOCK_DEL_FUT and STOCK_CS_FUT are
+        # also `market` values, so an equality filter would delete all futures.
         f"SELECT {tcols} FROM read_parquet('{date_glob('trades', date)}') "
-        f"WHERE symbol IS NOT NULL"
+        f"WHERE symbol IS NOT NULL AND market NOT IN ('NDM', 'ODD_LOT')"
     ).df()
     # If the day has no trades at all, there is nothing to screen.
     if len(t_all) == 0:

@@ -85,7 +85,7 @@ TOP_N = 20
 # count as materially attractive. See correction 1 above: rank alone is not
 # enough. Set from YOUR economics -- the ceiling is an upper bound and realistic
 # capture is 10-25% of it, so 20,000 here implies roughly 2,000-5,000 PKR gross.
-MATERIAL_PKR = 20_000
+MATERIAL_PKR = 200_000
 
 # Lag, in trading days, for the leaderboard rank autocorrelation.
 AUTOCORR_LAG = 5
@@ -126,6 +126,9 @@ def build_session_calendar(con):
     """
     # Execute and bring the (tiny, ~207 row) result into pandas.
     cal = con.sql(q).df()
+    # Same hive date auto-cast issue as above: normalise to YYYY-MM-DD strings so
+    # the merge against daily_stats (which stores date as text) has matching keys.
+    cal["date"] = cal["date"].astype(str).str.slice(0, 10)
     # Day name from the partition date string, for the Friday split.
     cal["dow"] = pd.to_datetime(cal["date"]).dt.day_name()
     # Ramadan flag from the measured window.
@@ -166,7 +169,11 @@ def build_segment_map(con):
         SELECT date, symbol, segment, n_segments FROM ranked WHERE rn = 1
     """
     # Execute and return.
-    return con.sql(q).df()
+    seg = con.sql(q).df()
+    # hive_partitioning auto-casts date= to DATE; daily_stats stores date as a
+    # plain string. Normalise so the pandas merge keys have matching dtypes.
+    seg["date"] = seg["date"].astype(str).str.slice(0, 10)
+    return seg
 
 
 # Days each symbol actually TRADED -- the honest denominator (correction 2).
