@@ -90,7 +90,10 @@ TOP_N = 20
 # differ. Anchor: the daily gross below which quoting is not worth the risk,
 # deflated by ~10-25% realistic capture of this upper-bound ceiling.
 MATERIAL_PKR = {"2p00": 30_000, "35p45": 5_000}
-
+# TREC own-account cost is ~1.6 bps round-trip = ~0.78 bps per side. A markout is
+# a one-side (passive fill) measure, so net edge subtracts ONE side. Change this
+# if your confirmed per-side TREC number differs.
+TREC_FEE_SIDE_BPS = 0.78
 # Lag, in trading days, for the leaderboard rank autocorrelation.
 AUTOCORR_LAG = 5
 
@@ -298,6 +301,22 @@ def persistence_table(df, fee_tag, days_traded, min_days=MIN_DAYS):
         "spread_bps_median": gn["median_spread_bps"].median(),
         # Typical share of session spent wide.
         "pct_time_wide_median": gn["pct_time_wide"].median(),
+        # SURVIVING EDGE. mk*_bps = realized passive half-spread the maker keeps
+        # after h seconds (positive = kept, negative = adverse selection). The
+        # ceiling is opportunity; these are what survives it. mk10 is the HFT-
+        # relevant horizon: on liquid names markout decays with hold time
+        # (mk1 ~4.5 -> mk60 ~2.0), so 60s understates a fast strategy's edge.
+        "mk1_bps_median": gn["mk1_bps"].median(),
+        "mk5_bps_median": gn["mk5_bps"].median(),
+        "mk10_bps_median": gn["mk10_bps"].median(),
+        "mk60_bps_median": gn["mk60_bps"].median(),
+        # Share of comparable days the 5s markout beat the TREC per-side fee --
+        # the viability rate at the chosen working horizon.
+        "pct_days_edge5_pos": gn["mk5_bps"].apply(
+            lambda s: float((s - TREC_FEE_SIDE_BPS > 0).mean())),
+        # 10s kept for reference / sensitivity.
+        "pct_days_edge10_pos": gn["mk10_bps"].apply(
+            lambda s: float((s - TREC_FEE_SIDE_BPS > 0).mean())),
     })
     # Interquartile range of the daily ceiling.
     lvl["ceiling_iqr"] = lvl["ceiling_p75"] - lvl["ceiling_p25"]
@@ -305,13 +324,22 @@ def persistence_table(df, fee_tag, days_traded, min_days=MIN_DAYS):
     # divide -- a symbol whose median ceiling is 0 has no stable level at all.
     lvl["iqr_over_median"] = np.where(
         lvl["ceiling_median"] > 0, lvl["ceiling_iqr"] / lvl["ceiling_median"], np.nan)
+    # Net edge at TREC fee, at the CHOSEN working horizon (mk5) -- THE realized-
+    # viability number per symbol. Positive median => passive MM survives adverse
+    # selection here at TREC fees. mk5 chosen over mk10: the net1/net5/net10 ramp
+    # (3.76/3.13/2.66) is smooth, so mk5 captures more front-loaded edge while
+    # staying a realistically achievable flatten horizon. net10 kept for reference.
+    lvl["net5_trec_median"] = lvl["mk5_bps_median"] - TREC_FEE_SIDE_BPS
+    lvl["net10_trec_median"] = lvl["mk10_bps_median"] - TREC_FEE_SIDE_BPS
 
     # Join the level block onto the count block.
     out = out.join(lvl, how="left")
     # Score only symbols with enough traded history to be meaningful.
     out = out[out["days_traded"] >= min_days]
-    # Rank on persistence first, level second -- never on a single day.
-    out = out.sort_values(["pct_days_top20", "ceiling_median"], ascending=False)
+    # Primary rank still ceiling-opportunity (pct_days_top20); secondary now the
+    # realized edge at the working horizon, so within an opportunity tier the
+    # names that actually survive adverse selection float to the top.
+    out = out.sort_values(["pct_days_top20", "net5_trec_median"], ascending=False)
     # Move symbol out of the index into a column.
     return out.reset_index()
 
