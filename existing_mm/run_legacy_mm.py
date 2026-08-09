@@ -106,6 +106,12 @@ def parse_rest_oid(x):
             return None
     if isinstance(x, (list, tuple)) and len(x) >= 1:
         return x[0]
+    # PSX stores resting_order_id as a bare order-ID string (e.g. 0010THF0D00017T6),
+    # which shares a namespace with ob_updates.order_id -- return it directly so
+    # queue-position resolution can match it. (The tuple/list branches above handle
+    # the legacy formats.)
+    if isinstance(x, str) and x:
+        return x
     return None
 
 

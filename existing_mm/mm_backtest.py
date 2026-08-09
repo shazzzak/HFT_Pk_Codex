@@ -100,9 +100,20 @@ FEE_PER_SHARE_FLAT = 0.0         # no flat per-share components in this schedule
 FEE_MM_REBATE_PCT  = 0.0         # MM-program rebate; enter NEGATIVE when known
 # CVT / WHT on turnover: abolished -> intentionally absent.
 
-FEE_TOTAL_PCT = (FEE_COMMISSION_PCT * (1.0 + FEE_SST_RATE)   # commission + tax ON it
-                 + FEE_PSX_LAGA_PCT + FEE_SECP_PCT + FEE_IPF_PCT
-                 + FEE_CLEARING_PCT + FEE_MM_REBATE_PCT)
+# Retail all-in per-side fee (commission dominates: ~17.73 bps/side).
+FEE_TOTAL_RETAIL = (FEE_COMMISSION_PCT * (1.0 + FEE_SST_RATE)
+                    + FEE_PSX_LAGA_PCT + FEE_SECP_PCT + FEE_IPF_PCT
+                    + FEE_CLEARING_PCT + FEE_MM_REBATE_PCT)
+# TREC own-account per-side fee: the broker COMMISSION (and its sales tax) drops
+# to zero because you are your own broker; the regulatory stack (LAGA, SECP, IPF,
+# clearing) remains. This sums to ~0.78 bps/side = ~1.6 bps round trip, which is
+# exactly the rt_2p00 scenario the screen's net5 used -- so backtest P&L is now
+# comparable to the screen. Flip USE_TREC_FEE to False to restore retail.
+FEE_TOTAL_TREC = (FEE_PSX_LAGA_PCT + FEE_SECP_PCT + FEE_IPF_PCT
+                  + FEE_CLEARING_PCT + FEE_MM_REBATE_PCT)
+USE_TREC_FEE = True
+FEE_TOTAL_PCT = FEE_TOTAL_TREC if USE_TREC_FEE else FEE_TOTAL_RETAIL
+
 
 def fee_for(price, qty):
     """All-in per-side fee for a fill of `qty` shares at `price`."""
