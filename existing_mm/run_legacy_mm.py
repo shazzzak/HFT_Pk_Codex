@@ -43,7 +43,8 @@ import pyarrow.dataset as ds
 
 # The frozen engine. This import is the single source of truth for fills, fees,
 # book reconstruction, and EOD liquidation -- do not copy these, import them.
-from mm_backtest import Backtester, NaiveSymmetricMM, fee_for, FEE_TOTAL_PCT
+from mm_backtest import Backtester, NaiveSymmetricMM, fee_for, FEE_TOTAL_PCT, LatencyModel
+from micro_mm import MicrostructureMM
 
 # ------------------------------- CONFIG -------------------------------------
 # Point this at your store root (the folder that CONTAINS trades/ ob_updates/ ...).
@@ -56,6 +57,9 @@ OUT_DIR = Path("./mm_results")
 
 # Strategy parameters (the documented MCB baseline).
 STRAT = dict(half_spread=0.20, size=50, max_inv=500)
+
+# Fixed seed for the stochastic LatencyModel -> identical latency draws every run.
+LATENCY_SEED = 0
 
 # Backtester config. fee schedule itself comes from mm_backtest (17.73 bps/side).
 CFG = dict(
@@ -192,10 +196,37 @@ def list_symbols(trade_ds):
 
 
 # ----------------------------- one backtest ---------------------------------
-def make_strategy():
-    # Swap point: return MicrostructureMM(...) here to run the microstructure MM
-    # instead (it needs session_ms and per-symbol params, and its short-cap bug
-    # must be fixed first). Default is the documented baseline.
+# Set True to run MicrostructureMM, False for the NaiveSymmetricMM baseline.
+# This is the ONLY thing that differs between the two attribution runs -- fee,
+# latency, session window, fill rules and dates are all held constant -- so the
+# P&L delta is attributable purely to strategy sophistication.
+USE_MICRO = True
+
+# Microstructure params. All at the author's documented __init__ defaults EXCEPT
+# the ones that must be set per-run: fee_pct is left None so micro inherits the
+# SAME TREC fee the backtester charges (one source of truth), and session_ms is
+# passed per symbol-day by run_one. Tuning params (gamma, kappa, min_edge_pct,
+# improve_ticks, tol_ticks) stay at defaults for an HONEST first comparison --
+# do NOT tune them to beat naive here; that is Stage-C calibration, done later.
+MICRO_PARAMS = dict(
+    size=50,            # match naive's size so sizing is not a confound
+    max_inv=500,        # match naive's inventory cap
+    gamma=0.15,         # risk aversion (default)
+    kappa=1.5,          # A-S base intensity (default, inert until as_base_weight>0)
+    min_edge_pct=0.0,   # no edge demanded above fees yet (default)
+    tick=0.01,          # PSX Ready-Market tick is a flat 1 paisa (verified)
+    improve_ticks=1.0,  # placement: quote 1 tick inside the touch (default)
+    tol_ticks=0.0,      # quote pegging off (default)
+    require_viable=True,  # stand aside when the market spread cannot cover cost
+)
+
+def make_strategy(session_ms=(0, 1)):
+    # The single swap point for the attribution chain. Micro needs session_ms
+    # (per symbol-day) for its Ho-Stoll horizon; naive ignores it.
+    if USE_MICRO:
+        # fee_pct omitted -> micro uses FEE_TOTAL_PCT (the live TREC fee).
+        return MicrostructureMM(session_ms=session_ms, **MICRO_PARAMS)
+    # The documented baseline.
     return NaiveSymmetricMM(**STRAT)
 
 
@@ -216,8 +247,16 @@ def run_one(date, sym, dsets):
         return None
     t0, t1 = int(cont["ts_exch"].min()), int(cont["ts_exch"].max())
 
-    cfg = dict(CFG, session=(t0, t1))
-    bt = Backtester(make_strategy(), cfg)
+    # Fresh seeded LatencyModel PER symbol-day: each run_one draws the identical
+    # latency sequence regardless of batch order or which other tickers run, so
+    # results are reproducible and order-independent. Same seed -> same draws.
+    # Uses the production stochastic model (~45ms median, 2% fat-tail spikes),
+    # not the flat-120ms constant. Held constant across naive/micro for clean
+    # attribution. Import LatencyModel is added at the top of the file.
+    cfg = dict(CFG, session=(t0, t1), latency_model=LatencyModel(seed=LATENCY_SEED))
+    # Pass the per-symbol-day session span so micro's Ho-Stoll horizon tau is
+    # correct. Naive ignores it. make_strategy switches on USE_MICRO.
+    bt = Backtester(make_strategy(session_ms=(t0, t1)), cfg)
     fills, equity, stats = bt.run(events, snap_groups)
     eod = bt.eod or {}
 
