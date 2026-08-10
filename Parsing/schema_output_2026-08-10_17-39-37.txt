@@ -1,0 +1,97 @@
+========== Table: trades ==========
+         column_name               column_type null   key default extra
+0      transact_time  TIMESTAMP WITH TIME ZONE  YES  None    None  None
+1       sending_time  TIMESTAMP WITH TIME ZONE  YES  None    None  None
+2         capture_ts  TIMESTAMP WITH TIME ZONE  YES  None    None  None
+3            msg_seq                    BIGINT  YES  None    None  None
+4           appl_seq                    BIGINT  YES  None    None  None
+5            channel                    BIGINT  YES  None    None  None
+6            segment                   VARCHAR  YES  None    None  None
+7             market                   VARCHAR  YES  None    None  None
+8     exec_type_code                   VARCHAR  YES  None    None  None
+9          exec_type                   VARCHAR  YES  None    None  None
+10         exec_inst                   VARCHAR  YES  None    None  None
+11            symbol                   VARCHAR  YES  None    None  None
+12             price                    DOUBLE  YES  None    None  None
+13               qty                    DOUBLE  YES  None    None  None
+14           buy_ref                    BIGINT  YES  None    None  None
+15          sell_ref                    BIGINT  YES  None    None  None
+16       resting_ref                    BIGINT  YES  None    None  None
+17  resting_order_id                   VARCHAR  YES  None    None  None
+18         initiator                   VARCHAR  YES  None    None  None
+19    aggressor_side                   VARCHAR  YES  None    None  None
+20              date                      DATE  YES  None    None  None
+
+========== Table: misc ==========
+       column_name               column_type null   key default extra
+0       capture_ts  TIMESTAMP WITH TIME ZONE  YES  None    None  None
+1     sending_time  TIMESTAMP WITH TIME ZONE  YES  None    None  None
+2        orig_time  TIMESTAMP WITH TIME ZONE  YES  None    None  None
+3          msg_seq                    BIGINT  YES  None    None  None
+4         msg_type                   VARCHAR  YES  None    None  None
+5          channel                    BIGINT  YES  None    None  None
+6          segment                   VARCHAR  YES  None    None  None
+7        n_streams                    BIGINT  YES  None    None  None
+8    appl_last_seq                    BIGINT  YES  None    None  None
+9   end_of_channel                    BIGINT  YES  None    None  None
+10  heartbeat_time  TIMESTAMP WITH TIME ZONE  YES  None    None  None
+11             raw                   VARCHAR  YES  None    None  None
+12            date                      DATE  YES  None    None  None
+
+========== Table: ob_updates ==========
+       column_name               column_type null   key default extra
+0    transact_time  TIMESTAMP WITH TIME ZONE  YES  None    None  None
+1     sending_time  TIMESTAMP WITH TIME ZONE  YES  None    None  None
+2       capture_ts  TIMESTAMP WITH TIME ZONE  YES  None    None  None
+3          msg_seq                    BIGINT  YES  None    None  None
+4         appl_seq                    BIGINT  YES  None    None  None
+5          channel                    BIGINT  YES  None    None  None
+6          segment                   VARCHAR  YES  None    None  None
+7           market                   VARCHAR  YES  None    None  None
+8            event                   VARCHAR  YES  None    None  None
+9   exec_type_code                   VARCHAR  YES  None    None  None
+10       exec_type                   VARCHAR  YES  None    None  None
+11       exec_inst                   VARCHAR  YES  None    None  None
+12          symbol                   VARCHAR  YES  None    None  None
+13       side_code                   VARCHAR  YES  None    None  None
+14            side                   VARCHAR  YES  None    None  None
+15           price                    DOUBLE  YES  None    None  None
+16             qty                    DOUBLE  YES  None    None  None
+17        order_id                   VARCHAR  YES  None    None  None
+18         buy_ref                    BIGINT  YES  None    None  None
+19        sell_ref                    BIGINT  YES  None    None  None
+20     resting_ref                    BIGINT  YES  None    None  None
+21     raw_last_px                    DOUBLE  YES  None    None  None
+22            date                      DATE  YES  None    None  None
+
+========== Table: ob_snapshot ==========
+          column_name               column_type null   key default extra
+0       snapshot_time  TIMESTAMP WITH TIME ZONE  YES  None    None  None
+1           orig_time  TIMESTAMP WITH TIME ZONE  YES  None    None  None
+2          capture_ts  TIMESTAMP WITH TIME ZONE  YES  None    None  None
+3             msg_seq                    BIGINT  YES  None    None  None
+4             channel                    BIGINT  YES  None    None  None
+5             segment                   VARCHAR  YES  None    None  None
+6              market                   VARCHAR  YES  None    None  None
+7              symbol                   VARCHAR  YES  None    None  None
+8      trading_status                   VARCHAR  YES  None    None  None
+9               phase                   VARCHAR  YES  None    None  None
+10  suspended_all_day                   BOOLEAN  YES  None    None  None
+11       break_reason                   VARCHAR  YES  None    None  None
+12         prev_close                    DOUBLE  YES  None    None  None
+13         num_trades                    BIGINT  YES  None    None  None
+14         cum_volume                    DOUBLE  YES  None    None  None
+15          cum_value                    DOUBLE  YES  None    None  None
+16    entry_type_code                   VARCHAR  YES  None    None  None
+17         entry_type                   VARCHAR  YES  None    None  None
+18              level                    BIGINT  YES  None    None  None
+19                 px                    DOUBLE  YES  None    None  None
+20                qty                    DOUBLE  YES  None    None  None
+21  n_orders_at_level                    BIGINT  YES  None    None  None
+22  n_orders_detailed                    BIGINT  YES  None    None  None
+23          order_ids                   VARCHAR  YES  None    None  None
+24         order_qtys                   VARCHAR  YES  None    None  None
+25    visible_qty_sum                    DOUBLE  YES  None    None  None
+26   is_xf_tick_floor                   BOOLEAN  YES  None    None  None
+27               date                      DATE  YES  None    None  None
+

@@ -209,14 +209,14 @@ USE_MICRO = True
 # improve_ticks, tol_ticks) stay at defaults for an HONEST first comparison --
 # do NOT tune them to beat naive here; that is Stage-C calibration, done later.
 MICRO_PARAMS = dict(
-    size=50,            # match naive's size so sizing is not a confound
-    max_inv=500,        # match naive's inventory cap
-    gamma=0.15,         # risk aversion (default)
-    kappa=1.5,          # A-S base intensity (default, inert until as_base_weight>0)
-    min_edge_pct=0.0,   # no edge demanded above fees yet (default)
-    tick=0.01,          # PSX Ready-Market tick is a flat 1 paisa (verified)
-    improve_ticks=1.0,  # placement: quote 1 tick inside the touch (default)
-    tol_ticks=0.0,      # quote pegging off (default)
+    size=50,                # match naive's size so sizing is not a confound
+    max_inv=500,            # match naive's inventory cap
+    gamma=0.15,             # risk aversion (default)
+    kappa=1.5,              # A-S base intensity (default, inert until as_base_weight>0)
+    min_edge_pct=0.0005,    # no edge demanded above fees yet (default)
+    tick=0.01,              # PSX Ready-Market tick is a flat 1 paisa (verified)
+    improve_ticks=1.0,      # placement: quote 1 tick inside the touch (default)
+    tol_ticks=0.0,          # quote pegging off (default)
     require_viable=True,  # stand aside when the market spread cannot cover cost
 )
 
