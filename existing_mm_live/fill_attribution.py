@@ -300,6 +300,13 @@ def main():
     import glob as _glob
     # every persisted real-fill file across both strategies
     real_fill_files = sorted(_glob.glob(os.path.join(FILLS_ROOT, "*", "*", "date=*.parquet")))
+    # OPTIONAL symbol restriction: set to None to attribute everything on disk,
+    # or a list to restrict (e.g. ["PPL","UBL"] even if fills/ holds all 38).
+    SYMBOLS = ["PPL", "UBL"]
+    # keep only files whose symbol folder is in the restriction (if any)
+    if SYMBOLS is not None:
+        real_fill_files = [f for f in real_fill_files
+                           if os.path.basename(os.path.dirname(f)) in SYMBOLS]
     # decompose each path into (strategy, symbol, date) for the loop
     parts = []
     # walk the file list once

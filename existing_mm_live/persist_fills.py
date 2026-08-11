@@ -66,8 +66,8 @@ FILLS_ROOT = RESULTS_ROOT / "fills"
 # Symbols to persist fills for. Start with the two validated pilots; widen to
 # the 38-name watchlist once the feature store build completes for them
 # (fills REQUIRE the symbol's feature store to exist for the context join).
-SYMBOLS = ["PPL", "UBL"]
 SYMBOLS = ['AKBL', 'ATRL', 'BAFL', 'BOP', 'DGKC', 'ENGROH', 'FFC', 'FNEL', 'HASCOL', 'HBL', 'HUBC', 'KEL', 'LUCK', 'MARI', 'MEBL', 'MLCF', 'NBP', 'NCPL', 'NML', 'NPL', 'NRL', 'OGDC', 'PACE', 'PAEL', 'PIAHCLA', 'PIBTL', 'PIOC', 'PPL', 'PSO', 'PTC', 'SAZEW', 'SEARL', 'SYS', 'THCCL', 'TOMCL', 'TPL', 'TRG', 'UBL']
+SYMBOLS = ["PPL", "UBL"]
 # Markout horizon for the fill-level forward mid (matches attribution's 5s).
 HORIZON_MS = 5000
 # Both strategies, persisted side by side under fills/{strategy}/...
