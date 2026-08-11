@@ -11,6 +11,7 @@ logs/
 *.duckdb
 *.duckdb.wal
 *.duckdb.tmp
+hft.duckdb
 
 # All Parquet Data Files
 *.par
