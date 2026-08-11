@@ -1,5 +1,17 @@
+# IDE / Editor
 .idea/
-.backtest_new/
+__pycache__/
+
+# Backtesting Directories
 .backtest/
-hft.duckdb
-session_calendar.parquet
+.backtest_new/
+logs/
+
+# All DuckDB Files
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+
+# All Parquet Data Files
+*.par
+*.parquet
