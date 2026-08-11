@@ -1,3 +1,5 @@
 .idea/
 .backtest_new/
 .backtest/
+hft.duckdb
+session_calendar.parquet
