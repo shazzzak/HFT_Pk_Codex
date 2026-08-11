@@ -47,6 +47,8 @@ FS_ROOT = RESULTS_ROOT / "feature_store"
 # ---------------------------------------------------------------------------
 # Pilot names (opposite micro failure modes: PPL over-quotes, UBL stands aside).
 SYMBOLS = ["PPL", "UBL"]
+SYMBOLS = ["KTML", "FFC", "SYS", "BAFL", "PSO", "HBL", "KOHC", "PKGS", "ITANZ", "AKBL"]
+SYMBOLS = ['AKBL', 'ATRL', 'BAFL', 'BOP', 'DGKC', 'ENGROH', 'FFC', 'FNEL', 'HASCOL', 'HBL', 'HUBC', 'KEL', 'LUCK', 'MARI', 'MEBL', 'MLCF', 'NBP', 'NCPL', 'NML', 'NPL', 'NRL', 'OGDC', 'PACE', 'PAEL', 'PIAHCLA', 'PIBTL', 'PIOC', 'PPL', 'PSO', 'PTC', 'SAZEW', 'SEARL', 'SYS', 'THCCL', 'TOMCL', 'TPL', 'TRG', 'UBL']
 # Markout label horizons in ms. 5s is PRIMARY (matches the flatten horizon).
 LABEL_HORIZONS_MS = [1000, 5000, 30000]
 # Trailing trade window for toxicity (matches micro_mm's flow deque).
@@ -381,6 +383,10 @@ def main():
             # feature_store/{symbol}/date={date}.parquet
             out_dir = FS_ROOT / sym
             out_dir.mkdir(parents=True, exist_ok=True)
+            # Skip already-built symbol-days so a crashed run resumes instead of restarting.
+            out_path = out_dir / f"date={date}.parquet"
+            if out_path.exists():
+                continue
             df.to_parquet(out_dir / f"date={date}.parquet", index=False)
         # Per-date progress with timing.
         print(f"  [{di}/{len(dates)}] {date} {time.perf_counter()-dt0:.2f}s")
