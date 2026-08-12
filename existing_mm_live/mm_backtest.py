@@ -253,84 +253,67 @@ class Book:
         else:
             self.o[key] = Order(passive, px, -float(r.qty))
 
-    # ---- snapshots replace the whole book ----
-    def snapshot(self, rows):
-        """Apply one exchange snapshot (35=W message): FULL replacement.
-
-            `rows` = ALL rows sharing one msg_seq, including BID/OFFER book
-            levels AND the AGG_BID/AGG_OFFER aggregate rows. The method filters
-            to BID/OFFER for the visible book (up to ~10 levels per side, each
-            row carrying pipe-separated parallel lists of disclosed orders,
-            "ID1|ID2" / "500|1200") and separately reads the AGG rows for L11.
-
-            Build the target book from scratch, then `self.o = tgt` in one
-            assignment = add-missing / remove-stale / correct-every-qty at once.
-            All prior incremental state (and all synthetic lumps) is
-            deliberately forgotten, so lumps reset every snapshot.
-
-            Undisclosed depth WITHIN a visible level: a level's total qty can
-            exceed the sum of its disclosed orders. The residual is parked in a
-            synthetic order keyed "__H_{side}_{price}" so depth totals stay
-            correct; the deterministic key means successive snapshots overwrite
-            rather than accumulate.
-
-            Deep book BEYOND the visible levels (L11): the feed transmits only
-            the top ~10 price levels per side, but AGG_BID/AGG_OFFER give the
-            WHOLE-side total. The portion not covered by the visible levels
-            (total - sum(visible)) is parked as a "__AGG_{side}" lump one tick
-            past the worst visible level. This preserves whole-book depth for
-            obi(include_deep=True) without affecting bbo() or touch-level
-            quoting. The lump has no per-level detail — the feed doesn't provide
-            it — so it is a single aggregate, correct in total but opaque in
-            composition, and refreshed each snapshot. Zero/absent residual
-            (common pre-open, when the side fits in the window) -> no lump.
-            """
-
-        rows_all = rows  # full msg incl AGG_*
-        rows = rows[rows.entry_type.isin(["BID", "OFFER"])]  # visible levels
-
-        # --- market state (message-level): phase + individual circuit limits ---
-        if len(rows_all):
-            ph = rows_all["phase"].iloc[0]
-            if isinstance(ph, str):
-                self.phase = ph
-            up = rows_all.loc[rows_all.entry_type == "UPPER_CIRCUIT_BREAKER", "px"]
-            dn = rows_all.loc[rows_all.entry_type == "LOWER_CIRCUIT_BREAKER", "px"]
-            if len(up):
-                self.limit_up = float(up.iloc[0])
-            if len(dn):
-                self.limit_dn = float(dn.iloc[0])
-        if len(rows) == 0:
-            return  # status-only message: update state, KEEP the book
-
+    # NOTE: now receives a PreparsedSnapshot (from snapshot_prep.prep_snapshot),
+    # NOT a DataFrame. All pandas parsing was moved to build time; this method
+    # does only native-Python dict building. Behavior is identical -- same visible
+    # levels, same __H_ hidden residual, same __AGG_ L11 lump, same state updates.
+    def snapshot(self, ps):
+        """Apply one pre-parsed exchange snapshot: FULL book replacement.
+        `ps` is a PreparsedSnapshot with .phase, .limit_up/.limit_dn, .levels
+        (list of (side, px, qty, order_ids_str, order_qtys_str)), .agg
+        ({"BUY":total,"SELL":total}), and .has_visible. See snapshot_prep.py.
+        """
+        # --- market state (message-level): phase + circuit limits ---
+        # set phase only when the source had a string phase
+        if ps.phase is not None:
+            self.phase = ps.phase
+        # set circuit limits when present
+        if ps.limit_up is not None:
+            self.limit_up = ps.limit_up
+        if ps.limit_dn is not None:
+            self.limit_dn = ps.limit_dn
+        # status-only message (no visible levels): update state, KEEP the book
+        if not ps.has_visible:
+            return
+        # --- build the target book from scratch (full replacement) ---
         tgt = {}
-        for r in rows.itertuples():
-            side = "BUY" if r.entry_type == "BID" else "SELL"
-            px = float(r.px); disc = 0.0                   # disclosed qty sum
-            if isinstance(r.order_ids, str) and r.order_ids:
-                for oid, q in zip(r.order_ids.split("|"), str(r.order_qtys).split("|")):
-                    tgt[oid] = Order(side, px, float(q)); disc += float(q)
-            if float(r.qty) - disc > 0:                    # hidden residual
-                tgt[f"__H_{side}_{px}"] = Order(side, px, float(r.qty) - disc)
-
-        # L11: deep residual beyond the visible 10 levels. AGG_BID/AGG_OFFER
-        # carry the WHOLE-side total; the part not covered by L1-10 is parked
-        # as a "__AGG_" lump one tick past the worst visible level so bbo()
-        # never sees it. Zero/missing residual (pre-open) -> no lump.
-        # Resets each snapshot via the full replacement below.
-        for side, agg_type in (("BUY", "AGG_BID"), ("SELL", "AGG_OFFER")):
-            arow = rows_all[rows_all.entry_type == agg_type]
-            if len(arow) == 0:
+        # iterate the pre-extracted native level tuples (no pandas)
+        for side, px, qty, order_ids, order_qtys in ps.levels:
+            # disclosed qty accumulator for this level
+            disc = 0.0
+            # if this level lists disclosed orders, add each one
+            if order_ids:
+                # split the parallel pipe-delimited id/qty strings
+                for oid, q in zip(order_ids.split("|"), order_qtys.split("|")):
+                    # each disclosed order becomes an Order; accumulate disclosed qty
+                    tgt[oid] = Order(side, px, float(q));
+                    disc += float(q)
+            # hidden residual within this level (total qty beyond disclosed)
+            if qty - disc > 0:
+                # park the residual under a deterministic synthetic key
+                tgt[f"__H_{side}_{px}"] = Order(side, px, qty - disc)
+        # --- L11: deep residual beyond visible levels, from the AGG totals ---
+        for side in ("BUY", "SELL"):
+            # the whole-side aggregate total for this side (may be None)
+            agg_qty = ps.agg.get(side)
+            # no aggregate row -> no L11 lump
+            if agg_qty is None:
                 continue
-            agg_qty = float(arow["qty"].iloc[0])
+            # sum of visible qty on this side already placed in tgt
             visible = sum(o.qty for o in tgt.values() if o.side == side and o.qty > 0)
-            residual = agg_qty - visible  # L11 = AGG - sum(L1-10)
+            # L11 = whole-side total minus visible
+            residual = agg_qty - visible
+            # only park a lump when there is genuine deep residual
             if residual > 0:
+                # prices currently on this side (to place the lump one tick past worst)
                 prices = [o.price for o in tgt.values() if o.side == side]
+                # need at least one visible price to anchor the lump
                 if prices:
+                    # one tick past the worst visible level (below best bid / above best ask)
                     edge = (min(prices) - TICK) if side == "BUY" else (max(prices) + TICK)
+                    # single opaque aggregate lump, correct in total
                     tgt[f"__AGG_{side}"] = Order(side, edge, residual)
-
+        # atomic full replacement: add-missing / remove-stale / correct-all-qty at once
         self.o = tgt
 
     # ---- derived views ----
@@ -600,6 +583,11 @@ class Backtester:
                  cfg):  # constructor. strategy = the quoting logic (e.g. NaiveSymmetricMM); cfg = config dict (latency, fees, session window, fill rules).
         self.strat = strategy  # store the strategy object; _requote() calls self.strat.quotes(...) each event to ask where to quote.
         self.cfg = cfg  # store the config dict; read throughout for session window, fill rules, etc.
+        # Skip the per-event equity+OBI logging when False (sweep speed path).
+        # obi(5)/obi(None) scan book levels EVERY event and dominate runtime (~50x);
+        # consumers needing only fills set cfg["log_equity"]=False. Defaults True so
+        # real backtests keep the full equity curve unchanged. Fills are unaffected.
+        self.log_equity = cfg.get("log_equity", True)
         # latency: use provided LatencyModel, else build a CONSTANT-latency
         # model from cfg['latency_ms'] (back-compat / go-no-go runs)
         self.lat = cfg.get(
@@ -1095,12 +1083,22 @@ class Backtester:
                 mid = (bb + ba) / 2
                 # Remember this as the last reliable reference price.
                 self.last_good_mid = mid
-                # One equity row per event: PnL state plus the OBI features for later analysis.
-                self.equity.append({"t": ts_exch, "mid": mid,
-                                    "equity": self.cash + self.pos * mid,
-                                    "pos": self.pos,
-                                    "obi_5": self.book.obi(5),
-                                    "obi_deep": self.book.obi(None)})
+                # One equity row per event: PnL state plus the OBI features for later
+                # analysis. GATED: obi(5)/obi(None) scan book levels EVERY event and
+                # dominate runtime (~50x). Consumers that only need fills (e.g. the
+                # capture sweep) set cfg["log_equity"]=False to skip this entirely --
+                # fills are computed in steps (1)-(3) ABOVE and are unaffected.
+                if self.log_equity:
+                    self.equity.append({"t": ts_exch, "mid": mid,
+                                        "equity": self.cash + self.pos * mid,
+                                        "pos": self.pos,
+                                        "obi_5": self.book.obi(5),
+                                        "obi_deep": self.book.obi(None)})
+                else:
+                    # cheap path: keep only the mark needed for EOD inventory marking
+                    self.equity.append({"t": ts_exch, "mid": mid,
+                                        "equity": self.cash + self.pos * mid,
+                                        "pos": self.pos})
 
             # Feed the event to the strategy so it can calibrate sigma / flow / quiet time.
             if hasattr(self.strat, "observe"):

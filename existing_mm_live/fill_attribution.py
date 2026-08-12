@@ -361,7 +361,14 @@ def main():
             print(f"  fills built {i}/{len(parts)} partitions")
 
     # ---- load phase: read every checkpointed day back via duckdb (no pyarrow dependency) ----
-    fills = con.execute(f"SELECT * FROM read_parquet('{fills_dir}/*.parquet')").df()
+    # read ONLY the strategy-prefixed real-fill checkpoints (naive_*/micro_*),
+    # not any stale proxy files that may linger in the dir; union_by_name guards
+    # against minor column-order differences across partitions.
+    fills = con.execute(
+        f"SELECT * FROM read_parquet("
+        f"['{fills_dir}/naive_*.parquet', '{fills_dir}/micro_*.parquet'], "
+        f"union_by_name=True)"
+    ).df()
     # report the size of the assembled fill table
     print(f"loaded {len(fills):,} fills across {fills['date'].nunique()} days "
           f"({fills['symbol'].nunique()} symbols)")
@@ -372,18 +379,24 @@ def main():
     overall_parts, regime_parts = [], []
     # loop each strategy present in the loaded fills
     for strat_name, g in fills.groupby("strategy"):
-        # overall layered attribution for this strategy
-        a = attribute(g)
-        # tag the strategy on the front of the table
-        a.insert(0, "strategy", strat_name)
-        # collect
-        overall_parts.append(a)
-        # per-vol-regime attribution for this strategy
-        r = attribute_by_regime(g)
-        # tag it
-        r.insert(0, "strategy", strat_name)
-        # collect
-        regime_parts.append(r)
+        # split each strategy further BY SYMBOL -- PPL and UBL are opposite
+        # failure modes (micro over-quotes PPL, stands aside on UBL), so pooling
+        # them averages a disaster with a stand-aside and hides both stories.
+        for sym_name, gs in g.groupby("symbol"):
+            # overall layered attribution for this (strategy, symbol)
+            a = attribute(gs)
+            # tag symbol then strategy on the front (strategy leftmost)
+            a.insert(0, "symbol", sym_name)
+            a.insert(0, "strategy", strat_name)
+            # collect
+            overall_parts.append(a)
+            # per-vol-regime attribution for this (strategy, symbol)
+            r = attribute_by_regime(gs)
+            # tag it
+            r.insert(0, "symbol", sym_name)
+            r.insert(0, "strategy", strat_name)
+            # collect
+            regime_parts.append(r)
     # assemble the strategy-split tables
     overall = pd.concat(overall_parts, ignore_index=True)
     # regime table

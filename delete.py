@@ -1,6 +1,9 @@
-cd /Users/shazzak/PycharmProjects/HFT && \
-echo "=== run_one return dict (what it hands back -- does it expose fills?) ===" && \
-sed -n '233,275p' existing_mm_live/run_legacy_mm.py && \
-echo "" && \
-echo "=== fill_attribution build_fills_for_partition (the function to replace) ===" && \
-sed -n '212,278p' existing_mm/fill_attribution.py
+# show_snapshot_internals.py -- gather what's needed to optimize snapshot()
+# run from existing_mm_live/:  python show_snapshot_internals.py
+import subprocess
+# tail of snapshot() (the AGG loop end + book assignment)
+print("=== snapshot() tail (325-345) ===")
+print(subprocess.run(["sed","-n","325,345p","mm_backtest.py"],capture_output=True,text=True).stdout)
+# how snap_groups is constructed and passed to run()
+print("=== snap_groups / build_events grouping in run_legacy_mm.py ===")
+print(subprocess.run(["grep","-n","snap_groups","run_legacy_mm.py"],capture_output=True,text=True).stdout)

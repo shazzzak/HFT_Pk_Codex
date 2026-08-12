@@ -141,7 +141,13 @@ def build_events(u: pd.DataFrame, s: pd.DataFrame, t: pd.DataFrame):
     t["rest_oid"] = t["resting_order_id"].map(parse_rest_oid)
 
     # One frame per snapshot message (all its rows: book + AGG + status).
-    snap_groups = dict(tuple(s.groupby("msg_seq")))
+    # pre-parse each snapshot group ONCE into a plain-Python PreparsedSnapshot,
+    # so Book.snapshot() does zero pandas per call (removes the 89%-runtime
+    # bottleneck). snap_groups now maps msg_seq -> PreparsedSnapshot, not DataFrame.
+    from snapshot_prep import prep_snapshot
+    # build the dict of pre-parsed snapshots keyed by msg_seq
+    snap_groups = {ms: prep_snapshot(grp) for ms, grp in s.groupby("msg_seq")}
+    
     # One (ts_exch, ts_cap) per message; status-only messages become events too.
     snap_ev = s.groupby("msg_seq", as_index=False)[["ts_exch", "ts_cap"]].min()
 
@@ -213,7 +219,7 @@ MICRO_PARAMS = dict(
     max_inv=500,            # match naive's inventory cap
     gamma=0.15,             # risk aversion (default)
     kappa=1.5,              # A-S base intensity (default, inert until as_base_weight>0)
-    min_edge_pct=0.0005,    # no edge demanded above fees yet (default)
+    min_edge_pct=0.0000,    # no edge demanded above fees yet (default)
     tick=0.01,              # PSX Ready-Market tick is a flat 1 paisa (verified)
     improve_ticks=1.0,      # placement: quote 1 tick inside the touch (default)
     tol_ticks=0.0,          # quote pegging off (default)

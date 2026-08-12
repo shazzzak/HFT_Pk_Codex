@@ -2,7 +2,8 @@ Show or Hide the Dock - Control F3
 Capture a Specific Area - Command + Shift + 4.  
 Move In (Step Into): Press F7.  
 Move Over (Step Over): Press F8.  
-Lock Screen - Control + Command + Q. 
+Lock Screen - Control + Command + Q.   
+Make Folder Favorite - Control + Command + T (^ ⌘ T).   
 **Command + C** copies the file; then **Option + Command + V** moves it.  
 Python runs while MAC locked - caffeinate -i python3 path/to/your/file.py. 
    
