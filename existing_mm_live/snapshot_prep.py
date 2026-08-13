@@ -43,35 +43,45 @@ def prep_snapshot(rows_all):
     # match snapshot()'s isinstance(ph, str) guard exactly
     if isinstance(ph, str):
         ps.phase = ph
-    # --- circuit limits: pull the UPPER/LOWER breaker prices if present ---
-    up = rows_all.loc[rows_all.entry_type == "UPPER_CIRCUIT_BREAKER", "px"]
-    dn = rows_all.loc[rows_all.entry_type == "LOWER_CIRCUIT_BREAKER", "px"]
-    # only set when a row exists (mirrors snapshot()'s len() guards)
-    if len(up):
-        ps.limit_up = float(up.iloc[0])
-    if len(dn):
-        ps.limit_dn = float(dn.iloc[0])
-    # --- visible book levels: filter to BID/OFFER, extract to native tuples ---
-    vis = rows_all[rows_all.entry_type.isin(["BID", "OFFER"])]
-    # flag whether any visible levels exist (status-only message if not)
-    ps.has_visible = len(vis) > 0
-    # extract each visible level ONCE via itertuples (the only itertuples call now)
-    for r in vis.itertuples():
-        # map entry_type to our side label here, once
-        side = "BUY" if r.entry_type == "BID" else "SELL"
-        # keep order_ids / order_qtys as raw strings (snapshot() splits them);
-        # guard non-string order_ids exactly as the original snapshot() did
-        oids = r.order_ids if isinstance(r.order_ids, str) else ""
-        # order_qtys only meaningful when order_ids is a real string
-        oqty = str(r.order_qtys) if (isinstance(r.order_ids, str) and r.order_ids) else ""
-        # native tuple: no pandas from here on
-        ps.levels.append((side, float(r.px), float(r.qty), oids, oqty))
-    # --- aggregate (L11) totals per side ---
-    for side, agg_type in (("BUY", "AGG_BID"), ("SELL", "AGG_OFFER")):
-        # the AGG row for this side, if present
-        arow = rows_all[rows_all.entry_type == agg_type]
-        # store the whole-side total (or leave None)
-        if len(arow):
-            ps.agg[side] = float(arow["qty"].iloc[0])
+    # --- SINGLE PASS over the whole group: bucket every row by entry_type in
+    # one itertuples() loop, replacing the five separate boolean-mask scans
+    # (UPPER/LOWER breaker .loc, BID/OFFER .isin, two AGG ==) that each rescanned
+    # the group. Same fields, same values, same guards -- just one pass. This is
+    # the ~9s-per-build hot spot (8,056 calls/day); one pass instead of six.
+    for r in rows_all.itertuples():
+        # the row's entry type drives which bucket it lands in
+        et = r.entry_type
+        # visible book level: BID or OFFER -> append a native level tuple
+        if et == "BID" or et == "OFFER":
+            # side label from the entry type
+            side = "BUY" if et == "BID" else "SELL"
+            # keep order_ids as a raw string, guarding non-string exactly as before
+            oids = r.order_ids if isinstance(r.order_ids, str) else ""
+            # order_qtys only meaningful when order_ids is a real non-empty string
+            oqty = str(r.order_qtys) if (isinstance(r.order_ids, str) and r.order_ids) else ""
+            # native tuple: (side, px, qty, order_ids_str, order_qtys_str)
+            ps.levels.append((side, float(r.px), float(r.qty), oids, oqty))
+            # at least one visible level seen -> not a status-only message
+            ps.has_visible = True
+        # upper circuit-breaker price (first one wins, mirrors old .iloc[0])
+        elif et == "UPPER_CIRCUIT_BREAKER":
+            # only set if not already captured (first occurrence)
+            if ps.limit_up is None:
+                ps.limit_up = float(r.px)
+        # lower circuit-breaker price (first one wins)
+        elif et == "LOWER_CIRCUIT_BREAKER":
+            # only set if not already captured
+            if ps.limit_dn is None:
+                ps.limit_dn = float(r.px)
+        # aggregate BID total -> whole-side BUY total (first one wins)
+        elif et == "AGG_BID":
+            # only set if not already captured
+            if ps.agg["BUY"] is None:
+                ps.agg["BUY"] = float(r.qty)
+        # aggregate OFFER total -> whole-side SELL total (first one wins)
+        elif et == "AGG_OFFER":
+            # only set if not already captured
+            if ps.agg["SELL"] is None:
+                ps.agg["SELL"] = float(r.qty)
     # done: a pandas-free struct
     return ps
