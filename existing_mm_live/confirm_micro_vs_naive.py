@@ -35,27 +35,29 @@ FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
 # pilot symbols
 SYMBOLS = ["PPL", "UBL"]
 
-# Per-symbol back-solved session_scale: skew at max inventory ~ 1x median spread.
-# HYPOTHESIS (the "1x median spread" target is an assumption), so we SWEEP around
-# it rather than trusting the point estimate. [] lookup below = fail loud.
+# Per-symbol session_scale (still injected for micro; skew proven inert but the
+# arg is required). Held at the 1x point -- session_scale is NO LONGER the lever.
 SESSION_SCALE_BASE = {"PPL": 7.6, "UBL": 3.9}
-# Multipliers bracketing the derived base; the optimum is found, not assumed.
-SESSION_SCALE_MULTS = [0.25, 0.5, 1.0, 2.0]
-# min_edge policy points. Default [0.0005] (the diagnosed region) -> naive + 4
-# session_scale configs (~1.25x runtime). Add 0.0003/0.0007 back for the full 2D
-# sweep -> naive + 12 micro configs (~3.25x runtime).
-MIN_EDGE_GRID = [0.0005]
+# min_edge held at the diagnosed region for this experiment.
+_ME = 0.0005
+# 2x2 experiment + naive, to isolate the two confirmed drivers of the short drift:
+#   base       = microprice ON,  no band   -> reproduces the current losing config
+#   MID        = microprice OFF (plain mid), no band   -> isolates the microprice lean
+#   band150    = microprice ON,  soft band 150   -> isolates the inventory brake
+#   MID+band150= microprice OFF, soft band 150   -> both together
+# Read EOD position per config: does MID and/or the band pull mean_pos toward 0?
 # Run set as 4-tuples: (name, overrides, ss_mult, label). naive carries no scale.
-RUNSET = [("naive", {}, None, "naive")]
-# cross-product of min_edge x session_scale multiplier for the micro configs.
-for _me in MIN_EDGE_GRID:
-    for _mult in SESSION_SCALE_MULTS:
-        RUNSET.append((
-            "micro",
-            {"min_edge_pct": _me, "improve_ticks": 0.0},
-            _mult,
-            f"micro me={_me} ss={_mult:g}x",
-        ))
+RUNSET = [
+    ("naive", {}, None, "naive"),
+    ("micro", {"min_edge_pct": _ME, "improve_ticks": 0.0,
+               "use_microprice": True}, 1.0, "micro base"),
+    ("micro", {"min_edge_pct": _ME, "improve_ticks": 0.0,
+               "use_microprice": False}, 1.0, "micro MID"),
+    ("micro", {"min_edge_pct": _ME, "improve_ticks": 0.0,
+               "use_microprice": True, "soft_inv": 150}, 1.0, "micro band150"),
+    ("micro", {"min_edge_pct": _ME, "improve_ticks": 0.0,
+               "use_microprice": False, "soft_inv": 150}, 1.0, "micro MID+band150"),
+]
 
 
 # build a strategy for name + overrides. sym + ss_mult added so micro gets its
@@ -113,8 +115,11 @@ def main():
             # totals: Path A PKR, summed mid-mark PKR, fills, per-day Path B means,
             # unclean-liq days, day-counts, and liq_none_days so a None in the
             # headline liquidated P&L is surfaced, never silently dropped.
+            # liqslip = per-day liquidation slippage per share (direct unwind cost,
+            # independent of the None-mid problem); unfilled = shares left unfilled.
             acc[(sym, label)] = {"pnl": 0.0, "mid": 0.0, "fills": 0, "unclean": 0,
                                  "pnl_days": 0, "mid_days": 0, "liq_none_days": 0,
+                                 "liqslip": [], "unfilled": 0.0,
                                  "cap": [], "mk": [], "net": []}
     # whole-run timer
     t0_all = time.perf_counter()
@@ -200,6 +205,15 @@ def main():
                     # count clean vs unclean liquidation days.
                     if bt.eod["liquidation_clean"] is False:
                         acc[(sym, label)]["unclean"] += 1
+                    # direct unwind cost: liquidation slippage per share (PKR/sh),
+                    # accumulated when present -> the real "how bad is the close" metric.
+                    _ls = bt.eod.get("liq_slippage_per_sh")
+                    if _ls is not None:
+                        acc[(sym, label)]["liqslip"].append(float(_ls))
+                    # shares the liquidation couldn't fill (residual / thin book).
+                    _uf = bt.eod.get("unfilled_sh")
+                    if _uf is not None:
+                        acc[(sym, label)]["unfilled"] += float(_uf)
                 # Path B: score fills (reusing cached fs_day)
                 nf, cap, mk, net = score_bps(fills, fs_day)
                 acc[(sym, label)]["fills"] += nf
@@ -225,6 +239,9 @@ def main():
             "mean_capture_bps": float(np.mean(a["cap"])) if a["cap"] else np.nan,
             "mean_markout_bps": float(np.mean(a["mk"])) if a["mk"] else np.nan,
             "mean_net_bps": float(np.mean(a["net"])) if a["net"] else np.nan,
+            # direct unwind cost + residual: how expensive/incomplete the close was.
+            "mean_liq_slip_per_sh": float(np.mean(a["liqslip"])) if a["liqslip"] else np.nan,
+            "total_unfilled_sh": a["unfilled"],
             "unclean_liq_days": a["unclean"],
         })
     # frame + save
@@ -247,8 +264,7 @@ def main():
     for sym in SYMBOLS:
         d = df[df.symbol == sym].copy()
         # order: naive first, then micro configs
-        # rank by position in RUNSET (robust to the swept labels; the old
-        # hard-coded {"micro me=0.0003":1,...} map returned NaN for ss=...x labels).
+        # rank by position in RUNSET (robust to any labels).
         _order = {lbl_: i for i, (_, _, _, lbl_) in enumerate(RUNSET)}
         # naive is RUNSET index 0, so it still sorts first.
         d["_ord"] = d["strategy"].map(_order)

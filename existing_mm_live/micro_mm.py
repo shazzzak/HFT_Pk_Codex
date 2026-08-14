@@ -67,13 +67,28 @@ class MicrostructureMM:
                  flow_window=50, tick=0.01,
                  quiet_ms=2000, require_viable=True, as_base_weight=0.0,
                  improve_ticks=1.0, size_notional=None, tol_ticks=0.0, vol_alpha=0.05,
-                 # REQUIRED, keyword-only: no default -> a missing value raises TypeError
-                 # at construction instead of silently skewing on a wrong scale.
-                 *, session_scale):
+                 # session_scale is REQUIRED, keyword-only: no default -> a missing
+                 # value raises TypeError at construction instead of silently
+                 # skewing on a wrong scale.
+                 # use_microprice=False -> quote around plain mid (neutral, like
+                 # naive); it exists to test/disable the microprice, the confirmed
+                 # driver of the short drift.
+                 # soft_inv=N -> once |pos|>N, stop quoting the side that ADDS to the
+                 # position (pull that quote) so fills can only reduce it. None
+                 # disables the band.
+                 *, session_scale, use_microprice=True, soft_inv=None):
         # Baseline quote size in shares (Ch 3.4: this gets cut when flow is toxic).
         self.size0 = size
         # Hard inventory cap in shares (a backstop; the skew is the real control).
         self.max_inv = max_inv
+        # Soft inventory band in shares: once |pos| exceeds it we stop quoting the
+        # side that ADDS to the position, so fills can only reduce it. None disables
+        # the band. Sweep {100, 150, 200}.
+        self.soft_inv = soft_inv
+        # Directional-pricing toggle: True = imbalance microprice (Ch 3.3); False =
+        # plain mid (neutral, like naive). The microprice is the confirmed cause of
+        # the short drift, so this exists to test/disable it.
+        self.use_microprice = use_microprice
         # Risk aversion. Scales BOTH the inventory skew and the risk half-spread.
         self.gamma = gamma
         # Dimensional bridge (units 1/PKR) scaling the inventory skew from PKR
@@ -193,9 +208,14 @@ class MicrostructureMM:
             return {}
         # Bid share of top-of-book depth.
         imb = bq / (bq + aq)
-        # Ch 3.3 proxy for the flow-conditional expectation: heavier bid depth
-        # pulls fair value UP toward the ask. This replaces the naive mid.
-        fair = ba * imb + bb * (1.0 - imb)
+        # Ch 3.3 microprice: heavier bid depth pulls fair value UP toward the ask.
+        # This is DIRECTIONAL -- the confirmed cause of the short drift (micro sells
+        # into ask-heavy books, buys into bid-heavy ones). use_microprice=False
+        # quotes around the plain mid, like naive, to remove the lean.
+        if self.use_microprice:
+            fair = ba * imb + bb * (1.0 - imb)
+        else:
+            fair = 0.5 * (bb + ba)
         # Ho-Stoll horizon.
         tau = self._horizon()
         # Per-unit inventory risk: risk aversion x variance x remaining horizon.
@@ -258,15 +278,17 @@ class MicrostructureMM:
 
         size = max(1.0, round(size))
         out = {}
-        # Bid unless we are already at the long cap.
-        if pos < self.max_inv:
+        # Bid unless long at the hard cap OR already long past the soft band
+        # (past +soft_inv we stop buying so fills can only reduce a long).
+        if pos < self.max_inv and (self.soft_inv is None or pos < self.soft_inv):
             # Floor onto the tick grid so rounding never makes us more aggressive.
             px = math.floor((reservation - half) / self.tick) * self.tick
             # Post-only clip: stay at least one tick inside the ask.
             px = min(px, ba - self.tick)
             out["BUY"] = (round(px, 2), size)
-        # Offer unless we are already at the short cap.
-        if pos > -self.max_inv:
+        # Offer unless short at the hard cap OR already short past the soft band
+        # (past -soft_inv we stop selling so only the bid remains -> we cover).
+        if pos > -self.max_inv and (self.soft_inv is None or pos > -self.soft_inv):
             # Ceil onto the tick grid (again, never more aggressive).
             px = math.ceil((reservation + half) / self.tick) * self.tick
             # Post-only clip: stay at least one tick outside the bid.
