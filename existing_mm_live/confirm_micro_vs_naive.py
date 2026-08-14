@@ -2,12 +2,12 @@
 # beat naive, per symbol, on 207 days? Measures P&L two ways and reconciles:
 #   Path A -- Backtester true EOD P&L in PKR (bt.eod["equity_liquidated"]).
 #   Path B -- attribution net bps/fill (the +2.78/-0.00 benchmark lens).
-# Micro tested at 0.0003/0.0005/0.0007 (improve_ticks=0.0); naive re-derived fresh.
+# Micro now sweeps session_scale per symbol (the inventory-skew fix); naive fresh.
 #
 # PERFORMANCE: events (esp. the 9s snapshot pre-parse) are built ONCE per
-# symbol-day and reused across all 4 configs -- the old per-config structure
-# rebuilt them 4x per symbol-day (~37s wasted/day). Also caches the feature-store
-# day once per symbol-day for Path B.
+# symbol-day and reused across all configs -- the old per-config structure
+# rebuilt them per config per symbol-day. Also caches the feature-store day once
+# per symbol-day for Path B.
 #
 # Run from existing_mm_live/:  python confirm_micro_vs_naive.py
 
@@ -34,23 +34,42 @@ FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
 
 # pilot symbols
 SYMBOLS = ["PPL", "UBL"]
-# the run set: naive + 3 micro configs. Each entry: (name, overrides, label).
-RUNSET = [
-    ("naive", {}, "naive"),
-    ("micro", {"min_edge_pct": 0.0003, "improve_ticks": 0.0}, "micro me=0.0003"),
-    ("micro", {"min_edge_pct": 0.0005, "improve_ticks": 0.0}, "micro me=0.0005"),
-    ("micro", {"min_edge_pct": 0.0007, "improve_ticks": 0.0}, "micro me=0.0007"),
-]
+
+# Per-symbol back-solved session_scale: skew at max inventory ~ 1x median spread.
+# HYPOTHESIS (the "1x median spread" target is an assumption), so we SWEEP around
+# it rather than trusting the point estimate. [] lookup below = fail loud.
+SESSION_SCALE_BASE = {"PPL": 7.6, "UBL": 3.9}
+# Multipliers bracketing the derived base; the optimum is found, not assumed.
+SESSION_SCALE_MULTS = [0.25, 0.5, 1.0, 2.0]
+# min_edge policy points. Default [0.0005] (the diagnosed region) -> naive + 4
+# session_scale configs (~1.25x runtime). Add 0.0003/0.0007 back for the full 2D
+# sweep -> naive + 12 micro configs (~3.25x runtime).
+MIN_EDGE_GRID = [0.0005]
+# Run set as 4-tuples: (name, overrides, ss_mult, label). naive carries no scale.
+RUNSET = [("naive", {}, None, "naive")]
+# cross-product of min_edge x session_scale multiplier for the micro configs.
+for _me in MIN_EDGE_GRID:
+    for _mult in SESSION_SCALE_MULTS:
+        RUNSET.append((
+            "micro",
+            {"min_edge_pct": _me, "improve_ticks": 0.0},
+            _mult,
+            f"micro me={_me} ss={_mult:g}x",
+        ))
 
 
-# build a strategy for a given name + overrides (session_ms only used by micro)
-def make_strategy(name, session_ms, overrides):
-    # naive ignores overrides + session_ms
+# build a strategy for name + overrides. sym + ss_mult added so micro gets its
+# per-symbol, swept session_scale injected (naive ignores all of sym/ss_mult).
+def make_strategy(name, sym, session_ms, overrides, ss_mult):
+    # naive ignores overrides, session_ms, sym, ss_mult.
     if name == "naive":
         return NaiveSymmetricMM(**R.STRAT)
-    # micro: MICRO_PARAMS with the config overrides applied
+    # micro: start from MICRO_PARAMS, apply the config overrides.
     params = dict(R.MICRO_PARAMS)
     params.update(overrides)
+    # Inject the required keyword-only session_scale: per-symbol base x multiplier.
+    # [] not .get() -> an uncalibrated symbol raises KeyError, never runs on a guess.
+    params["session_scale"] = SESSION_SCALE_BASE[sym] * ss_mult
     return MicrostructureMM(session_ms=session_ms, **params)
 
 
@@ -85,11 +104,17 @@ def main():
     dates = R.discover_dates()
     # per-(symbol, config) accumulators, keyed by (sym, label)
     acc = {}
+    # per-day EOD position rows for plot_skew_validation.py (one row per run/day).
+    _eod_rows = []
     # init accumulators for every (symbol, config)
     for sym in SYMBOLS:
-        for _, _, label in RUNSET:
-            # totals: Path A PKR, fills, per-day Path B means, unclean-liq days
-            acc[(sym, label)] = {"pnl": 0.0, "fills": 0, "unclean": 0,
+        # 4-tuple now; only the label is needed here.
+        for _, _, _, label in RUNSET:
+            # totals: Path A PKR, summed mid-mark PKR, fills, per-day Path B means,
+            # unclean-liq days, day-counts, and liq_none_days so a None in the
+            # headline liquidated P&L is surfaced, never silently dropped.
+            acc[(sym, label)] = {"pnl": 0.0, "mid": 0.0, "fills": 0, "unclean": 0,
+                                 "pnl_days": 0, "mid_days": 0, "liq_none_days": 0,
                                  "cap": [], "mk": [], "net": []}
     # whole-run timer
     t0_all = time.perf_counter()
@@ -135,16 +160,44 @@ def main():
                 continue
             t0, t1 = int(cont["ts_exch"].min()), int(cont["ts_exch"].max())
             # ---- INNER: every config reuses the SAME events + fs_day ----
-            for name, overrides, label in RUNSET:
+            # RUNSET entries are now 4-tuples: (name, overrides, ss_mult, label).
+            for name, overrides, ss_mult, label in RUNSET:
                 # fresh seeded latency per run (reproducible, order-independent)
                 cfg = dict(R.CFG, session=(t0, t1),
                            latency_model=LatencyModel(seed=R.LATENCY_SEED))
                 # build + run
-                bt = Backtester(make_strategy(name, (t0, t1), overrides), cfg)
+                # pass sym + ss_mult so make_strategy injects the per-symbol,
+                # swept session_scale (7.6 PPL / 3.9 UBL x the multiplier).
+                bt = Backtester(
+                    make_strategy(name, sym, (t0, t1), overrides, ss_mult), cfg)
                 fills, equity, stats = bt.run(events, snap_groups)
                 # Path A: true EOD P&L
                 if bt.eod is not None:
-                    acc[(sym, label)]["pnl"] += float(bt.eod["equity_liquidated"])
+                    # Path A total: true post-liquidation EOD P&L (summed over days).
+                    # equity_liquidated should never be None, but if it is we skip
+                    # the day and COUNT it (liq_none_days) rather than crash the whole
+                    # run or -- worse -- silently drop it and corrupt the headline
+                    # basis. The printed count keeps the total's day-basis honest
+                    # when comparing to the naive benchmark (measured over 207 days).
+                    _liq = bt.eod["equity_liquidated"]
+                    if _liq is not None:
+                        acc[(sym, label)]["pnl"] += float(_liq)
+                        acc[(sym, label)]["pnl_days"] += 1
+                    else:
+                        acc[(sym, label)]["liq_none_days"] += 1
+                    # Mid-mark P&L can be None on a day with no valid closing mid.
+                    # Accumulate only when present (it is a diagnostic, not the
+                    # headline). Days skipped here are counted below for honesty.
+                    _mid = bt.eod["equity_mid_mark"]
+                    if _mid is not None:
+                        acc[(sym, label)]["mid"] += float(_mid)
+                        acc[(sym, label)]["mid_days"] += 1
+                    # Per-day EOD signed position for the histogram; skip if absent.
+                    _pos = bt.eod["pos_at_close"]
+                    if _pos is not None:
+                        _eod_rows.append({"symbol": sym, "variant": label,
+                                          "eod_pos": float(_pos)})
+                    # count clean vs unclean liquidation days.
                     if bt.eod["liquidation_clean"] is False:
                         acc[(sym, label)]["unclean"] += 1
                 # Path B: score fills (reusing cached fs_day)
@@ -178,12 +231,27 @@ def main():
     df = pd.DataFrame(rows)
     out = Path("/Users/shazzak/Capital Stake - Results/confirm_micro_vs_naive.csv")
     df.to_csv(out, index=False)
+    # ---- LOUD: any day where the headline liquidated P&L was None ----------
+    # These days are excluded from total_pnl_pkr, so if the count is nonzero the
+    # total is NOT on the same 207-day basis as the naive benchmark. Surfaced
+    # here (not buried) precisely because it distorts the headline comparison.
+    _liq_bad = [(sym, lbl, a["liq_none_days"])
+                for (sym, lbl), a in acc.items() if a["liq_none_days"] > 0]
+    if _liq_bad:
+        print("\n!! LIQUIDATED P&L WAS None ON SOME DAYS (excluded from totals):")
+        for sym, lbl, n in _liq_bad:
+            print(f"     {sym} {lbl}: {n} day(s) -> total is over fewer than all days")
+    else:
+        print("\nliquidated P&L present on every day (headline basis intact).")
     # ---- per-symbol report with benchmark + reconciliation ----
     for sym in SYMBOLS:
         d = df[df.symbol == sym].copy()
         # order: naive first, then micro configs
-        d["_ord"] = d["strategy"].map({"naive": 0, "micro me=0.0003": 1,
-                                       "micro me=0.0005": 2, "micro me=0.0007": 3})
+        # rank by position in RUNSET (robust to the swept labels; the old
+        # hard-coded {"micro me=0.0003":1,...} map returned NaN for ss=...x labels).
+        _order = {lbl_: i for i, (_, _, _, lbl_) in enumerate(RUNSET)}
+        # naive is RUNSET index 0, so it still sorts first.
+        d["_ord"] = d["strategy"].map(_order)
         d = d.sort_values("_ord").drop(columns="_ord")
         # naive benchmark row
         nv = d[d.strategy == "naive"].iloc[0]
@@ -203,6 +271,31 @@ def main():
                   f"PathB={r['mean_net_bps']:+.3f} "
                   f"({'beats' if b_beat else 'loses'}) | {agree}")
     print(f"\nsaved: {out}")
+    # ---- validation CSVs for plot_skew_validation.py -----------------------
+    # per-day EOD signed positions: one row per (symbol, variant, day).
+    eod_df = pd.DataFrame(_eod_rows)
+    # per-(symbol, variant) P&L: summed mid-mark vs summed liquidated over all days.
+    # The gap between the two IS the inventory carry cost the skew fix targets.
+    pnl_df = pd.DataFrame([
+        {"symbol": s_, "variant": lbl_,
+         "midmark_pnl": a_["mid"], "liquidated_pnl": a_["pnl"],
+         "mid_days": a_["mid_days"], "pnl_days": a_["pnl_days"]}
+        for (s_, lbl_), a_ in acc.items()
+    ])
+    # honesty check: mid-mark is summed over mid_days, liquidated over pnl_days.
+    # If they differ the carry-gap bar compares slightly different day-sets.
+    _mism = pnl_df[pnl_df["mid_days"] != pnl_df["pnl_days"]]
+    if len(_mism):
+        print("  NOTE: mid/liquidated day-set mismatch (mid None on some days):")
+        print(_mism[["symbol", "variant", "mid_days", "pnl_days"]].to_string(index=False))
+    # write both next to the confirm CSV, where the plotter looks by default.
+    res = Path("/Users/shazzak/Capital Stake - Results")
+    # per-day positions -> the drift-toward-flat histogram.
+    eod_df.to_csv(res / "eod_positions.csv", index=False)
+    # P&L summary -> the mid-mark vs liquidated carry-gap bars.
+    pnl_df.to_csv(res / "pnl_summary.csv", index=False)
+    # confirm on stdout.
+    print(f"wrote {res / 'eod_positions.csv'} and {res / 'pnl_summary.csv'}")
 
 
 # entry point

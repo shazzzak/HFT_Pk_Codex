@@ -66,13 +66,22 @@ class MicrostructureMM:
                  session_ms=(0, 1), fee_pct=None, min_edge_pct=0.0,
                  flow_window=50, tick=0.01,
                  quiet_ms=2000, require_viable=True, as_base_weight=0.0,
-                 improve_ticks=1.0, size_notional=None, tol_ticks=0.0, vol_alpha=0.05):
+                 improve_ticks=1.0, size_notional=None, tol_ticks=0.0, vol_alpha=0.05,
+                 # REQUIRED, keyword-only: no default -> a missing value raises TypeError
+                 # at construction instead of silently skewing on a wrong scale.
+                 *, session_scale):
         # Baseline quote size in shares (Ch 3.4: this gets cut when flow is toxic).
         self.size0 = size
         # Hard inventory cap in shares (a backstop; the skew is the real control).
         self.max_inv = max_inv
         # Risk aversion. Scales BOTH the inventory skew and the risk half-spread.
         self.gamma = gamma
+        # Dimensional bridge (units 1/PKR) scaling the inventory skew from PKR
+        # variance to PKR price; gamma is treated as dimensionless in the skew, so
+        # THIS carries the dimension. CALIBRATED, not free: back-solved per symbol so
+        # skew at max inventory ~ 1x median spread (derived PPL~7.6, UBL~3.9). SWEEP
+        # it {0.25, 0.5, 1, 2}x the derived value -- do NOT trust the default.
+        self.session_scale = session_scale
         # Order-arrival intensity decay for the A-S base term (needs calibration).
         self.kappa = kappa
         # Session start/end in exchange-ms; defines the Ho-Stoll horizon tau.
@@ -191,9 +200,22 @@ class MicrostructureMM:
         tau = self._horizon()
         # Per-unit inventory risk: risk aversion x variance x remaining horizon.
         inv_risk = self.gamma * (self.sigma ** 2) * tau
-        # Ch 2.2/2.3: inventory SHIFTS the quote pair. Long -> shift down (sell
-        # more eagerly, buy less); short -> shift up. Width is untouched.
-        skew = inv_risk * pos * fair
+        # --- inventory skew, corrected to PKR variance (Ho-Stoll / A-S) --------
+        # BUG FIX: self.sigma is a per-event FRACTIONAL-return vol (~1e-4). The old
+        # skew inv_risk*pos*fair therefore used sigma^2 ~ 1e-8 and produced ~7.5e-5
+        # PKR at full inventory -- under 1/100th of a tick, so inventory control was
+        # inert. Convert sigma to a PKR PRICE vol before squaring.
+        sigma_p = self.sigma * fair
+        # Remaining inventory variance over the session: PKR-variance x a calibrated
+        # dimensional bridge (units 1/PKR) x the remaining-time fraction. LINEAR in
+        # tau -- A-S is linear in time-to-horizon and tau already encodes (T-now)/span.
+        remaining_var = (sigma_p ** 2) * self.session_scale * tau
+        # Inventory in LOTS (pos / base clip), not raw shares, so the lean scales with
+        # how many clips we are from flat. session_scale was calibrated against this.
+        pos_lots = pos / self.size0
+        # Ch 2.2/2.3: inventory SHIFTS the quote pair. Long (pos>0) -> skew>0 ->
+        # reservation below fair -> sell eagerly / buy less. Width left untouched.
+        skew = self.gamma * remaining_var * pos_lots
         # The reservation price: our own indifference value, fair value less skew.
         reservation = fair - skew
         # Avellaneda-Stoikov base half-spread; inert until kappa is calibrated.
