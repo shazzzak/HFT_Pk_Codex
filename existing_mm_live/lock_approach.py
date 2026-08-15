@@ -45,6 +45,11 @@ def _fmt(sec):
 
 # per-message best bid/ask/ts for the continuous phase of one symbol-day
 def per_message(s):
+    # this script does NOT call build_events, so ts_exch isn't present yet --
+    # derive it from orig_time exactly as build_events does (line 132 there).
+    s = s.copy()
+    # exchange-ms timestamp from the snapshot's orig_time
+    s["ts_exch"] = R.to_ms(s["orig_time"])
     # continuous-trading snapshots only
     c = s[s["phase"] == "CONTINUOUS_AUCTION"]
     # nothing continuous -> None
