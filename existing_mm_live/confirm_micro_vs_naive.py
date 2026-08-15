@@ -38,26 +38,25 @@ SYMBOLS = ["PPL", "UBL"]
 # Per-symbol session_scale (still injected for micro; skew proven inert but the
 # arg is required). Held at the 1x point -- session_scale is NO LONGER the lever.
 SESSION_SCALE_BASE = {"PPL": 7.6, "UBL": 3.9}
-# min_edge held at the diagnosed region for this experiment.
-_ME = 0.0005
-# 2x2 experiment + naive, to isolate the two confirmed drivers of the short drift:
-#   base       = microprice ON,  no band   -> reproduces the current losing config
-#   MID        = microprice OFF (plain mid), no band   -> isolates the microprice lean
-#   band150    = microprice ON,  soft band 150   -> isolates the inventory brake
-#   MID+band150= microprice OFF, soft band 150   -> both together
-# Read EOD position per config: does MID and/or the band pull mean_pos toward 0?
+# VOLUME SWEEP on the winning base (MID = microprice OFF, soft band 150). Micro's
+# per-fill economics already beat naive but it quotes ~5x less; lowering min_edge
+# lets it quote in tighter markets -> more fills. Question: does more volume close
+# the PPL gap to naive WITHOUT giving back per-fill quality or the flat inventory?
+# me=0.0005 reproduces the current MID+band150 baseline (+69,925 UBL / -1,927 PPL)
+# -> doubles as a reproducibility check.
+_MID_BAND = {"use_microprice": False, "soft_inv": 150}
+# min_edge policy points, loosest last.
+_ME_GRID = [0.0005, 0.0003, 0.0002]
 # Run set as 4-tuples: (name, overrides, ss_mult, label). naive carries no scale.
-RUNSET = [
-    ("naive", {}, None, "naive"),
-    ("micro", {"min_edge_pct": _ME, "improve_ticks": 0.0,
-               "use_microprice": True}, 1.0, "micro base"),
-    ("micro", {"min_edge_pct": _ME, "improve_ticks": 0.0,
-               "use_microprice": False}, 1.0, "micro MID"),
-    ("micro", {"min_edge_pct": _ME, "improve_ticks": 0.0,
-               "use_microprice": True, "soft_inv": 150}, 1.0, "micro band150"),
-    ("micro", {"min_edge_pct": _ME, "improve_ticks": 0.0,
-               "use_microprice": False, "soft_inv": 150}, 1.0, "micro MID+band150"),
-]
+RUNSET = [("naive", {}, None, "naive")]
+# micro configs: MID+band150 across the min_edge grid.
+for _me in _ME_GRID:
+    RUNSET.append((
+        "micro",
+        {"min_edge_pct": _me, "improve_ticks": 0.0, **_MID_BAND},
+        1.0,
+        f"MID+band150 me={_me}",
+    ))
 
 
 # build a strategy for name + overrides. sym + ss_mult added so micro gets its
@@ -197,11 +196,19 @@ def main():
                     if _mid is not None:
                         acc[(sym, label)]["mid"] += float(_mid)
                         acc[(sym, label)]["mid_days"] += 1
-                    # Per-day EOD signed position for the histogram; skip if absent.
+                    # Per-day record: position + liquidated P&L + the one-sided-close
+                    # flag (mid_at_close is None iff the closing book was one-sided).
+                    # This is what lets us split P&L by day-type to size step 1.
                     _pos = bt.eod["pos_at_close"]
-                    if _pos is not None:
-                        _eod_rows.append({"symbol": sym, "variant": label,
-                                          "eod_pos": float(_pos)})
+                    _eod_rows.append({
+                        "symbol": sym, "variant": label, "date": str(date),
+                        "eod_pos": (float(_pos) if _pos is not None else np.nan),
+                        "liquidated": (float(_liq) if _liq is not None else np.nan),
+                        # True on days with no two-sided book at the close.
+                        "mid_is_none": bt.eod["mid_at_close"] is None,
+                        # was the flatten clean (unfilled == 0)?
+                        "liq_clean": bool(bt.eod["liquidation_clean"]),
+                    })
                     # count clean vs unclean liquidation days.
                     if bt.eod["liquidation_clean"] is False:
                         acc[(sym, label)]["unclean"] += 1
