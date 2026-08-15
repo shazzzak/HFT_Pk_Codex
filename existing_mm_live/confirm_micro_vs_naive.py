@@ -156,13 +156,21 @@ def main():
             # need book + trades
             if len(t) == 0 or len(s) == 0:
                 continue
-            # build the event stream once
+            # build the event stream once (build_events adds ts_exch to s in place)
             events, snap_groups, t = R.build_events(u, s, t)
-            # continuous-session window
-            cont = t[t["initiator"] != "AUCTION"]
-            if len(cont) == 0:
+            # SESSION WINDOW from the PHASE field, not last-trade time. The old
+            # t1 = last non-auction trade let the EOD flatten fire in AFTER_HOURS /
+            # MARKET_CLOSED against a one-sided post-close book (the "one-sided close"
+            # bug). Phase-based is also the only definition robust to Ramadan (9:17-
+            # 13:30) and Friday split sessions -- any hardcoded clock would be wrong
+            # for a large chunk of the 207 days. CONTINUOUS_AUCTION is the same phase
+            # string the engine's quote gate already uses (mm_backtest line 918).
+            cont_snap = s[s["phase"] == "CONTINUOUS_AUCTION"]
+            # skip days with no continuous phase (fully halted / no-data days)
+            if len(cont_snap) == 0:
                 continue
-            t0, t1 = int(cont["ts_exch"].min()), int(cont["ts_exch"].max())
+            # t0 = continuous open, t1 = continuous close (the true bell)
+            t0, t1 = int(cont_snap["ts_exch"].min()), int(cont_snap["ts_exch"].max())
             # ---- INNER: every config reuses the SAME events + fs_day ----
             # RUNSET entries are now 4-tuples: (name, overrides, ss_mult, label).
             for name, overrides, ss_mult, label in RUNSET:

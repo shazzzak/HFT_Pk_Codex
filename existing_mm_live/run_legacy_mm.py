@@ -247,11 +247,18 @@ def run_one(date, sym, dsets):
 
     events, snap_groups, t = build_events(u, s, t)
 
-    # Session = continuous (non-auction) trading span, in exchange-ms.
-    cont = t[t["initiator"] != "AUCTION"]
-    if len(cont) == 0:
+    # Session window from the PHASE field, not last-trade time. The old
+    # t1 = last non-auction trade let the EOD flatten fire in AFTER_HOURS /
+    # MARKET_CLOSED against a one-sided post-close book (the "one-sided close"
+    # bug that inflated liquidation loss). Phase-based is also the only definition
+    # robust to Ramadan (9:17-13:30) and Friday split sessions -- any hardcoded
+    # clock would be wrong for a large chunk of days. CONTINUOUS_AUCTION is the
+    # same phase string the engine's quote gate uses (mm_backtest line 918).
+    cont_snap = s[s["phase"] == "CONTINUOUS_AUCTION"]
+    if len(cont_snap) == 0:
         return None
-    t0, t1 = int(cont["ts_exch"].min()), int(cont["ts_exch"].max())
+    # t0 = continuous open, t1 = continuous close (the true bell)
+    t0, t1 = int(cont_snap["ts_exch"].min()), int(cont_snap["ts_exch"].max())
 
     # Fresh seeded LatencyModel PER symbol-day: each run_one draws the identical
     # latency sequence regardless of batch order or which other tickers run, so
