@@ -1105,6 +1105,13 @@ class Backtester:
                 _bb, _, _ba, _ = self.book.bbo()
                 _mid = (_bb + _ba) / 2 if (_bb is not None and _ba is not None) else None
                 self.strat.observe(kind, obj, ts_exch, _mid)
+                # Sync the published circuit-breaker band onto strategies that run
+                # the distance-to-lock trigger. Duck-typed: micro_mm sets
+                # wants_limits=True; naive lacks the attribute -> getattr returns
+                # False -> skipped at near-zero cost.
+                if getattr(self.strat, "wants_limits", False):
+                    self.strat.limit_up = self.book.limit_up
+                    self.strat.limit_dn = self.book.limit_dn
 
             # (5) Advance knowledge time. cummax: receive times jitter, knowledge never rewinds.
             know = max(know, int(obj.ts_cap))

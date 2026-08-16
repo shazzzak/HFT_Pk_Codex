@@ -32,31 +32,34 @@ R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
 # feature store (Path B context)
 FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
 
-# pilot symbols
-SYMBOLS = ["PPL", "UBL"]
+# pilot symbols + PACE, the measured locky/thin name that exercises the triggers
+SYMBOLS = ["PPL", "UBL", "PACE"]
 
-# Per-symbol session_scale (still injected for micro; skew proven inert but the
-# arg is required). Held at the 1x point -- session_scale is NO LONGER the lever.
-SESSION_SCALE_BASE = {"PPL": 7.6, "UBL": 3.9}
-# VOLUME SWEEP on the winning base (MID = microprice OFF, soft band 150). Micro's
-# per-fill economics already beat naive but it quotes ~5x less; lowering min_edge
-# lets it quote in tighter markets -> more fills. Question: does more volume close
-# the PPL gap to naive WITHOUT giving back per-fill quality or the flat inventory?
-# me=0.0005 reproduces the current MID+band150 baseline (+69,925 UBL / -1,927 PPL)
-# -> doubles as a reproducibility check.
-_MID_BAND = {"use_microprice": False, "soft_inv": 150}
-# min_edge policy points, loosest last.
-_ME_GRID = [0.0005, 0.0003, 0.0002]
-# Run set as 4-tuples: (name, overrides, ss_mult, label). naive carries no scale.
-RUNSET = [("naive", {}, None, "naive")]
-# micro configs: MID+band150 across the min_edge grid.
-for _me in _ME_GRID:
-    RUNSET.append((
-        "micro",
-        {"min_edge_pct": _me, "improve_ticks": 0.0, **_MID_BAND},
-        1.0,
-        f"MID+band150 me={_me}",
-    ))
+# Per-symbol back-solved session_scale (skew at max inventory ~ 1x median spread):
+# PPL/UBL from the original back-solve; PACE from calibrate_pace_scale.py (exact
+# sigma replay, 2026-08). [] lookup in make_strategy = fail loud on new symbols.
+SESSION_SCALE_BASE = {"PPL": 7.6, "UBL": 3.9, "PACE": 46.15}
+# min_edge held at the winning point from the volume sweep.
+_ME = 0.0005
+# common micro base: microprice OFF + soft band (the current best config)
+_MID_BAND = {"min_edge_pct": _ME, "improve_ticks": 0.0,
+             "use_microprice": False, "soft_inv": 150}
+# same but with the confirmed-harmful microprice ON (re-tested on the fixed bell)
+_MP_BAND = {"min_edge_pct": _ME, "improve_ticks": 0.0,
+            "use_microprice": True, "soft_inv": 150}
+# the two production triggers (EOD + distance-to-lock), enabled together
+_TRIG = {"enable_eod_trigger": True, "enable_lock_trigger": True}
+# FACTORIAL: isolates (a) does the microprice beat MID on the corrected bell,
+# (b) do the triggers help/hurt, (c) do they interact. NOTE: on PPL/UBL the
+# triggers are EXPECTED to barely register (locks snap; approach data 2026-08);
+# PACE is the name that exercises them. Read the trigger-activation table.
+RUNSET = [
+    ("naive", {}, None, "naive"),
+    ("micro", dict(_MID_BAND), 1.0, "MID"),
+    ("micro", dict(_MID_BAND, **_TRIG), 1.0, "MID+TRIG"),
+    ("micro", dict(_MP_BAND), 1.0, "MP"),
+    ("micro", dict(_MP_BAND, **_TRIG), 1.0, "MP+TRIG"),
+]
 
 
 # build a strategy for name + overrides. sym + ss_mult added so micro gets its
@@ -119,6 +122,13 @@ def main():
             acc[(sym, label)] = {"pnl": 0.0, "mid": 0.0, "fills": 0, "unclean": 0,
                                  "pnl_days": 0, "mid_days": 0, "liq_none_days": 0,
                                  "liqslip": [], "unfilled": 0.0,
+                                 # trigger MONITORING: summed strategy counters, so
+                                 # "did the ramp/cliff ever engage" is measured fact
+                                 "trig": {"eod_ramp_widen": 0, "eod_cliff_dark": 0,
+                                          "lock_ramp_widen": 0, "lock_cliff_dark": 0,
+                                          "hold_add_pulled": 0, "hold_exit_leaned": 0,
+                                          "widen_capped": 0,
+                                          "u_time_max": 0.0, "u_lock_max": 0.0},
                                  "cap": [], "mk": [], "net": []}
     # whole-run timer
     t0_all = time.perf_counter()
@@ -179,10 +189,23 @@ def main():
                            latency_model=LatencyModel(seed=R.LATENCY_SEED))
                 # build + run
                 # pass sym + ss_mult so make_strategy injects the per-symbol,
-                # swept session_scale (7.6 PPL / 3.9 UBL x the multiplier).
-                bt = Backtester(
-                    make_strategy(name, sym, (t0, t1), overrides, ss_mult), cfg)
+                # swept session_scale; keep the strategy REFERENCE so we can read
+                # its trigger-monitoring counters after the run.
+                strat = make_strategy(name, sym, (t0, t1), overrides, ss_mult)
+                bt = Backtester(strat, cfg)
                 fills, equity, stats = bt.run(events, snap_groups)
+                # harvest the strategy's trigger-monitoring counters (naive has a
+                # different stats dict or none -- guard with .get and skip cleanly)
+                sstats = getattr(strat, "stats", {})
+                # the accumulator's trigger bucket for this (symbol, config)
+                tacc = acc[(sym, label)]["trig"]
+                # counters sum across days; urgency maxes take the max across days
+                for k in ("eod_ramp_widen", "eod_cliff_dark",
+                          "lock_ramp_widen", "lock_cliff_dark",
+                          "hold_add_pulled", "hold_exit_leaned", "widen_capped"):
+                    tacc[k] += int(sstats.get(k, 0))
+                for k in ("u_time_max", "u_lock_max"):
+                    tacc[k] = max(tacc[k], float(sstats.get(k, 0.0)))
                 # Path A: true EOD P&L
                 if bt.eod is not None:
                     # Path A total: true post-liquidation EOD P&L (summed over days).
@@ -302,6 +325,27 @@ def main():
                   f"PathB={r['mean_net_bps']:+.3f} "
                   f"({'beats' if b_beat else 'loses'}) | {agree}")
     print(f"\nsaved: {out}")
+    # ---- TRIGGER ACTIVATION TABLE (the monitoring readout) ------------------
+    # For each (symbol, config) with triggers enabled: how often each layer fired
+    # and the deepest urgency reached. EXPECTED on PPL/UBL: near-zero ramp counts
+    # (locks snap through the widen zone -- measured 2026-08); PACE should show
+    # real activity. Zero everywhere on a "+TRIG" config = investigate wiring.
+    print("\n--- trigger activation (summed events across days; u = max urgency) ---")
+    print(f"{'symbol':6s} {'config':10s} {'eod_ramp':>9s} {'eod_clif':>9s} "
+          f"{'lock_ramp':>9s} {'lock_clif':>9s} {'hold_pull':>9s} {'hold_lean':>9s} "
+          f"{'capped':>7s} {'u_time':>7s} {'u_lock':>7s}")
+    for sym in SYMBOLS:
+        for _, _, _, label in RUNSET:
+            # only rows where the config had triggers on (label convention: +TRIG)
+            if "TRIG" not in label:
+                continue
+            # this config's trigger bucket
+            t = acc[(sym, label)]["trig"]
+            # one formatted row
+            print(f"{sym:6s} {label:10s} {t['eod_ramp_widen']:>9d} {t['eod_cliff_dark']:>9d} "
+                  f"{t['lock_ramp_widen']:>9d} {t['lock_cliff_dark']:>9d} "
+                  f"{t['hold_add_pulled']:>9d} {t['hold_exit_leaned']:>9d} "
+                  f"{t['widen_capped']:>7d} {t['u_time_max']:>7.2f} {t['u_lock_max']:>7.2f}")
     # ---- validation CSVs for plot_skew_validation.py -----------------------
     # per-day EOD signed positions: one row per (symbol, variant, day).
     eod_df = pd.DataFrame(_eod_rows)

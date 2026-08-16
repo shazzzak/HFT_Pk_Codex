@@ -3,6 +3,47 @@ from collections import deque
 from mm_backtest import FEE_TOTAL_PCT
 
 
+# ============================ TRIGGER DEFAULTS (cfg-ready) ====================
+# These are the EOD / distance-to-lock trigger knobs, declared at module top so
+# they are easy to toggle now and easy to move into a periodically-read .cfg file
+# in the production system. Each is consumed as the DEFAULT of an __init__ param,
+# so any instance can still override them per-run (e.g. in a sweep).
+
+# minutes before the continuous close where the FLAT-case exploding widen starts
+EOD_RAMP_START_MIN = 5.0
+# minutes before the continuous close where the FLAT-case hard cliff fires
+# (go dark: no new positions in the final minute)
+EOD_CLIFF_MIN = 1.0
+# lock ramp start, as a fraction of the band-in-spreads runway (0.5 = half the
+# half-band away); clipped into [LOCK_START_MIN_SPR, LOCK_START_MAX_SPR]
+LOCK_START_FRAC = 0.5
+# clip floor for the lock ramp start (spreads)
+LOCK_START_MIN_SPR = 15.0
+# clip cap for the lock ramp start (spreads)
+LOCK_START_MAX_SPR = 40.0
+# lock cliff, as a fraction of the band-in-spreads runway (0.10 = SZ's 10%-of-
+# runway rule); clipped into [LOCK_CLIFF_MIN_SPR, LOCK_CLIFF_MAX_SPR]
+LOCK_CLIFF_FRAC = 0.10
+# clip floor for the lock cliff (spreads) -- guards cheap/thin names whose band
+# is only a handful of spreads wide (the PKR-1.00 band rule)
+LOCK_CLIFF_MIN_SPR = 3.0
+# clip cap for the lock cliff (spreads) -- stops going dark absurdly early on a
+# name with a huge runway
+LOCK_CLIFF_MAX_SPR = 10.0
+# cap on the exploding widen: the widened half-spread never exceeds this many
+# REFERENCE market spreads from the reservation ("~10 spreads out = unfillable").
+# The reference is max(current spread, EMA spread) -- see SPREAD_ALPHA below.
+WIDEN_CAP_SPREADS = 10.0
+# EMA decay for the rolling spread estimate (0.05 ~ 13.5-update half-life, same
+# family as vol_alpha). The cap uses max(instantaneous, EMA) so a momentarily
+# tight book cannot collapse the cap to nothing exactly when we want to be wide;
+# a genuinely widening book still grows it. Distances-to-band stay on the
+# INSTANTANEOUS spread (spread cancels in the unclipped region -> pure price
+# rule; and a blown-out spread makes the floor-clipped cliff MORE conservative).
+SPREAD_ALPHA = 0.05
+# ==============================================================================
+
+
 class MicrostructureMM:
     """Market maker built from O'Hara, Market Microstructure Theory (1998).
 
@@ -19,6 +60,24 @@ class MicrostructureMM:
                                TIGHTEN (opposite of Diamond-Verrecchia)
       Ch 7.1 viability       : if the required spread exceeds the market spread,
                                no viable quote exists -> quote nothing
+
+    EOD / LOCK TRIGGERS (production guards, OFF by default):
+      Two urgency sources -- time-to-close and distance-to-the-circuit-band --
+      each with a graded RAMP and a hard CLIFF, and both holding-aware:
+        FLAT   (|pos| < one clip): ramp = exploding widen of the acquiring
+               side(s), capped at WIDEN_CAP_SPREADS x market spread; cliff =
+               go dark (time: both sides in the last EOD_CLIFF_MIN minutes;
+               lock: the TRAPPED side within the cliff distance of the band).
+        HOLDING: the adding side is pulled inside ANY trigger window; the EXIT
+               side is ALWAYS quoted, never widened or pulled, and is leaned to
+               the most aggressive post-only placement to get flat.
+      MEASURED CONTEXT (2026-08, PPL/UBL/PACE, 207 days): lock approaches SNAP --
+      price sits ~17-42 spreads out until T-10s and covers the distance in the
+      final seconds. So on these names the RAMP will almost never engage and
+      "the ramp made no difference" in a backtest is the EXPECTED result, not
+      evidence it is broken. It is kept deliberately (defense-in-depth) for
+      names/regimes that crawl instead of snap. Do not remove it for inactivity;
+      check stats["*_ramp_widen"] to see when it actually engaged.
 
     FLAGGED SIMPLIFICATIONS (production versions noted):
       * sigma is a rolling realised vol of the reconstructed mid. Production:
@@ -62,6 +121,11 @@ class MicrostructureMM:
      
     """
 
+    # Duck-typed flag the backtester checks each event: when True it syncs the
+    # book's published circuit-breaker prices onto self.limit_up / self.limit_dn.
+    # Naive lacks this attribute entirely, so the engine skips it there.
+    wants_limits = True
+
     def __init__(self, size=50, max_inv=500, gamma=0.15, kappa=1.5,
                  session_ms=(0, 1), fee_pct=None, min_edge_pct=0.0,
                  flow_window=50, tick=0.01,
@@ -76,7 +140,24 @@ class MicrostructureMM:
                  # soft_inv=N -> once |pos|>N, stop quoting the side that ADDS to the
                  # position (pull that quote) so fills can only reduce it. None
                  # disables the band.
-                 *, session_scale, use_microprice=True, soft_inv=None):
+                 *, session_scale, use_microprice=True, soft_inv=None,
+                 # --- EOD / LOCK triggers (OFF by default: PPL/UBL runs are
+                 # unaffected unless a config explicitly enables them) ---
+                 enable_eod_trigger=False, enable_lock_trigger=False,
+                 # time thresholds (minutes), defaults from the module-top constants
+                 eod_ramp_start_min=EOD_RAMP_START_MIN, eod_cliff_min=EOD_CLIFF_MIN,
+                 # lock ramp-start rule: clip(frac * band_in_spreads, lo, hi)
+                 lock_start_frac=LOCK_START_FRAC,
+                 lock_start_min_spr=LOCK_START_MIN_SPR,
+                 lock_start_max_spr=LOCK_START_MAX_SPR,
+                 # lock cliff rule: clip(frac * band_in_spreads, lo, hi)
+                 lock_cliff_frac=LOCK_CLIFF_FRAC,
+                 lock_cliff_min_spr=LOCK_CLIFF_MIN_SPR,
+                 lock_cliff_max_spr=LOCK_CLIFF_MAX_SPR,
+                 # cap on the exploding widen, in reference market spreads
+                 widen_cap_spreads=WIDEN_CAP_SPREADS,
+                 # EMA decay for the rolling spread reference (cap robustness)
+                 spread_alpha=SPREAD_ALPHA):
         # Baseline quote size in shares (Ch 3.4: this gets cut when flow is toxic).
         self.size0 = size
         # Hard inventory cap in shares (a backstop; the skew is the real control).
@@ -94,12 +175,14 @@ class MicrostructureMM:
         # Dimensional bridge (units 1/PKR) scaling the inventory skew from PKR
         # variance to PKR price; gamma is treated as dimensionless in the skew, so
         # THIS carries the dimension. CALIBRATED, not free: back-solved per symbol so
-        # skew at max inventory ~ 1x median spread (derived PPL~7.6, UBL~3.9). SWEEP
-        # it {0.25, 0.5, 1, 2}x the derived value -- do NOT trust the default.
+        # skew at max inventory ~ 1x median spread (derived PPL~7.6, UBL~3.9,
+        # PACE~46.15). SWEEP it {0.25, 0.5, 1, 2}x the derived value.
         self.session_scale = session_scale
         # Order-arrival intensity decay for the A-S base term (needs calibration).
         self.kappa = kappa
         # Session start/end in exchange-ms; defines the Ho-Stoll horizon tau.
+        # NOTE: with the phase-based session fix, t1 is the CONTINUOUS close, so the
+        # time trigger below counts down to the true bell automatically.
         self.t0, self.t1 = session_ms
         # All-in per-side fee as a fraction of traded value (the spread floor).
         # Fee floor for quoting decisions. Defaults to the SAME schedule the
@@ -116,6 +199,35 @@ class MicrostructureMM:
         self.require_viable = require_viable
         # Weight on the A-S base half-spread; 0 until kappa is calibrated.
         self.as_base_weight = as_base_weight
+
+        # --- trigger config (stored per-instance so a sweep can override) ---
+        # master switch for the time-to-close trigger
+        self.enable_eod_trigger = enable_eod_trigger
+        # master switch for the distance-to-lock trigger
+        self.enable_lock_trigger = enable_lock_trigger
+        # minutes before the close where the flat-case widen ramp starts
+        self.eod_ramp_start_min = eod_ramp_start_min
+        # minutes before the close where the flat-case hard cliff fires
+        self.eod_cliff_min = eod_cliff_min
+        # lock ramp-start rule parameters (fraction of runway + clip bounds)
+        self.lock_start_frac = lock_start_frac
+        self.lock_start_min_spr = lock_start_min_spr
+        self.lock_start_max_spr = lock_start_max_spr
+        # lock cliff rule parameters (fraction of runway + clip bounds)
+        self.lock_cliff_frac = lock_cliff_frac
+        self.lock_cliff_min_spr = lock_cliff_min_spr
+        self.lock_cliff_max_spr = lock_cliff_max_spr
+        # widen cap in reference market spreads
+        self.widen_cap_spreads = widen_cap_spreads
+        # EMA decay for the rolling spread reference
+        self.spread_alpha = spread_alpha
+        # rolling EMA of the market spread (0 until the first quote cycle seeds it);
+        # updated in quotes() because that is where the live book is visible.
+        self.ema_spread = 0.0
+        # published circuit-breaker prices, synced each event by the backtester
+        # (see wants_limits above); None until the feed publishes them.
+        self.limit_up = None
+        self.limit_dn = None
 
         # Rolling signed trade volume for the toxicity estimate.
         self.flow = deque(maxlen=flow_window)
@@ -141,8 +253,35 @@ class MicrostructureMM:
         # Our last DESIRED quotes, for the pegging hysteresis.
         self.last_desired = {}
 
-        # Diagnostics: how often the viability gate refused to quote.
-        self.stats = {"no_quote_unviable": 0, "quotes_made": 0}
+        # Diagnostics. The trigger counters are the MONITORING SYSTEM: they record
+        # every activation so "did the ramp/cliff ever engage, and how hard" is a
+        # measured fact per run, not an inference from P&L.
+        self.stats = {
+            # how often the viability gate refused to quote
+            "no_quote_unviable": 0,
+            # how often we produced at least one quote
+            "quotes_made": 0,
+            # FLAT + time ramp widened the quotes (events)
+            "eod_ramp_widen": 0,
+            # FLAT + time cliff went dark, both sides (events)
+            "eod_cliff_dark": 0,
+            # FLAT + lock ramp widened the trapped side (events)
+            "lock_ramp_widen": 0,
+            # FLAT + lock cliff went dark on the trapped side (events)
+            "lock_cliff_dark": 0,
+            # HOLDING inside a window: adding side pulled (events)
+            "hold_add_pulled": 0,
+            # HOLDING inside a window: exit side leaned to max-aggressive (events)
+            "hold_exit_leaned": 0,
+            # events where the exploding widen HIT THE CAP (cap won the min ->
+            # the ramp wanted to go wider but was clamped). This is the "cap binds"
+            # signal: if it stays ~0 the dual-window spread upgrade is unnecessary.
+            "widen_capped": 0,
+            # maximum time-urgency reached this run (0 = ramp never engaged)
+            "u_time_max": 0.0,
+            # maximum lock-urgency reached this run (0 = ramp never engaged)
+            "u_lock_max": 0.0,
+        }
 
     # ---- calibration state: called once per event by the backtester ---------
     def observe(self, kind, obj, ts_exch, mid):
@@ -201,6 +340,153 @@ class MicrostructureMM:
         # component decays with it, so the spread narrows into the close.
         return max(0.0, min(1.0, (self.t1 - self.now) / span))
 
+    # ---- EOD / LOCK trigger state (one call per quote cycle) ----------------
+    def _trigger_state(self, bb, ba, pos):
+        """Evaluate both triggers and return the per-side actions.
+
+        Returns a dict:
+          kill_buy / kill_sell : hard suppression of that side (cliffs / holding rule)
+          u_buy / u_sell       : widen urgency for that side (0 = no widening)
+          lean_exit            : holding inside a window -> lean the exit side
+        Direction logic (sign-critical, verified against pinned()):
+          UPPER band: pinned when bb >= limit_up; the TRAPPED position is SHORT
+          (you cannot buy back above the cap), so the dangerous acquisition is a
+          SELL fill -> near the upper band we suppress/widen the SELL side.
+          LOWER band: mirrored; trapped is LONG; suppress/widen the BUY side.
+        """
+        # default: no action on either side
+        act = {"kill_buy": False, "kill_sell": False,
+               "u_buy": 0.0, "u_sell": 0.0, "lean_exit": False}
+        # nothing enabled -> zero-cost early exit (PPL/UBL default path)
+        if not (self.enable_eod_trigger or self.enable_lock_trigger):
+            return act
+        # flat = less than one clip of inventory (sub-clip residue treated as flat)
+        is_flat = abs(pos) < self.size0
+        # current market spread in PKR (book is two-sided when quotes() runs)
+        spr = ba - bb
+        # window flags: is ANY trigger currently in its ramp-or-cliff zone?
+        in_time_window = False
+        in_lock_window = False
+
+        # ---------------- time-to-close trigger ----------------
+        if self.enable_eod_trigger:
+            # minutes remaining until the continuous close (t1 = the true bell)
+            mins_left = (self.t1 - self.now) / 60000.0
+            # CLIFF: final eod_cliff_min minutes -> flat goes dark on BOTH sides
+            if mins_left <= self.eod_cliff_min:
+                # inside the cliff zone regardless of holding state
+                in_time_window = True
+                # flat: no new position of either sign this close to the bell
+                if is_flat:
+                    act["kill_buy"] = True
+                    act["kill_sell"] = True
+                    self.stats["eod_cliff_dark"] += 1
+            # RAMP: exploding widen between ramp-start and the cliff
+            elif mins_left < self.eod_ramp_start_min:
+                # inside the ramp zone
+                in_time_window = True
+                # inverse shape: 0 at ramp start, explodes toward the cliff
+                u_t = (self.eod_ramp_start_min / mins_left) - 1.0
+                # monitoring: record the deepest urgency reached
+                self.stats["u_time_max"] = max(self.stats["u_time_max"], u_t)
+                # flat: widen BOTH sides (any acquisition is unwanted near the bell)
+                if is_flat:
+                    act["u_buy"] = max(act["u_buy"], u_t)
+                    act["u_sell"] = max(act["u_sell"], u_t)
+                    self.stats["eod_ramp_widen"] += 1
+
+        # ---------------- distance-to-lock trigger ----------------
+        # needs both published band prices and a positive spread to be evaluable
+        if self.enable_lock_trigger and self.limit_up is not None \
+                and self.limit_dn is not None and spr > 0:
+            # runway: the full band width expressed in CURRENT market spreads,
+            # halved (prev-close sits mid-band; a lock is ~half the band away).
+            # NOTE: instantaneous spread, not the median -- when the spread blows
+            # out pre-lock, the floor-clipped cliff distance GROWS in PKR terms,
+            # i.e. the rule gets MORE conservative exactly when the book thins.
+            band_spr = (self.limit_up - self.limit_dn) / (2.0 * spr)
+            # cliff distance in spreads: SZ's 10%-of-runway rule with floor/cap
+            cliff_spr = min(max(self.lock_cliff_frac * band_spr,
+                                self.lock_cliff_min_spr), self.lock_cliff_max_spr)
+            # ramp-start distance in spreads, clipped, and always beyond the cliff
+            start_spr = min(max(self.lock_start_frac * band_spr,
+                                self.lock_start_min_spr), self.lock_start_max_spr)
+            # guard: the ramp zone must sit strictly outside the cliff
+            start_spr = max(start_spr, cliff_spr + 1.0)
+            # distance of the touch to each band, in spreads (0 = pinned)
+            d_up = max(0.0, self.limit_up - bb) / spr
+            d_dn = max(0.0, ba - self.limit_dn) / spr
+
+            # --- upper band: trapped position is SHORT -> act on the SELL side ---
+            if d_up <= cliff_spr:
+                # inside the upper cliff zone
+                in_lock_window = True
+                # flat: go dark on the trapped side only (BUY stays -- being long
+                # into a limit-up close is the SAFE side: you can sell into bids)
+                if is_flat:
+                    act["kill_sell"] = True
+                    self.stats["lock_cliff_dark"] += 1
+            elif d_up < start_spr:
+                # inside the upper ramp zone
+                in_lock_window = True
+                # inverse shape: 0 at ramp start, explodes toward the cliff
+                u_l = (start_spr / max(d_up, 1e-9)) - 1.0
+                # monitoring: deepest lock urgency reached
+                self.stats["u_lock_max"] = max(self.stats["u_lock_max"], u_l)
+                # flat: widen the trapped (SELL) side only
+                if is_flat:
+                    act["u_sell"] = max(act["u_sell"], u_l)
+                    self.stats["lock_ramp_widen"] += 1
+
+            # --- lower band: trapped position is LONG -> act on the BUY side ---
+            if d_dn <= cliff_spr:
+                # inside the lower cliff zone
+                in_lock_window = True
+                # flat: go dark on the trapped side only
+                if is_flat:
+                    act["kill_buy"] = True
+                    self.stats["lock_cliff_dark"] += 1
+            elif d_dn < start_spr:
+                # inside the lower ramp zone
+                in_lock_window = True
+                # inverse shape toward the lower cliff
+                u_l = (start_spr / max(d_dn, 1e-9)) - 1.0
+                # monitoring
+                self.stats["u_lock_max"] = max(self.stats["u_lock_max"], u_l)
+                # flat: widen the trapped (BUY) side only
+                if is_flat:
+                    act["u_buy"] = max(act["u_buy"], u_l)
+                    self.stats["lock_ramp_widen"] += 1
+
+        # ---------------- holding rule (overrides the flat actions) ----------
+        # inside ANY window while holding: never add, always keep + lean the exit.
+        if (in_time_window or in_lock_window) and not is_flat:
+            # long: the adding side is BUY; short: the adding side is SELL
+            if pos > 0:
+                act["kill_buy"] = True
+            else:
+                act["kill_sell"] = True
+            # count the pull
+            self.stats["hold_add_pulled"] += 1
+            # the exit side gets the bounded lean (max-aggressive post-only)
+            act["lean_exit"] = True
+            # count the lean
+            self.stats["hold_exit_leaned"] += 1
+            # IMPORTANT: the exit side is never widened -- clear any widen urgency
+            # the flat branches above could not have set (is_flat was False, so
+            # none were set), and never kill the exit side: for a LONG the exit is
+            # SELL (kill_sell stays False unless the lock cliff set it -- undo it),
+            # for a SHORT the exit is BUY (mirror). Exit access wins over the lock
+            # cliff: a trapped holder still POSTS on the exit side (best effort).
+            if pos > 0:
+                act["kill_sell"] = False
+                act["u_sell"] = 0.0
+            else:
+                act["kill_buy"] = False
+                act["u_buy"] = 0.0
+        # return the per-side action set
+        return act
+
     # ---- quoting -----------------------------------------------------------
     def quotes(self, bb, bq, ba, aq, pos):
         # No two-sided book with depth on both sides -> nothing to quote against.
@@ -258,6 +544,8 @@ class MicrostructureMM:
         half = max(half, self.tick)
         # Ch 7.1 VIABILITY GATE: if the market's spread is narrower than the
         # spread we require, no profitable passive quote exists -> stand aside.
+        # NOTE: evaluated on the BASE half, before any trigger widening -- the
+        # widening is deliberate unfillable-ness, not an economics test.
         if self.require_viable and (ba - bb) < 2.0 * half:
             self.stats["no_quote_unviable"] += 1
             return {}
@@ -277,22 +565,73 @@ class MicrostructureMM:
         size = base_size * (0.5 if tox > 0.5 else 1.0)
 
         size = max(1.0, round(size))
+
+        # ---- EOD / LOCK TRIGGERS: per-side actions (inert unless enabled) ----
+        # evaluate both triggers once for this quote cycle
+        trig = self._trigger_state(bb, ba, pos)
+        # current market spread (distance units use THIS -- see SPREAD_ALPHA note)
+        spr = ba - bb
+        # update the rolling spread EMA (seed on first cycle)
+        if self.ema_spread == 0.0:
+            self.ema_spread = spr
+        else:
+            self.ema_spread = self.spread_alpha * spr + (1.0 - self.spread_alpha) * self.ema_spread
+        # cap REFERENCE: a momentarily tight book cannot collapse the cap, a
+        # genuinely widening book still grows it.
+        ref_spr = max(spr, self.ema_spread)
+        # per-side halves: apply the exploding widen, capped at k x reference
+        # spread, and never BELOW the base half (the cap is a ceiling, not a target)
+        half_buy = half
+        # widen the BUY side if a trigger set urgency on it
+        if trig["u_buy"] > 0.0:
+            # the two candidates: the raw exploded half, and the cap ceiling
+            raw = half * (1.0 + trig["u_buy"])
+            cap = self.widen_cap_spreads * ref_spr
+            # apply cap, keep at/above base half
+            half_buy = max(half, min(raw, cap))
+            # the cap BOUND if it was the smaller of the two (it clamped the ramp)
+            if cap < raw:
+                self.stats["widen_capped"] += 1
+        # widen the SELL side if a trigger set urgency on it
+        half_sell = half
+        if trig["u_sell"] > 0.0:
+            # same two candidates for the sell side
+            raw = half * (1.0 + trig["u_sell"])
+            cap = self.widen_cap_spreads * ref_spr
+            # apply cap, keep at/above base half
+            half_sell = max(half, min(raw, cap))
+            # count a bind (note: both sides binding in one cycle counts twice,
+            # which is the intended "how many side-widenings got capped" measure)
+            if cap < raw:
+                self.stats["widen_capped"] += 1
+
         out = {}
-        # Bid unless long at the hard cap OR already long past the soft band
-        # (past +soft_inv we stop buying so fills can only reduce a long).
-        if pos < self.max_inv and (self.soft_inv is None or pos < self.soft_inv):
+        # Bid unless: trigger-killed, long at the hard cap, or long past the soft
+        # band (past +soft_inv we stop buying so fills can only reduce a long).
+        if (not trig["kill_buy"]) and pos < self.max_inv \
+                and (self.soft_inv is None or pos < self.soft_inv):
             # Floor onto the tick grid so rounding never makes us more aggressive.
-            px = math.floor((reservation - half) / self.tick) * self.tick
+            px = math.floor((reservation - half_buy) / self.tick) * self.tick
             # Post-only clip: stay at least one tick inside the ask.
             px = min(px, ba - self.tick)
+            # Bounded exit lean: SHORT + inside a trigger window -> BUY is the exit;
+            # place it at the most aggressive post-only price (the bound is
+            # structural: post-only cannot cross, so ba - tick is the ceiling).
+            if trig["lean_exit"] and pos < 0:
+                px = ba - self.tick
             out["BUY"] = (round(px, 2), size)
-        # Offer unless short at the hard cap OR already short past the soft band
-        # (past -soft_inv we stop selling so only the bid remains -> we cover).
-        if pos > -self.max_inv and (self.soft_inv is None or pos > -self.soft_inv):
+        # Offer unless: trigger-killed, short at the hard cap, or short past the
+        # soft band (past -soft_inv we stop selling so only the bid remains).
+        if (not trig["kill_sell"]) and pos > -self.max_inv \
+                and (self.soft_inv is None or pos > -self.soft_inv):
             # Ceil onto the tick grid (again, never more aggressive).
-            px = math.ceil((reservation + half) / self.tick) * self.tick
+            px = math.ceil((reservation + half_sell) / self.tick) * self.tick
             # Post-only clip: stay at least one tick outside the bid.
             px = max(px, bb + self.tick)
+            # Bounded exit lean: LONG + inside a trigger window -> SELL is the exit;
+            # most aggressive post-only placement is bb + tick.
+            if trig["lean_exit"] and pos > 0:
+                px = bb + self.tick
             out["SELL"] = (round(px, 2), size)
 
         # QUOTE PEGGING (burst-flow names): hold the previous desired quote until
