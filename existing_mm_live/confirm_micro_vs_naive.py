@@ -44,22 +44,34 @@ _ME = 0.0005
 # common micro base: microprice OFF + soft band (the current best config)
 _MID_BAND = {"min_edge_pct": _ME, "improve_ticks": 0.0,
              "use_microprice": False, "soft_inv": 150}
-# same but with the confirmed-harmful microprice ON (re-tested on the fixed bell)
+# same but with the microprice ON (kept in the test per SZ's instruction)
 _MP_BAND = {"min_edge_pct": _ME, "improve_ticks": 0.0,
             "use_microprice": True, "soft_inv": 150}
-# the two production triggers (EOD + distance-to-lock), enabled together
-_TRIG = {"enable_eod_trigger": True, "enable_lock_trigger": True}
-# FACTORIAL: isolates (a) does the microprice beat MID on the corrected bell,
-# (b) do the triggers help/hurt, (c) do they interact. NOTE: on PPL/UBL the
-# triggers are EXPECTED to barely register (locks snap; approach data 2026-08);
-# PACE is the name that exercises them. Read the trigger-activation table.
+# the two triggers SEPARATELY and together, so each one's marginal P&L is isolated
+_EOD = {"enable_eod_trigger": True}
+_LOCK = {"enable_lock_trigger": True}
+_BOTH = {"enable_eod_trigger": True, "enable_lock_trigger": True}
+# SEPARATED FACTORIAL: fair-value (MID vs MP) x trigger state (none/EOD/LOCK/BOTH).
+# Reads: (a) which trigger helps/hurts, per name; (b) does the pct-rewritten lock
+# trigger stop bleeding on PPL/UBL; (c) microprice re-test on the same footing.
 RUNSET = [
     ("naive", {}, None, "naive"),
     ("micro", dict(_MID_BAND), 1.0, "MID"),
-    ("micro", dict(_MID_BAND, **_TRIG), 1.0, "MID+TRIG"),
+    ("micro", dict(_MID_BAND, **_EOD), 1.0, "MID+EOD"),
+    ("micro", dict(_MID_BAND, **_LOCK), 1.0, "MID+LOCK"),
+    ("micro", dict(_MID_BAND, **_BOTH), 1.0, "MID+BOTH"),
     ("micro", dict(_MP_BAND), 1.0, "MP"),
-    ("micro", dict(_MP_BAND, **_TRIG), 1.0, "MP+TRIG"),
+    ("micro", dict(_MP_BAND, **_EOD), 1.0, "MP+EOD"),
+    ("micro", dict(_MP_BAND, **_LOCK), 1.0, "MP+LOCK"),
+    ("micro", dict(_MP_BAND, **_BOTH), 1.0, "MP+BOTH"),
 ]
+
+# STRATIFIED SUBSAMPLE: run every k-th day so ~N_DAYS days span the WHOLE range
+# (Ramadan, halt days, PACE's locky stretches all represented). Set N_DAYS=None
+# for the full 207. A 60-day pass is the fast directional read; before trusting
+# magnitudes, compare naive/MID here vs the stored full-run numbers -- if those
+# line up, the subsample is representative.
+N_DAYS = None
 
 
 # build a strategy for name + overrides. sym + ss_mult added so micro gets its
@@ -106,6 +118,15 @@ def _fmt(sec):
 def main():
     # all dates
     dates = R.discover_dates()
+    # STRATIFIED subsample: N_DAYS evenly-spaced days spanning the WHOLE range
+    # INCLUDING the most recent day (a plain stride+truncate would drop the last
+    # month). Ramadan / halt / locky periods all stay represented.
+    if N_DAYS is not None and N_DAYS < len(dates):
+        # evenly-spaced index selection from first to last (inclusive)
+        idx = [round(i * (len(dates) - 1) / (N_DAYS - 1)) for i in range(N_DAYS)]
+        dates = [dates[i] for i in idx]
+        print(f"STRATIFIED SUBSAMPLE: {len(dates)} days evenly spanning "
+              f"{dates[0]} .. {dates[-1]}\n", flush=True)
     # per-(symbol, config) accumulators, keyed by (sym, label)
     acc = {}
     # per-day EOD position rows for plot_skew_validation.py (one row per run/day).
@@ -127,7 +148,10 @@ def main():
                                  "trig": {"eod_ramp_widen": 0, "eod_cliff_dark": 0,
                                           "lock_ramp_widen": 0, "lock_cliff_dark": 0,
                                           "hold_add_pulled": 0, "hold_exit_leaned": 0,
+                                          "hold_add_pulled_time": 0,
+                                          "hold_add_pulled_lock": 0,
                                           "widen_capped": 0,
+                                          "lock_tier_active": 0,
                                           "u_time_max": 0.0, "u_lock_max": 0.0},
                                  "cap": [], "mk": [], "net": []}
     # whole-run timer
@@ -140,6 +164,8 @@ def main():
     print(f"confirm: {len(RUNSET)} configs x {len(SYMBOLS)} symbols x {len(dates)} days; "
           f"build-once per symbol-day\n", flush=True)
     # OUTER: dates
+    # collected (date, sym, published_upper, derived_upper) disagreements
+    band_mismatch = []
     for date in dates:
         # open datasets once
         dsets = R.open_datasets(date)
@@ -161,7 +187,14 @@ def main():
             # ---- BUILD EVENTS ONCE (the 9s snapshot pre-parse, paid once) ----
             # load the three tables
             u = R.read_symbol(dsets["ob_updates"], R.REQ_UPDATES, sym)
-            s = R.read_symbol(dsets["ob_snapshot"], R.REQ_SNAP, sym)
+            # read prev_close alongside the standard snapshot columns so the
+            # published band can be sanity-checked against the derived band
+            # (guarded: if the column is absent the check silently skips)
+            try:
+                s = R.read_symbol(dsets["ob_snapshot"],
+                                  R.REQ_SNAP + ["prev_close"], sym)
+            except Exception:
+                s = R.read_symbol(dsets["ob_snapshot"], R.REQ_SNAP, sym)
             t = R.read_symbol(dsets["trades"], R.REQ_TRADES, sym)
             # need book + trades
             if len(t) == 0 or len(s) == 0:
@@ -181,6 +214,22 @@ def main():
                 continue
             # t0 = continuous open, t1 = continuous close (the true bell)
             t0, t1 = int(cont_snap["ts_exch"].min()), int(cont_snap["ts_exch"].max())
+            # ---- BAND SANITY CHECK: published vs prev_close-derived band --------
+            # The strategy trusts ONLY the exchange-published circuit-breaker rows
+            # (handles splits / the PKR-1.00 rule). This check flags any day where
+            # published != prev_close +/- max(10%, PKR 1.00) so disagreements are
+            # HIGHLIGHTED, never silently absorbed. Skips if prev_close is absent.
+            if "prev_close" in s.columns:
+                # first published band prices for the day
+                _pub_up = s.loc[s["entry_type"] == "UPPER_CIRCUIT_BREAKER", "px"].dropna()
+                _pc = s["prev_close"].dropna()
+                if len(_pub_up) and len(_pc):
+                    # derived upper band: prev_close + max(10% of it, PKR 1.00)
+                    _exp_up = float(_pc.iloc[0]) + max(0.10 * float(_pc.iloc[0]), 1.00)
+                    # tolerance: one tick of rounding slack
+                    if abs(float(_pub_up.iloc[0]) - _exp_up) > 0.011:
+                        band_mismatch.append((str(date), sym,
+                                              float(_pub_up.iloc[0]), round(_exp_up, 2)))
             # ---- INNER: every config reuses the SAME events + fs_day ----
             # RUNSET entries are now 4-tuples: (name, overrides, ss_mult, label).
             for name, overrides, ss_mult, label in RUNSET:
@@ -202,7 +251,9 @@ def main():
                 # counters sum across days; urgency maxes take the max across days
                 for k in ("eod_ramp_widen", "eod_cliff_dark",
                           "lock_ramp_widen", "lock_cliff_dark",
-                          "hold_add_pulled", "hold_exit_leaned", "widen_capped"):
+                          "hold_add_pulled", "hold_exit_leaned", "widen_capped",
+                          "hold_add_pulled_time", "hold_add_pulled_lock",
+                          "lock_tier_active"):
                     tacc[k] += int(sstats.get(k, 0))
                 for k in ("u_time_max", "u_lock_max"):
                     tacc[k] = max(tacc[k], float(sstats.get(k, 0.0)))
@@ -325,6 +376,16 @@ def main():
                   f"PathB={r['mean_net_bps']:+.3f} "
                   f"({'beats' if b_beat else 'loses'}) | {agree}")
     print(f"\nsaved: {out}")
+    # ---- band sanity report: highlight any published-vs-derived disagreements ----
+    if band_mismatch:
+        print(f"\n!!! BAND MISMATCHES ({len(band_mismatch)} symbol-days): published upper "
+              f"band != prev_close + max(10%, PKR1) -- possible split/adjustment days:")
+        for d_, s_, pub_, exp_ in band_mismatch[:20]:
+            print(f"    {d_} {s_}: published {pub_}  derived {exp_}")
+        if len(band_mismatch) > 20:
+            print(f"    ... and {len(band_mismatch)-20} more")
+    else:
+        print("\nband sanity: published bands match prev_close-derived on all checked days")
     # ---- TRIGGER ACTIVATION TABLE (the monitoring readout) ------------------
     # For each (symbol, config) with triggers enabled: how often each layer fired
     # and the deepest urgency reached. EXPECTED on PPL/UBL: near-zero ramp counts
@@ -332,20 +393,24 @@ def main():
     # real activity. Zero everywhere on a "+TRIG" config = investigate wiring.
     print("\n--- trigger activation (summed events across days; u = max urgency) ---")
     print(f"{'symbol':6s} {'config':10s} {'eod_ramp':>9s} {'eod_clif':>9s} "
-          f"{'lock_ramp':>9s} {'lock_clif':>9s} {'hold_pull':>9s} {'hold_lean':>9s} "
-          f"{'capped':>7s} {'u_time':>7s} {'u_lock':>7s}")
+          f"{'lock_ramp':>9s} {'lock_clif':>9s} {'hold_pull':>9s} {'hp_time':>8s} "
+          f"{'hp_lock':>8s} {'hold_lean':>9s} {'capped':>7s} {'tier':>6s} "
+          f"{'u_time':>7s} {'u_lock':>7s}")
     for sym in SYMBOLS:
         for _, _, _, label in RUNSET:
-            # only rows where the config had triggers on (label convention: +TRIG)
-            if "TRIG" not in label:
+            # only rows with a trigger enabled (labels: +EOD / +LOCK / +BOTH)
+            if "+" not in label:
                 continue
             # this config's trigger bucket
             t = acc[(sym, label)]["trig"]
-            # one formatted row
+            # one formatted row (hp_time / hp_lock = hold-pull cause split;
+            # tier = moments the low-price tick floor set a lock threshold)
             print(f"{sym:6s} {label:10s} {t['eod_ramp_widen']:>9d} {t['eod_cliff_dark']:>9d} "
                   f"{t['lock_ramp_widen']:>9d} {t['lock_cliff_dark']:>9d} "
-                  f"{t['hold_add_pulled']:>9d} {t['hold_exit_leaned']:>9d} "
-                  f"{t['widen_capped']:>7d} {t['u_time_max']:>7.2f} {t['u_lock_max']:>7.2f}")
+                  f"{t['hold_add_pulled']:>9d} {t['hold_add_pulled_time']:>8d} "
+                  f"{t['hold_add_pulled_lock']:>8d} {t['hold_exit_leaned']:>9d} "
+                  f"{t['widen_capped']:>7d} {t['lock_tier_active']:>6d} "
+                  f"{t['u_time_max']:>7.2f} {t['u_lock_max']:>7.2f}")
     # ---- validation CSVs for plot_skew_validation.py -----------------------
     # per-day EOD signed positions: one row per (symbol, variant, day).
     eod_df = pd.DataFrame(_eod_rows)

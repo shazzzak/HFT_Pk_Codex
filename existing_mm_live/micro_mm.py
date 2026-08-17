@@ -14,22 +14,28 @@ EOD_RAMP_START_MIN = 5.0
 # minutes before the continuous close where the FLAT-case hard cliff fires
 # (go dark: no new positions in the final minute)
 EOD_CLIFF_MIN = 1.0
-# lock ramp start, as a fraction of the band-in-spreads runway (0.5 = half the
-# half-band away); clipped into [LOCK_START_MIN_SPR, LOCK_START_MAX_SPR]
-LOCK_START_FRAC = 0.5
-# clip floor for the lock ramp start (spreads)
-LOCK_START_MIN_SPR = 15.0
-# clip cap for the lock ramp start (spreads)
-LOCK_START_MAX_SPR = 40.0
-# lock cliff, as a fraction of the band-in-spreads runway (0.10 = SZ's 10%-of-
-# runway rule); clipped into [LOCK_CLIFF_MIN_SPR, LOCK_CLIFF_MAX_SPR]
-LOCK_CLIFF_FRAC = 0.10
-# clip floor for the lock cliff (spreads) -- guards cheap/thin names whose band
-# is only a handful of spreads wide (the PKR-1.00 band rule)
-LOCK_CLIFF_MIN_SPR = 3.0
-# clip cap for the lock cliff (spreads) -- stops going dark absurdly early on a
-# name with a huge runway
-LOCK_CLIFF_MAX_SPR = 10.0
+# ---- LOCK trigger thresholds: PERCENT OF PRICE, measured FROM THE MID to the
+# EXCHANGE-PUBLISHED band (UPPER/LOWER_CIRCUIT_BREAKER rows -> limit_up/limit_dn).
+# Spread-free by design: the 2026-08 diagnostic proved spread-unit distances fire
+# spuriously whenever the spread widens (median fire at 3-4% from the band on
+# names that never lock). Percent-of-price is instantaneous AND stable.
+# LOCK_RAMP_PCT: start the flat-case widen when the mid is within this % of a band
+# (2.0 = price has moved ~+8% of a 10% band).
+LOCK_RAMP_PCT = 2.0
+# LOCK_CLIFF_PCT: go dark (flat) on the trapped side within this % of a band
+# (0.5 = ~+9.5% moved on a 10% band).
+LOCK_CLIFF_PCT = 0.5
+# LOW-PRICE TIER (production guard for cheap names, e.g. a stock falling under
+# Rs 10): one tick is a big % move there, so a fixed % cliff could be jumped in a
+# single tick. The effective thresholds are "X% of price OR N ticks, whichever is
+# LARGER", so the cliff/ramp zones are always at least N ticks wide. For PACE at
+# ~16 PKR the tick floor never binds (tick = 0.06% of price); for a Rs 1 stock
+# (tick = 1% of price) the cliff auto-widens to 2% and the ramp to 4%.
+# MIN_CLIFF_TICKS: the cliff zone must span at least this many ticks.
+MIN_CLIFF_TICKS = 2.0
+# MIN_RAMP_GAP_TICKS: the ramp zone must extend at least this many ticks beyond
+# the cliff (so a single tick cannot jump from outside-the-ramp into the lock).
+MIN_RAMP_GAP_TICKS = 2.0
 # cap on the exploding widen: the widened half-spread never exceeds this many
 # REFERENCE market spreads from the reservation ("~10 spreads out = unfillable").
 # The reference is max(current spread, EMA spread) -- see SPREAD_ALPHA below.
@@ -146,14 +152,12 @@ class MicrostructureMM:
                  enable_eod_trigger=False, enable_lock_trigger=False,
                  # time thresholds (minutes), defaults from the module-top constants
                  eod_ramp_start_min=EOD_RAMP_START_MIN, eod_cliff_min=EOD_CLIFF_MIN,
-                 # lock ramp-start rule: clip(frac * band_in_spreads, lo, hi)
-                 lock_start_frac=LOCK_START_FRAC,
-                 lock_start_min_spr=LOCK_START_MIN_SPR,
-                 lock_start_max_spr=LOCK_START_MAX_SPR,
-                 # lock cliff rule: clip(frac * band_in_spreads, lo, hi)
-                 lock_cliff_frac=LOCK_CLIFF_FRAC,
-                 lock_cliff_min_spr=LOCK_CLIFF_MIN_SPR,
-                 lock_cliff_max_spr=LOCK_CLIFF_MAX_SPR,
+                 # lock thresholds in PERCENT OF PRICE (spread-free), plus the
+                 # low-price tier floors in ticks (see module constants)
+                 lock_ramp_pct=LOCK_RAMP_PCT,
+                 lock_cliff_pct=LOCK_CLIFF_PCT,
+                 min_cliff_ticks=MIN_CLIFF_TICKS,
+                 min_ramp_gap_ticks=MIN_RAMP_GAP_TICKS,
                  # cap on the exploding widen, in reference market spreads
                  widen_cap_spreads=WIDEN_CAP_SPREADS,
                  # EMA decay for the rolling spread reference (cap robustness)
@@ -209,14 +213,11 @@ class MicrostructureMM:
         self.eod_ramp_start_min = eod_ramp_start_min
         # minutes before the close where the flat-case hard cliff fires
         self.eod_cliff_min = eod_cliff_min
-        # lock ramp-start rule parameters (fraction of runway + clip bounds)
-        self.lock_start_frac = lock_start_frac
-        self.lock_start_min_spr = lock_start_min_spr
-        self.lock_start_max_spr = lock_start_max_spr
-        # lock cliff rule parameters (fraction of runway + clip bounds)
-        self.lock_cliff_frac = lock_cliff_frac
-        self.lock_cliff_min_spr = lock_cliff_min_spr
-        self.lock_cliff_max_spr = lock_cliff_max_spr
+        # lock thresholds (% of price) + the low-price tier tick floors
+        self.lock_ramp_pct = lock_ramp_pct
+        self.lock_cliff_pct = lock_cliff_pct
+        self.min_cliff_ticks = min_cliff_ticks
+        self.min_ramp_gap_ticks = min_ramp_gap_ticks
         # widen cap in reference market spreads
         self.widen_cap_spreads = widen_cap_spreads
         # EMA decay for the rolling spread reference
@@ -269,10 +270,18 @@ class MicrostructureMM:
             "lock_ramp_widen": 0,
             # FLAT + lock cliff went dark on the trapped side (events)
             "lock_cliff_dark": 0,
-            # HOLDING inside a window: adding side pulled (events)
+            # HOLDING inside a window: adding side pulled (events, ANY cause)
             "hold_add_pulled": 0,
+            # cause split: hold-pull while the TIME window was active
+            "hold_add_pulled_time": 0,
+            # cause split: hold-pull while the LOCK window was active (these two can
+            # sum to more than hold_add_pulled when both windows coincide)
+            "hold_add_pulled_lock": 0,
             # HOLDING inside a window: exit side leaned to max-aggressive (events)
             "hold_exit_leaned": 0,
+            # moments where the LOW-PRICE TIER (tick floor) set a lock threshold
+            # (0 on normal-priced names; non-zero means the tier is doing work)
+            "lock_tier_active": 0,
             # events where the exploding widen HIT THE CAP (cap won the min ->
             # the ramp wanted to go wider but was clamped). This is the "cap binds"
             # signal: if it stays ~0 the dual-window spread upgrade is unnecessary.
@@ -395,42 +404,52 @@ class MicrostructureMM:
                     act["u_sell"] = max(act["u_sell"], u_t)
                     self.stats["eod_ramp_widen"] += 1
 
-        # ---------------- distance-to-lock trigger ----------------
-        # needs both published band prices and a positive spread to be evaluable
+        # ---------------- distance-to-lock trigger (PERCENT OF PRICE) ----------
+        # Uses ONLY the exchange-published band prices (UPPER/LOWER_CIRCUIT_BREAKER
+        # rows -> limit_up/limit_dn, synced by the engine). Distance is measured
+        # FROM THE MID (not the touch) as a % of price -- fully spread-free, so a
+        # wide-spread flicker cannot fire it (the 2026-08 diagnostic bug).
+        # cliff flags per cause (the zone-split holding rule needs cliff-vs-ramp)
+        in_time_cliff = False
+        in_lock_cliff = False
+        # the time branch above set in_time_window; recompute its cliff flag here
+        if self.enable_eod_trigger:
+            # cliff = the final eod_cliff_min minutes
+            in_time_cliff = ((self.t1 - self.now) / 60000.0) <= self.eod_cliff_min
         if self.enable_lock_trigger and self.limit_up is not None \
-                and self.limit_dn is not None and spr > 0:
-            # runway: the full band width expressed in CURRENT market spreads,
-            # halved (prev-close sits mid-band; a lock is ~half the band away).
-            # NOTE: instantaneous spread, not the median -- when the spread blows
-            # out pre-lock, the floor-clipped cliff distance GROWS in PKR terms,
-            # i.e. the rule gets MORE conservative exactly when the book thins.
-            band_spr = (self.limit_up - self.limit_dn) / (2.0 * spr)
-            # cliff distance in spreads: SZ's 10%-of-runway rule with floor/cap
-            cliff_spr = min(max(self.lock_cliff_frac * band_spr,
-                                self.lock_cliff_min_spr), self.lock_cliff_max_spr)
-            # ramp-start distance in spreads, clipped, and always beyond the cliff
-            start_spr = min(max(self.lock_start_frac * band_spr,
-                                self.lock_start_min_spr), self.lock_start_max_spr)
-            # guard: the ramp zone must sit strictly outside the cliff
-            start_spr = max(start_spr, cliff_spr + 1.0)
-            # distance of the touch to each band, in spreads (0 = pinned)
-            d_up = max(0.0, self.limit_up - bb) / spr
-            d_dn = max(0.0, ba - self.limit_dn) / spr
+                and self.limit_dn is not None:
+            # the mid: the price reference for the % distance (spread-invariant)
+            mid_px = 0.5 * (bb + ba)
+            # one tick expressed as a % of price (drives the low-price tier floors)
+            tick_pct = (self.tick / mid_px) * 100.0 if mid_px > 0 else 0.0
+            # EFFECTIVE thresholds: "% of price OR N ticks, whichever is larger" --
+            # the low-price tier. On normal-priced names the % values bind; on cheap
+            # names the tick floors bind so the zones are always jump-proof.
+            cliff_pct = max(self.lock_cliff_pct, self.min_cliff_ticks * tick_pct)
+            ramp_pct = max(self.lock_ramp_pct,
+                           cliff_pct + self.min_ramp_gap_ticks * tick_pct)
+            # monitoring: count moments where the tick floor (tier) set a threshold
+            if cliff_pct > self.lock_cliff_pct or ramp_pct > self.lock_ramp_pct:
+                self.stats["lock_tier_active"] += 1
+            # distance from the MID to each band, as % of price (0 = at the band)
+            d_up_pct = max(0.0, self.limit_up - mid_px) / mid_px * 100.0
+            d_dn_pct = max(0.0, mid_px - self.limit_dn) / mid_px * 100.0
 
             # --- upper band: trapped position is SHORT -> act on the SELL side ---
-            if d_up <= cliff_spr:
-                # inside the upper cliff zone
+            if d_up_pct <= cliff_pct:
+                # inside the upper CLIFF zone
                 in_lock_window = True
+                in_lock_cliff = True
                 # flat: go dark on the trapped side only (BUY stays -- being long
-                # into a limit-up close is the SAFE side: you can sell into bids)
+                # into a limit-up close is the SAFE side: sell into stacked bids)
                 if is_flat:
                     act["kill_sell"] = True
                     self.stats["lock_cliff_dark"] += 1
-            elif d_up < start_spr:
-                # inside the upper ramp zone
+            elif d_up_pct < ramp_pct:
+                # inside the upper RAMP zone
                 in_lock_window = True
                 # inverse shape: 0 at ramp start, explodes toward the cliff
-                u_l = (start_spr / max(d_up, 1e-9)) - 1.0
+                u_l = (ramp_pct / max(d_up_pct, 1e-9)) - 1.0
                 # monitoring: deepest lock urgency reached
                 self.stats["u_lock_max"] = max(self.stats["u_lock_max"], u_l)
                 # flat: widen the trapped (SELL) side only
@@ -439,18 +458,19 @@ class MicrostructureMM:
                     self.stats["lock_ramp_widen"] += 1
 
             # --- lower band: trapped position is LONG -> act on the BUY side ---
-            if d_dn <= cliff_spr:
-                # inside the lower cliff zone
+            if d_dn_pct <= cliff_pct:
+                # inside the lower CLIFF zone
                 in_lock_window = True
+                in_lock_cliff = True
                 # flat: go dark on the trapped side only
                 if is_flat:
                     act["kill_buy"] = True
                     self.stats["lock_cliff_dark"] += 1
-            elif d_dn < start_spr:
-                # inside the lower ramp zone
+            elif d_dn_pct < ramp_pct:
+                # inside the lower RAMP zone
                 in_lock_window = True
                 # inverse shape toward the lower cliff
-                u_l = (start_spr / max(d_dn, 1e-9)) - 1.0
+                u_l = (ramp_pct / max(d_dn_pct, 1e-9)) - 1.0
                 # monitoring
                 self.stats["u_lock_max"] = max(self.stats["u_lock_max"], u_l)
                 # flat: widen the trapped (BUY) side only
@@ -458,26 +478,35 @@ class MicrostructureMM:
                     act["u_buy"] = max(act["u_buy"], u_l)
                     self.stats["lock_ramp_widen"] += 1
 
-        # ---------------- holding rule (overrides the flat actions) ----------
-        # inside ANY window while holding: never add, always keep + lean the exit.
-        if (in_time_window or in_lock_window) and not is_flat:
+        # ---------------- holding rule: ZONE-SPLIT (the 2026-08 fix) ------------
+        # RAMP zones while holding: DO NOTHING here -- keep quoting BOTH sides; the
+        # base Ho-Stoll inventory skew already leans the quotes toward the exit.
+        # (The old behaviour hard-pulled the adding side across the whole ramp,
+        # which destroyed normal two-sided quoting -- e.g. holding 50 shares early
+        # in the day pulled the bid entirely. Measured cost: every +TRIG config
+        # lost money. Hard actions belong ONLY in the cliffs.)
+        # CLIFF zones while holding: pull the adding side, keep + lean the exit.
+        if (in_time_cliff or in_lock_cliff) and not is_flat:
             # long: the adding side is BUY; short: the adding side is SELL
             if pos > 0:
                 act["kill_buy"] = True
             else:
                 act["kill_sell"] = True
-            # count the pull
+            # count the pull (overall)
             self.stats["hold_add_pulled"] += 1
             # the exit side gets the bounded lean (max-aggressive post-only)
             act["lean_exit"] = True
-            # count the lean
+            # count the lean (overall)
             self.stats["hold_exit_leaned"] += 1
-            # IMPORTANT: the exit side is never widened -- clear any widen urgency
-            # the flat branches above could not have set (is_flat was False, so
-            # none were set), and never kill the exit side: for a LONG the exit is
-            # SELL (kill_sell stays False unless the lock cliff set it -- undo it),
-            # for a SHORT the exit is BUY (mirror). Exit access wins over the lock
-            # cliff: a trapped holder still POSTS on the exit side (best effort).
+            # CAUSE SPLIT: attribute to whichever CLIFF(s) were active; both count
+            # when both are (their sum can exceed the overall -- the overlap signal)
+            if in_time_cliff:
+                self.stats["hold_add_pulled_time"] += 1
+            if in_lock_cliff:
+                self.stats["hold_add_pulled_lock"] += 1
+            # the exit side is never widened or killed: undo anything a lock cliff
+            # set on it. Exit access wins -- a trapped holder still posts (best
+            # effort) on the exit side.
             if pos > 0:
                 act["kill_sell"] = False
                 act["u_sell"] = 0.0
