@@ -213,6 +213,10 @@ class MicrostructureMM:
         self.eod_ramp_start_min = eod_ramp_start_min
         # minutes before the close where the flat-case hard cliff fires
         self.eod_cliff_min = eod_cliff_min
+        # the active trigger window, updated every _trigger_state evaluation and
+        # read by the backtester to tag fills. "none" before the first evaluation
+        # and permanently when both triggers are disabled.
+        self.current_window = "none"
         # lock thresholds (% of price) + the low-price tier tick floors
         self.lock_ramp_pct = lock_ramp_pct
         self.lock_cliff_pct = lock_cliff_pct
@@ -478,6 +482,21 @@ class MicrostructureMM:
                     act["u_buy"] = max(act["u_buy"], u_l)
                     self.stats["lock_ramp_widen"] += 1
 
+        # ---------------- window state (for fill tagging) -----------------------
+        # record WHICH window this quote cycle is in, cliffs taking priority over
+        # ramps (a fill during an overlap is attributed to the harder zone). The
+        # backtester reads this attribute at fill time and stamps every fill with
+        # it -- making "did we actually sell during the cliff?" directly answerable.
+        if in_time_cliff:
+            self.current_window = "time_cliff"
+        elif in_lock_cliff:
+            self.current_window = "lock_cliff"
+        elif in_time_window:
+            self.current_window = "time_ramp"
+        elif in_lock_window:
+            self.current_window = "lock_ramp"
+        else:
+            self.current_window = "none"
         # ---------------- holding rule: UNWIND (time) + ZONE-SPLIT (lock) -------
         # TIME trigger while holding: pull the adding side + lean the exit across the
         # WHOLE window (ramp AND cliff). Justified because the ramp start is now

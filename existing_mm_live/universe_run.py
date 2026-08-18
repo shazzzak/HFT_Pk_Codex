@@ -71,6 +71,25 @@ def load_scales():
     return scales
 
 
+# load the newest POV time-window table -> {symbol: (ramp_min, cliff_min)}
+def load_windows():
+    # every windows CSV, newest last
+    cands = sorted(RESULTS.glob("time_windows_*.csv"))
+    # must have one (produced by calibrate_time_windows.py)
+    if not cands:
+        raise SystemExit("no time_windows_*.csv -- run calibrate_time_windows.py first")
+    # read the newest
+    df = pd.read_csv(cands[-1])
+    # keep calibrated rows
+    ok = df[df["note"] == "ok"] if "note" in df.columns else df
+    # build the dict symbol -> (ramp, cliff)
+    win = {r["symbol"]: (float(r["eod_ramp_start_min"]), float(r["eod_cliff_min"]))
+           for _, r in ok.iterrows()}
+    # report
+    print(f"loaded {len(win)} POV time windows from {cands[-1].name}")
+    return win
+
+
 # PRE-PASS: daily median trade size (shares) + traded notional (PKR), per name.
 # (Same logic as size_sweep; trades table uses 'price', not 'px'.)
 def daily_trade_stats(dates, syms):
@@ -112,6 +131,8 @@ def main():
     tier_of = dict(zip(wl["symbol"], wl["tier"]))
     # calibrated per-name scales
     scales = load_scales()
+    # POV-calibrated per-name unwind windows (ramp, cliff) in minutes
+    windows = load_windows()
     # every name must have a scale (fail loud -- never run on a guess)
     missing = [s for s in syms if s not in scales]
     if missing:
@@ -194,6 +215,10 @@ def main():
                     params["max_inv"] = int(round(MAXINV_CLIPS * clip))
                     params["soft_inv"] = int(round(SOFTINV_CLIPS * clip))
                     params["session_scale"] = scales[sym]
+                    # per-name POV unwind windows (default 5/1 if a name is missing)
+                    ramp_min, cliff_min = windows.get(sym, (5.0, 1.0))
+                    params["eod_ramp_start_min"] = ramp_min
+                    params["eod_cliff_min"] = cliff_min
                     strat = MicrostructureMM(session_ms=(t0, t1), **params)
                 # run
                 bt = Backtester(strat, cfg)
@@ -207,8 +232,22 @@ def main():
                 else:
                     fnot = 0.0
                 part = 100.0 * fnot / adv if adv and adv > 0 else np.nan
-                # Path A: the day's liquidated P&L
+                # window-tagged fill counts (the "did we sell during the cliff?"
+                # instrumentation): count fills per trigger window this day
+                wcounts = {"none": 0, "time_ramp": 0, "time_cliff": 0,
+                           "lock_ramp": 0, "lock_cliff": 0}
+                if len(f) and "window" in f.columns:
+                    for w, n in f["window"].value_counts().items():
+                        if w in wcounts:
+                            wcounts[w] = int(n)
+                # Path A: the day's liquidated P&L + the liquidation split
                 liq = bt.eod["equity_liquidated"] if bt.eod is not None else None
+                # the split: what the mid-mark would have said, the residual mark,
+                # the shares the book could not absorb, and the closing position
+                eq_mid = bt.eod.get("equity_mid_mark") if bt.eod is not None else None
+                resid = bt.eod.get("residual_marked", 0.0) if bt.eod is not None else None
+                unf = bt.eod.get("unfilled_sh", 0.0) if bt.eod is not None else None
+                pos_c = bt.eod.get("pos_at_close", 0.0) if bt.eod is not None else None
                 # accumulate
                 a = acc[(sym, cfg_name)]
                 if liq is not None:
@@ -228,6 +267,20 @@ def main():
                              "clip_sh": (clip if cfg_name == "MID" else 50),
                              "med_trade_sh": round(med_qty, 1),
                              "pnl_pkr": (round(float(liq), 2) if liq is not None else np.nan),
+                             # what a mid-mark close would have reported (the gap to
+                             # pnl_pkr IS the day's liquidation cost)
+                             "pnl_mid_mark": (round(float(eq_mid), 2) if eq_mid is not None else np.nan),
+                             # residual marked at mid-3% (only when the walk could not absorb)
+                             "residual_marked": (round(float(resid), 2) if resid is not None else np.nan),
+                             # shares the visible book could not absorb at the close
+                             "unfilled_sh": (float(unf) if unf is not None else np.nan),
+                             # signed position carried into the close
+                             "pos_at_close": (float(pos_c) if pos_c is not None else np.nan),
+                             # fills by trigger window: the cliff/ramp activity audit
+                             "fills_time_ramp": wcounts["time_ramp"],
+                             "fills_time_cliff": wcounts["time_cliff"],
+                             "fills_lock_ramp": wcounts["lock_ramp"],
+                             "fills_lock_cliff": wcounts["lock_cliff"],
                              "net_bps": (round(net_b, 3) if isinstance(net_b, float) else np.nan),
                              "participation_pct": (round(part, 4) if not np.isnan(part) else np.nan)})
             # heartbeat with ETA

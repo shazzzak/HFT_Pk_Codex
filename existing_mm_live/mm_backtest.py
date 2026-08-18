@@ -726,7 +726,13 @@ class Backtester:
         self.pos += sgn * take                        # update our position: +take if we bought, -take if we sold.
         self.cash += -sgn * take * o.price - fee_for(o.price, take)   # update cash: money moves OPPOSITE to position (buying spends cash, selling earns it), always at OUR limit price o.price -- then subtract the fee. Note: fee uses o.price, the price we transacted at.
         self.fills.append({"t": t_exch, "side": side, "px": o.price, "qty": take,   # log this fill: time, side, OUR price, and the amount filled...
-                           "reason": reason})          # ...plus WHY it filled (through/at-queue/crossing-add) so you can audit which fill rule produced which PnL.
+                           "reason": reason,          # ...plus WHY it filled (through/at-queue/crossing-add) so you can audit which fill rule produced which PnL.
+                           # ...plus WHICH trigger window the strategy was in when it
+                           # filled (none/time_ramp/time_cliff/lock_ramp/lock_cliff).
+                           # Read-only label set by the strategy each quote cycle;
+                           # strategies without the attribute (naive) tag "none".
+                           # Answers: "did we actually sell during the cliffs?"
+                           "window": getattr(self.strat, "current_window", "none")})
         o.qty -= take                                 # reduce our order's remaining quantity by what just filled.
         if o.qty <= 0:                                # if the order is now fully filled...
             self.work.pop(side, None)                 # ...remove it from working orders (it's done). A partial fill leaves it in place with reduced qty.
