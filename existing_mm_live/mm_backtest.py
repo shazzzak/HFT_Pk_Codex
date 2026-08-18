@@ -1145,7 +1145,11 @@ class Backtester:
                     ref = mid_e if mid_e is not None else self.last_good_mid
                     residual_mark = 0.0
                     if unfilled > 0 and ref is not None:
-                        haircut = self.cfg.get("unfilled_haircut_pct", 0.10)
+                        # Residual haircut: 3% off the closing mid. The residual is
+                        # HELD OVERNIGHT (a genuine option for this desk), so the mark
+                        # is fair value less ~one day's adverse move -- NOT a fire-sale
+                        # discount. (Was 0.10, which over-penalised trapping names.)
+                        haircut = self.cfg.get("unfilled_haircut_pct", 0.03)
                         sgn = 1.0 if self.pos > 0 else -1.0
                         residual_mark = sgn * unfilled * ref * (1.0 - sgn * haircut)
                     self.eod = {

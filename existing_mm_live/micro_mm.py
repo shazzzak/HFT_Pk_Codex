@@ -478,15 +478,17 @@ class MicrostructureMM:
                     act["u_buy"] = max(act["u_buy"], u_l)
                     self.stats["lock_ramp_widen"] += 1
 
-        # ---------------- holding rule: ZONE-SPLIT (the 2026-08 fix) ------------
-        # RAMP zones while holding: DO NOTHING here -- keep quoting BOTH sides; the
-        # base Ho-Stoll inventory skew already leans the quotes toward the exit.
-        # (The old behaviour hard-pulled the adding side across the whole ramp,
-        # which destroyed normal two-sided quoting -- e.g. holding 50 shares early
-        # in the day pulled the bid entirely. Measured cost: every +TRIG config
-        # lost money. Hard actions belong ONLY in the cliffs.)
-        # CLIFF zones while holding: pull the adding side, keep + lean the exit.
-        if (in_time_cliff or in_lock_cliff) and not is_flat:
+        # ---------------- holding rule: UNWIND (time) + ZONE-SPLIT (lock) -------
+        # TIME trigger while holding: pull the adding side + lean the exit across the
+        # WHOLE window (ramp AND cliff). Justified because the ramp start is now
+        # POV-SIZED per name (Minutes = max_inv / (vol_per_min x MAX_POV)): the window
+        # opens exactly when the remaining closing volume can still absorb our
+        # inventory at our participation cap -- so "stop adding, work the exit" is the
+        # correct behaviour for the entire window, not just the last minute.
+        # LOCK trigger while holding: ZONE-SPLIT kept (the 2026-08 fix) -- the lock
+        # ramp is a price-proximity warning, not a liquidity budget; holding inside it
+        # keeps BOTH sides quoted (base skew leans) and only the lock CLIFF pulls.
+        if (in_time_window or in_lock_cliff) and not is_flat:
             # long: the adding side is BUY; short: the adding side is SELL
             if pos > 0:
                 act["kill_buy"] = True
@@ -494,13 +496,15 @@ class MicrostructureMM:
                 act["kill_sell"] = True
             # count the pull (overall)
             self.stats["hold_add_pulled"] += 1
-            # the exit side gets the bounded lean (max-aggressive post-only)
+            # the exit side gets the bounded lean (max-aggressive post-only: the
+            # touch). PURE MAKER: never crosses the spread -- the lean is the most
+            # aggressive PASSIVE placement, full stop.
             act["lean_exit"] = True
             # count the lean (overall)
             self.stats["hold_exit_leaned"] += 1
-            # CAUSE SPLIT: attribute to whichever CLIFF(s) were active; both count
+            # CAUSE SPLIT: attribute to whichever cause was active; both count
             # when both are (their sum can exceed the overall -- the overlap signal)
-            if in_time_cliff:
+            if in_time_window:
                 self.stats["hold_add_pulled_time"] += 1
             if in_lock_cliff:
                 self.stats["hold_add_pulled_lock"] += 1
@@ -571,11 +575,19 @@ class MicrostructureMM:
         half = half_risk + half_adverse + self.as_base_weight * as_base * fair + cost_floor
         # Never quote inside one tick.
         half = max(half, self.tick)
+        # ---- EOD / LOCK TRIGGERS: evaluated BEFORE the viability gate, because the
+        # UNWIND (lean_exit) must be able to post the exit side even when the market
+        # spread is too tight for profitable quoting -- during the unwind we are
+        # deliberately paying edge to get flat (min_edge is waived on the exit side).
+        trig = self._trigger_state(bb, ba, pos)
         # Ch 7.1 VIABILITY GATE: if the market's spread is narrower than the
         # spread we require, no profitable passive quote exists -> stand aside.
         # NOTE: evaluated on the BASE half, before any trigger widening -- the
         # widening is deliberate unfillable-ness, not an economics test.
-        if self.require_viable and (ba - bb) < 2.0 * half:
+        # UNWIND EXCEPTION: when lean_exit is active the gate is bypassed; the
+        # adding side is killed by the trigger anyway, and the exit side posts at
+        # the touch regardless of edge economics (getting flat > earning edge).
+        if self.require_viable and (ba - bb) < 2.0 * half and not trig["lean_exit"]:
             self.stats["no_quote_unviable"] += 1
             return {}
 
@@ -595,9 +607,8 @@ class MicrostructureMM:
 
         size = max(1.0, round(size))
 
-        # ---- EOD / LOCK TRIGGERS: per-side actions (inert unless enabled) ----
-        # evaluate both triggers once for this quote cycle
-        trig = self._trigger_state(bb, ba, pos)
+        # ---- EOD / LOCK TRIGGERS: per-side actions (trig computed above, before
+        # the viability gate -- see the unwind exception there) ----
         # current market spread (distance units use THIS -- see SPREAD_ALPHA note)
         spr = ba - bb
         # update the rolling spread EMA (seed on first cycle)
