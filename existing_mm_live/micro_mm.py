@@ -152,6 +152,7 @@ class MicrostructureMM:
                  enable_eod_trigger=False, enable_lock_trigger=False,
                  # time thresholds (minutes), defaults from the module-top constants
                  eod_ramp_start_min=EOD_RAMP_START_MIN, eod_cliff_min=EOD_CLIFF_MIN,
+                 unwind_profile=None, unwind_pov=0.10, session_segments=None,
                  # lock thresholds in PERCENT OF PRICE (spread-free), plus the
                  # low-price tier floors in ticks (see module constants)
                  lock_ramp_pct=LOCK_RAMP_PCT,
@@ -213,6 +214,18 @@ class MicrostructureMM:
         self.eod_ramp_start_min = eod_ramp_start_min
         # minutes before the close where the flat-case hard cliff fires
         self.eod_cliff_min = eod_cliff_min
+        # ---- POV unwind model (SZ's weighted-bucket design, 2026-08) ----
+        # unwind_profile: (vol_first15, vol_middle, vol_last15) shares-per-minute
+        # for THIS name, from build_volume_profile.py. None -> the OLD fixed-window
+        # behaviour (holding inside the time window engages the unwind), keeping
+        # the old strategy available for A/B comparison.
+        self.unwind_profile = unwind_profile
+        # participation cap: we never assume more than this share of market volume
+        self.unwind_pov = unwind_pov
+        # the day's continuous-trading segments [(start_ms, end_ms), ...]; REQUIRED
+        # when unwind_profile is set (Friday's Jumu'ah break makes wall-clock time
+        # WRONG -- tradeable minutes must be summed over segments)
+        self.session_segments = session_segments
         # the active trigger window, updated every _trigger_state evaluation and
         # read by the backtester to tag fills. "none" before the first evaluation
         # and permanently when both triggers are disabled.
@@ -352,6 +365,57 @@ class MicrostructureMM:
         # Ho-Stoll tau: 1.0 at the open, 0.0 at the flatten time. The risk
         # component decays with it, so the spread narrows into the close.
         return max(0.0, min(1.0, (self.t1 - self.now) / span))
+
+    # ---- SZ's POV unwind model (the Weight_Avg_Shares_per_Min.xlsx logic) ----
+    # Decide whether the CURRENT inventory can still be cleared passively in the
+    # tradeable time remaining, at our participation cap. Mirrors the sheet:
+    #   Mins allocation : fills the remaining time from the CLOSE BACKWARD --
+    #                     Last15 first (=MIN(15, left)), then Middle, then First15
+    #                     (the MIN(I,H) column mechanic).
+    #   Shares/Min      : SUMPRODUCT(bucket_rates, bucket_mins)/SUM(bucket_mins)
+    #   My Trades/Min   : Shares/Min x POV      (never assume >POV of the tape)
+    #   Time Needed     : |inventory| / My Trades/Min
+    #   engage unwind  <=> Time Needed >= tradeable minutes left (the "Ramp" cell)
+    def _unwind_needed(self, pos):
+        # tradeable minutes remaining: sum of the overlap of [now, end] with each
+        # continuous segment -- NOT wall clock (Friday's Jumu'ah break must not
+        # count as sellable time)
+        left_ms = 0
+        # total tradeable ms this day (for the Middle bucket's total length)
+        total_ms = 0
+        for s, e in self.session_segments:
+            # this segment's full length
+            total_ms += (e - s)
+            # the part of it still ahead of us
+            if self.now < e:
+                left_ms += (e - max(self.now, s))
+        # minutes remaining
+        left_min = left_ms / 60000.0
+        # nothing tradeable left -> cannot clear passively; engage if holding
+        if left_min <= 0.0:
+            return True
+        # bucket TOTALS for this day: 15 / (session - 30, floored at 1) / 15
+        total_min = total_ms / 60000.0
+        mid_total = max(total_min - 30.0, 1.0)
+        # ---- the MIN(I,H) back-fill: allocate remaining minutes close-backward ----
+        # Last15 takes the final minutes first
+        a_last = min(15.0, left_min)
+        # Middle takes what remains, up to its day total
+        a_mid = min(mid_total, left_min - a_last)
+        # First15 takes any residue (nonzero only inside the opening cap)
+        a_first = max(0.0, left_min - a_last - a_mid)
+        # ---- weighted-average expected shares/min over the remaining time ----
+        vf, vm, vl = self.unwind_profile
+        exp_vol = (a_first * vf + a_mid * vm + a_last * vl) / left_min
+        # a dead tape -> cannot clear passively; engage
+        if exp_vol <= 0.0:
+            return True
+        # our clearable rate at the participation cap
+        my_rate = exp_vol * self.unwind_pov
+        # minutes needed to clear the CURRENT position (live state, not max_inv)
+        mins_needed = abs(pos) / my_rate
+        # the sheet's Normal/Ramp decision
+        return mins_needed >= left_min
 
     # ---- EOD / LOCK trigger state (one call per quote cycle) ----------------
     def _trigger_state(self, bb, ba, pos):
@@ -507,7 +571,18 @@ class MicrostructureMM:
         # LOCK trigger while holding: ZONE-SPLIT kept (the 2026-08 fix) -- the lock
         # ramp is a price-proximity warning, not a liquidity budget; holding inside it
         # keeps BOTH sides quoted (base skew leans) and only the lock CLIFF pulls.
-        if (in_time_window or in_lock_cliff) and not is_flat:
+        # engagement rule for the TIME-driven unwind:
+        #   NEW (unwind_profile set): SZ's POV model -- engage only when the
+        #   CURRENT inventory cannot clear in the tradeable time left at our
+        #   participation cap. Dormant whenever inventory is comfortably small;
+        #   fires early when genuinely loaded on a thin day.
+        #   OLD (no profile): the fixed clock window (holding inside ramp/cliff).
+        if self.unwind_profile is not None and self.session_segments is not None:
+            time_unwind = (not is_flat) and self.enable_eod_trigger \
+                and self._unwind_needed(pos)
+        else:
+            time_unwind = in_time_window and not is_flat
+        if (time_unwind or in_lock_cliff) and not is_flat:
             # long: the adding side is BUY; short: the adding side is SELL
             if pos > 0:
                 act["kill_buy"] = True
@@ -523,7 +598,7 @@ class MicrostructureMM:
             self.stats["hold_exit_leaned"] += 1
             # CAUSE SPLIT: attribute to whichever cause was active; both count
             # when both are (their sum can exceed the overall -- the overlap signal)
-            if in_time_window:
+            if time_unwind:
                 self.stats["hold_add_pulled_time"] += 1
             if in_lock_cliff:
                 self.stats["hold_add_pulled_lock"] += 1
