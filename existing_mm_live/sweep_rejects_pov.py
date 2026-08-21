@@ -1,4 +1,4 @@
-# sweep_top10_pov.py -- THE EXPERIMENT: does the NEW unwind (SZ's POV model) beat
+# sweep_rejects_pov.py -- THE REJECT/BORDERLINE EXPERIMENT: does the NEW unwind (SZ's POV model) beat
 # the OLD fixed-window unwind, per clip size? The hypothesis: at 1x the new model
 # is dormant (recovers the ~4% quoting give-back); at 3-5x, inventory is real and
 # the POV unwind's early, liquidity-aware exit should WIN. The comparison is
@@ -36,9 +36,15 @@ FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
 RESULTS = Path("/Users/shazzak/Capital Stake - Results")
 
 # ------------------------------ experiment knobs ------------------------------
-# the top-10 clean winners by P&L from the universe run (2026-08-19)
-TOP10 = ["ENGROH", "LUCK", "UBL", "PSO", "PPL", "HBL", "SAZEW", "MLCF",
-         "ATRL", "SYS"]
+# the reject + borderline names: does the window-based POV unwind flip them?
+#   HARD REJECTS (loss-shrink test; probably stay negative -- their jump-day
+#   toxicity is a vol-gate problem, not an unwind problem):
+#     FNEL, PACE, AKBL, TPL, HASCOL
+#   BORDERLINE (graduation test; already profitable, dirty exits -- the unwind
+#   may clean them into the 24-name portfolio, WIDENING the tradeable universe):
+#     THCCL, TOMCL, TRG, BOP, NCPL
+TOP10 = ["FNEL", "PACE", "AKBL", "TPL", "HASCOL",
+         "THCCL", "TOMCL", "TRG", "BOP", "NCPL"]
 # clip multiples of the trailing median trade size
 MULTS = [1.0, 2.0, 3.0, 4.0, 5.0]
 # inventory limits in clips (unchanged ratios)
@@ -239,7 +245,7 @@ def main():
                       f"ETA {C._fmt(eta)}", flush=True)
 
     # ---- outputs ----
-    daily_csv = RESULTS / f"sweep_pov_daily_{stamp}.csv"
+    daily_csv = RESULTS / f"sweep_rejects_daily_{stamp}.csv"
     pd.DataFrame(rows).to_csv(daily_csv, index=False)
 
     # ---- the verdict table: NEW minus OLD per (symbol, clip) ----
@@ -262,7 +268,7 @@ def main():
                          "new_pnl": n["pnl"], "delta": d,
                          "old_unclean": o["unclean"], "new_unclean": n["unclean"]})
     S = pd.DataFrame(summ)
-    rank_csv = RESULTS / f"sweep_pov_summary_{stamp}.csv"
+    rank_csv = RESULTS / f"sweep_rejects_summary_{stamp}.csv"
     S.to_csv(rank_csv, index=False)
     # the headline: total delta per clip across the 10 names
     print("\nTOTAL new-minus-old per clip (the hypothesis test):")

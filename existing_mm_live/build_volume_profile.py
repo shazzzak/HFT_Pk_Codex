@@ -113,7 +113,7 @@ def main():
     # per-date segment rows
     seg_rows = []
     # per-name per-day bucket volumes: {sym: {"f": [], "m": [], "l": []}} in sh/min
-    prof = {s: {"f": [], "m": [], "l": []} for s in syms}
+    prof = {s: {"f": [], "m": [], "p": [], "l": []} for s in syms}
     # timer
     t0_all = time.perf_counter()
 
@@ -169,22 +169,29 @@ def main():
                          "n_segments": len(segs),
                          "tradeable_min": round(tradeable, 1),
                          "session_type": stype, "flag": flag})
-        # ---- bucket boundaries for this day ----
+        # ---- bucket boundaries for this day (4 buckets, 2026-08-20 upgrade) ----
         # First15 = first BUCKET_MIN of the FIRST segment
         f_end = segs[0][0] + BUCKET_MIN * 60000
         # Last15 = final BUCKET_MIN of the LAST segment
         l_start = segs[-1][1] - BUCKET_MIN * 60000
-        # middle tradeable minutes (never below a tiny floor to avoid div-by-zero)
-        mid_min = max(tradeable - 2 * BUCKET_MIN, 1.0)
+        # PreClose45 = minutes 60 -> 15 before the final close (the measured ramp:
+        # 1.3x/1.4x/1.8x the midday rate across those three 15-min buckets)
+        p_start = segs[-1][1] - 60 * 60000
+        # PreClose45 minutes actually available (short sessions clamp it)
+        p_min = max(min(45.0, tradeable - 2 * BUCKET_MIN), 1.0)
+        # middle tradeable minutes (what remains after the three caps)
+        mid_min = max(tradeable - 2 * BUCKET_MIN - p_min, 1.0)
         # ---- per-name bucket volumes ----
         for sym, (ts, qty) in per_sym.items():
-            # masks per bucket (Middle = inside a segment, outside the two caps)
+            # masks per bucket; precedence: First15, Last15, PreClose45, Middle
             in_f = ts <= f_end
             in_l = ts >= l_start
-            in_m = ~(in_f | in_l)
+            in_p = (ts >= p_start) & ~in_l & ~in_f
+            in_m = ~(in_f | in_l | in_p)
             # shares per minute for each bucket this day
             prof[sym]["f"].append(qty[in_f].sum() / BUCKET_MIN)
             prof[sym]["l"].append(qty[in_l].sum() / BUCKET_MIN)
+            prof[sym]["p"].append(qty[in_p].sum() / p_min)
             prof[sym]["m"].append(qty[in_m].sum() / mid_min)
         # heartbeat
         if i % 50 == 0 or i == len(dates):
@@ -207,6 +214,7 @@ def main():
         rows.append({"symbol": sym,
                      "vol_first15": round(float(np.median(p["f"])), 1),
                      "vol_middle": round(float(np.median(p["m"])), 1),
+                     "vol_preclose45": round(float(np.median(p["p"])), 1),
                      "vol_last15": round(float(np.median(p["l"])), 1),
                      "days": len(p["f"]), "note": "ok"})
     prof_df = pd.DataFrame(rows)
@@ -226,12 +234,13 @@ def main():
     # the U-shape sanity: Last15 should generally exceed Middle
     ok = prof_df[prof_df.note == "ok"]
     u = (ok["vol_last15"] > ok["vol_middle"]).mean()
-    print(f"\nU-shape check: Last15 rate > Middle rate on {100*u:.0f}% of names "
-          f"(expect high; a flat profile would make the buckets pointless)")
-    print(f"\n{'symbol':8s} {'first15':>9s} {'middle':>9s} {'last15':>9s}")
+    ramp = (ok["vol_preclose45"] > ok["vol_middle"]).mean()
+    print(f"\nU-shape check: Last15 > Middle on {100*u:.0f}% of names; "
+          f"PreClose45 > Middle on {100*ramp:.0f}% (the measured ramp)")
+    print(f"\n{'symbol':8s} {'first15':>9s} {'middle':>9s} {'preclose45':>10s} {'last15':>9s}")
     for _, r in ok.sort_values("vol_last15", ascending=False).iterrows():
         print(f"{r.symbol:8s} {r.vol_first15:>9,.0f} {r.vol_middle:>9,.0f} "
-              f"{r.vol_last15:>9,.0f}")
+              f"{r.vol_preclose45:>10,.0f} {r.vol_last15:>9,.0f}")
     print(f"\nwrote {prof_csv}\nwrote {seg_csv}")
 
 

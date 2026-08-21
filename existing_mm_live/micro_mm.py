@@ -153,6 +153,8 @@ class MicrostructureMM:
                  # time thresholds (minutes), defaults from the module-top constants
                  eod_ramp_start_min=EOD_RAMP_START_MIN, eod_cliff_min=EOD_CLIFF_MIN,
                  unwind_profile=None, unwind_pov=0.10, session_segments=None,
+                 reactive_mode="off", reactive_k=3.0, reactive_cooldown_s=60.0,
+                 reactive_lookback_s=10.0,
                  # lock thresholds in PERCENT OF PRICE (spread-free), plus the
                  # low-price tier floors in ticks (see module constants)
                  lock_ramp_pct=LOCK_RAMP_PCT,
@@ -230,6 +232,23 @@ class MicrostructureMM:
         # read by the backtester to tag fills. "none" before the first evaluation
         # and permanently when both triggers are disabled.
         self.current_window = "none"
+        # ---- REACTIVE JUMP GATE (2026-08-21) -----------------------------------
+        # PSX jumps have NO book precursor (validated), so we cannot PREDICT them.
+        # This REACTS instead: after a large move over the last reactive_lookback_s
+        # seconds, go dark for reactive_cooldown_s to avoid the compounding 2nd/3rd
+        # toxic fill. mode: "off" | "symmetric" (any big move) | "inventory"
+        # (only moves AGAINST current inventory -- preserves profitable reversion).
+        self.reactive_mode = reactive_mode
+        # trigger size in trailing-sigma multiples over the lookback window
+        self.reactive_k = reactive_k
+        # stay-dark duration once tripped (ms)
+        self.reactive_cooldown_ms = reactive_cooldown_s * 1000.0
+        # trailing window over which the move is measured (ms)
+        self.reactive_lookback_ms = reactive_lookback_s * 1000.0
+        # (ts_ms, mid) history for the lookback move; trimmed each observe
+        self._mid_hist = deque()
+        # timestamp until which we stay dark (0 = not gated)
+        self._dark_until = 0.0
         # lock thresholds (% of price) + the low-price tier tick floors
         self.lock_ramp_pct = lock_ramp_pct
         self.lock_cliff_pct = lock_cliff_pct
@@ -275,6 +294,8 @@ class MicrostructureMM:
         # every activation so "did the ramp/cliff ever engage, and how hard" is a
         # measured fact per run, not an inference from P&L.
         self.stats = {
+            # how often the reactive jump gate went dark (events)
+            "reactive_darkened": 0,
             # how often the viability gate refused to quote
             "no_quote_unviable": 0,
             # how often we produced at least one quote
@@ -328,6 +349,15 @@ class MicrostructureMM:
                     self.ema_var = self.vol_alpha * ret * ret + (1.0 - self.vol_alpha) * self.ema_var
                 self.sigma = math.sqrt(self.ema_var)
             self.last_mid = mid
+        # ---- reactive-gate mid history: keep (ts, mid) over the lookback window ----
+        # only when the gate is active, to avoid overhead in the off case
+        if self.reactive_mode != "off" and mid is not None:
+            # append the current observation
+            self._mid_hist.append((ts_exch, mid))
+            # drop points older than the lookback window
+            cutoff = ts_exch - self.reactive_lookback_ms
+            while self._mid_hist and self._mid_hist[0][0] < cutoff:
+                self._mid_hist.popleft()
 
         # Trades carry the direction signal Glosten-Milgrom conditions on.
         if kind == "T":
@@ -394,19 +424,29 @@ class MicrostructureMM:
         # nothing tradeable left -> cannot clear passively; engage if holding
         if left_min <= 0.0:
             return True
-        # bucket TOTALS for this day: 15 / (session - 30, floored at 1) / 15
+        # bucket TOTALS for this day. 4-bucket profile (2026-08-20): the measured
+        # close ramp starts ~60min out (1.3x/1.4x/1.8x midday), so a PreClose45
+        # zone (minutes 60->15) sits between Middle and Last15. A 3-tuple profile
+        # still works (PreClose45 collapses into Middle -- the old model).
         total_min = total_ms / 60000.0
-        mid_total = max(total_min - 30.0, 1.0)
+        if len(self.unwind_profile) == 4:
+            vf, vm, vp, vl = self.unwind_profile
+            p_total = max(min(45.0, total_min - 30.0), 0.0)
+        else:
+            vf, vm, vl = self.unwind_profile
+            vp, p_total = vm, 0.0
+        mid_total = max(total_min - 30.0 - p_total, 1.0)
         # ---- the MIN(I,H) back-fill: allocate remaining minutes close-backward ----
         # Last15 takes the final minutes first
         a_last = min(15.0, left_min)
+        # PreClose45 takes the next block (zero-length under a 3-tuple profile)
+        a_pre = min(p_total, left_min - a_last)
         # Middle takes what remains, up to its day total
-        a_mid = min(mid_total, left_min - a_last)
+        a_mid = min(mid_total, left_min - a_last - a_pre)
         # First15 takes any residue (nonzero only inside the opening cap)
-        a_first = max(0.0, left_min - a_last - a_mid)
+        a_first = max(0.0, left_min - a_last - a_pre - a_mid)
         # ---- weighted-average expected shares/min over the remaining time ----
-        vf, vm, vl = self.unwind_profile
-        exp_vol = (a_first * vf + a_mid * vm + a_last * vl) / left_min
+        exp_vol = (a_first * vf + a_mid * vm + a_pre * vp + a_last * vl) / left_min
         # a dead tape -> cannot clear passively; engage
         if exp_vol <= 0.0:
             return True
@@ -619,6 +659,41 @@ class MicrostructureMM:
         # No two-sided book with depth on both sides -> nothing to quote against.
         if bb is None or ba is None or bq <= 0 or aq <= 0:
             return {}
+        # ---- REACTIVE JUMP GATE: react to a large recent move by going dark ----
+        # Checked first: if we are inside an active cooldown, quote nothing at all.
+        # Then test for a fresh trigger over the lookback window. "Adverse" (for
+        # the inventory mode) = move against the current position: long + price
+        # DOWN, or short + price UP. sigma here is the per-event EMA vol scaled to
+        # the lookback horizon is complex; we use a simpler, robust test: the raw
+        # move over the window vs reactive_k * (trailing sigma * sqrt(n_moves)).
+        if self.reactive_mode != "off":
+            # still inside a cooldown -> stay dark
+            if self.now < self._dark_until:
+                self.stats["reactive_darkened"] += 1
+                return {}
+            # enough history to measure a move?
+            if len(self._mid_hist) >= 2:
+                m0 = self._mid_hist[0][1]
+                m1 = self._mid_hist[-1][1]
+                if m0 > 0:
+                    # signed move over the window (fractional return)
+                    move = (m1 - m0) / m0
+                    # trigger size: k * per-event sigma, scaled to the window by
+                    # the number of observations in it (random-walk sqrt scaling).
+                    n = max(1, len(self._mid_hist) - 1)
+                    thresh = self.reactive_k * self.sigma * math.sqrt(n)
+                    # is the move large enough?
+                    big = abs(move) >= thresh and thresh > 0
+                    # adverse to inventory? long hurt by a drop, short by a rise
+                    adverse = (pos > 0 and move < 0) or (pos < 0 and move > 0)
+                    # fire per mode
+                    fire = big and (self.reactive_mode == "symmetric"
+                                    or (self.reactive_mode == "inventory" and adverse))
+                    if fire:
+                        # open a cooldown and go dark now
+                        self._dark_until = self.now + self.reactive_cooldown_ms
+                        self.stats["reactive_darkened"] += 1
+                        return {}
         # Bid share of top-of-book depth.
         imb = bq / (bq + aq)
         # Ch 3.3 microprice: heavier bid depth pulls fair value UP toward the ask.
