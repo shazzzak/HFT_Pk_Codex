@@ -155,6 +155,8 @@ class MicrostructureMM:
                  unwind_profile=None, unwind_pov=0.10, session_segments=None,
                  reactive_mode="off", reactive_k=3.0, reactive_cooldown_s=60.0,
                  reactive_lookback_s=10.0,
+                 bucket_mult=None, open_wait_s=0.0, open_spread_mult=None,
+                 open_vol_mult=None,
                  # lock thresholds in PERCENT OF PRICE (spread-free), plus the
                  # low-price tier floors in ticks (see module constants)
                  lock_ramp_pct=LOCK_RAMP_PCT,
@@ -167,6 +169,43 @@ class MicrostructureMM:
                  spread_alpha=SPREAD_ALPHA):
         # Baseline quote size in shares (Ch 3.4: this gets cut when flow is toxic).
         self.size0 = size
+        # ---- per-bucket clip multipliers (2026-08-21 volume-sizing experiment) --
+        # scale the quote clip by which time-of-day bucket we are in. Order:
+        # (first15, middle, preclose45, last15). Default all 1.0 = no scaling
+        # (identical to the pre-experiment engine). max_inv rides at its usual
+        # ratio to the LIVE clip, so raising the clip raises the ceiling too.
+        # open_wait_ms delays the first15 multiplier taking effect (price-
+        # discovery guard); until then first15 uses the middle multiplier.
+        self.bucket_mult = (1.0, 1.0, 1.0, 1.0)
+        # seconds into the session before the first15 multiplier may apply
+        self.open_wait_ms = 0.0
+        # spread/vol gates for the open (None = disabled). first15 multiplier
+        # applies only once ALL enabled gates clear (MAX/AND logic): time elapsed
+        # AND spread<=k*median AND vol<=k*median. Conservative by construction.
+        self.open_spread_mult = None
+        self.open_vol_mult = None
+        # rolling medians for the open gates (seeded live)
+        self._spr_med = 0.0
+        self._vol_med = 0.0
+        # apply caller overrides
+        if bucket_mult is not None:
+            self.bucket_mult = tuple(bucket_mult)
+        self.open_wait_ms = open_wait_s * 1000.0
+        self.open_spread_mult = open_spread_mult
+        self.open_vol_mult = open_vol_mult
+        # per-bucket instrumentation: fills counted by the backtester via
+        # current_bucket; holding-time sampled here. buckets: f/m/p/l.
+        self._bucket_names = ("first15", "middle", "preclose45", "last15")
+        # the bucket the engine is currently quoting in (read by the backtester
+        # to tag fills, exactly like current_window)
+        self.current_bucket = "middle"
+        # inventory holding-time accumulators per bucket: we integrate |pos| over
+        # time (share-ms) and total time, so mean |inventory| per bucket = ratio;
+        # holding-time proxy = mean|inv| / mean fill rate (documented in sweep).
+        self._inv_time = {b: 0.0 for b in self._bucket_names}
+        self._pos_area = {b: 0.0 for b in self._bucket_names}
+        self._last_area_ts = None
+        self._last_area_pos = 0.0
         # Hard inventory cap in shares (a backstop; the skew is the real control).
         self.max_inv = max_inv
         # Soft inventory band in shares: once |pos| exceeds it we stop quoting the
@@ -349,6 +388,22 @@ class MicrostructureMM:
                     self.ema_var = self.vol_alpha * ret * ret + (1.0 - self.vol_alpha) * self.ema_var
                 self.sigma = math.sqrt(self.ema_var)
             self.last_mid = mid
+        # ---- open discovery-gate references: a slow EMA of spread and vol seen so
+        # far TODAY. During the open these are still forming, so the gate compares
+        # the CURRENT spread/vol to the running level -- when current has fallen
+        # back to the running EMA, discovery has settled. This is fully causal
+        # (uses only past-and-present), unlike comparing to the day's full median
+        # which would peek at the future. alpha kept slow so a spike does not
+        # immediately drag the reference up and defeat the gate.
+        if mid is not None and self.open_spread_mult is not None:
+            # spread reference (only maintained when the open-spread gate is on)
+            pass  # spread EMA is maintained in quotes() via ema_spread; reused there
+        if self.open_vol_mult is not None and self.sigma > 0:
+            # slow vol reference
+            if self._vol_med == 0.0:
+                self._vol_med = self.sigma
+            else:
+                self._vol_med = 0.02 * self.sigma + 0.98 * self._vol_med
         # ---- reactive-gate mid history: keep (ts, mid) over the lookback window ----
         # only when the gate is active, to avoid overhead in the off case
         if self.reactive_mode != "off" and mid is not None:
@@ -456,6 +511,47 @@ class MicrostructureMM:
         mins_needed = abs(pos) / my_rate
         # the sheet's Normal/Ramp decision
         return mins_needed >= left_min
+
+    # ---- which time-of-day bucket are we in, and the clip multiplier for it ----
+    # buckets defined off the session segments (same source as the unwind model):
+    #   first15 = first 15 tradeable min; last15 = final 15; preclose45 = the 45
+    #   min before last15 (i.e. 60->15 to close); middle = the rest. For the OPEN
+    #   (first15), the elevated multiplier applies only once the discovery gate is
+    #   satisfied: time elapsed AND spread settled AND vol settled (MAX/AND). Until
+    #   then the open uses the MIDDLE multiplier (no size-up into price discovery).
+    def _bucket_and_mult(self, spr):
+        # no segments -> treat everything as middle (no bucket scaling context)
+        if self.session_segments is None:
+            self.current_bucket = "middle"
+            return self.bucket_mult[1]
+        # minutes from the first segment's open, and to the last segment's close
+        seg0 = self.session_segments[0][0]
+        segN = self.session_segments[-1][1]
+        since_open_ms = self.now - seg0
+        to_close_ms = segN - self.now
+        mf, mm, mp, ml = self.bucket_mult
+        # LAST15: final 15 tradeable minutes
+        if 0 <= to_close_ms <= 15 * 60000:
+            self.current_bucket = "last15"
+            return ml
+        # PRECLOSE45: 60->15 minutes before the close
+        if 15 * 60000 < to_close_ms <= 60 * 60000:
+            self.current_bucket = "preclose45"
+            return mp
+        # FIRST15: first 15 tradeable minutes -- but gated by price discovery
+        if 0 <= since_open_ms <= 15 * 60000:
+            self.current_bucket = "first15"
+            # discovery gate: ALL enabled conditions must clear (MAX/AND)
+            time_ok = since_open_ms >= self.open_wait_ms
+            spread_ok = (self.open_spread_mult is None or self.ema_spread <= 0
+                         or spr <= self.open_spread_mult * self.ema_spread)
+            vol_ok = (self.open_vol_mult is None or self._vol_med <= 0
+                      or self.sigma <= self.open_vol_mult * self._vol_med)
+            # size up only if every gate is satisfied; else fall back to middle
+            return mf if (time_ok and spread_ok and vol_ok) else mm
+        # MIDDLE: everything else
+        self.current_bucket = "middle"
+        return mm
 
     # ---- EOD / LOCK trigger state (one call per quote cycle) ----------------
     def _trigger_state(self, bb, ba, pos):
@@ -659,6 +755,17 @@ class MicrostructureMM:
         # No two-sided book with depth on both sides -> nothing to quote against.
         if bb is None or ba is None or bq <= 0 or aq <= 0:
             return {}
+        # ---- holding-time instrumentation: integrate |pos| * dt into the bucket
+        # that was active as of the PREVIOUS cycle (the position was held through
+        # this interval in that bucket). mean|inv| per bucket = pos_area/inv_time.
+        if self._last_area_ts is not None:
+            dt = self.now - self._last_area_ts
+            if dt > 0:
+                b = self.current_bucket
+                self._pos_area[b] += abs(self._last_area_pos) * dt
+                self._inv_time[b] += dt
+        self._last_area_ts = self.now
+        self._last_area_pos = pos
         # ---- REACTIVE JUMP GATE: react to a large recent move by going dark ----
         # Checked first: if we are inside an active cooldown, quote nothing at all.
         # Then test for a fresh trigger over the lookback window. "Adverse" (for
@@ -772,6 +879,12 @@ class MicrostructureMM:
         # NOTIONAL SIZING: 50 shares is 2.8k PKR on KTML but 20k on MCB. Fix the
         # PKR-at-risk per quote instead; fall back to share count if unset.
         base_size = (self.size_notional / fair) if self.size_notional else self.size0
+        # per-bucket clip scaling (2026-08-21 experiment): scale the clip by the
+        # current time-of-day bucket's multiplier. Uses the market spread for the
+        # open discovery gate. current_bucket is set as a side effect for fill
+        # tagging. Default multipliers are 1.0 -> identical to the old engine.
+        bucket_m = self._bucket_and_mult(ba - bb)
+        base_size = base_size * bucket_m
         size = base_size * (0.5 if tox > 0.5 else 1.0)
 
         size = max(1.0, round(size))

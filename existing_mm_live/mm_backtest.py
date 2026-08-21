@@ -732,7 +732,10 @@ class Backtester:
                            # Read-only label set by the strategy each quote cycle;
                            # strategies without the attribute (naive) tag "none".
                            # Answers: "did we actually sell during the cliffs?"
-                           "window": getattr(self.strat, "current_window", "none")})
+                           "window": getattr(self.strat, "current_window", "none"),
+                           # ...and WHICH time-of-day bucket (first15/middle/
+                           # preclose45/last15) for per-bucket net_bps analysis.
+                           "bucket": getattr(self.strat, "current_bucket", "middle")})
         o.qty -= take                                 # reduce our order's remaining quantity by what just filled.
         if o.qty <= 0:                                # if the order is now fully filled...
             self.work.pop(side, None)                 # ...remove it from working orders (it's done). A partial fill leaves it in place with reduced qty.
