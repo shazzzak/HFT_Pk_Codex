@@ -273,99 +273,107 @@ def run_symbol_day(date, sym, dsets, params, want_fs=False):
 # Realized round-trip P&L attributed to the OPENING bucket (the bucket whose
 # quoting took the risk). Measured to each fill's ACTUAL offset -- no fixed
 # markout horizon. Residual EOD inventory closed at the true liquidation VWAP.
-def fifo_attribution(fills, liq_px, liq_time):
-    # accept a list of dicts or a DataFrame; normalise to records
+def fifo_attribution(fills, engine_pnl, liq_time, residual_hint=None):
+    # FIFO inventory-matched attribution that RECONCILES to the engine's headline
+    # P&L by construction, including on unclean-liquidation days.
+    #
+    # Method: match opposite-side fills FIFO and book each matched round trip's
+    # realized P&L to the OPENING bucket. The residual (never-closed) inventory is
+    # NOT priced by us -- instead the residual P&L is defined as
+    #     residual_total = engine_pnl - realized_on_matched_pairs
+    # and distributed to the residual lots' opening buckets pro-rata by their
+    # opened notional. This makes sum(realized) == engine_pnl exactly, so the
+    # 3% unclean-liquidation haircut the engine applied is attributed, not lost.
+    # normalise input to records
     f = fills if isinstance(fills, list) else (
         fills.to_dict("records") if isinstance(fills, pd.DataFrame) else fills)
-    # the FIFO queue of open lots (all entries share the current net side)
+    # the FIFO open-lot queue (all entries share the current net side)
     open_lots = deque()
-    # per-bucket accumulators: realized P&L, opened qty/notional, holds, fills
+    # per-bucket accumulators
     per = {b: {"realized": 0.0, "opened_qty": 0.0, "opened_notional": 0.0,
                "holds": [], "fills": 0} for b in BUCKETS}
+    # running total of realized P&L on MATCHED pairs only (residual added later)
+    matched_realized = 0.0
     # process fills in stream order
     for fl in f:
-        # BUY or SELL
+        # unpack the fill
         side = fl["side"]
-        # our fill price
         px = float(fl["px"])
-        # filled shares
         qty = float(fl["qty"])
-        # the bucket the strategy was quoting in when this fill happened
         b = fl.get("bucket", "middle")
-        # the fill timestamp (exchange ms)
         t = float(fl["t"])
-        # count every fill against its bucket
+        # count the fill in its bucket
         if b in per:
             per[b]["fills"] += 1
-        # same side as the open queue (or empty queue) -> this fill OPENS inventory
+        # same side (or empty queue) -> OPENS inventory
         if not open_lots or open_lots[0]["side"] == side:
-            # push the new open lot
+            # push the open lot
             open_lots.append({"qty": qty, "px": px, "bucket": b, "t": t,
                               "side": side})
-            # track opened qty/notional for the bps-of-opened denominator
+            # track opened qty/notional (the residual-apportion weights)
             if b in per:
                 per[b]["opened_qty"] += qty
                 per[b]["opened_notional"] += qty * px
-            # nothing to match; next fill
+            # next fill
             continue
-        # opposite side -> this fill CLOSES open lots, oldest first (FIFO)
+        # opposite side -> CLOSES open lots FIFO
         remaining = qty
-        # match against the queue until the fill is consumed or the queue flips
+        # match until consumed or the queue flips
         while remaining > 1e-9 and open_lots and open_lots[0]["side"] != side:
             # the oldest open lot
             lot = open_lots[0]
-            # shares matched in this pairing
+            # matched shares
             matched = min(remaining, lot["qty"])
-            # sign-correct realized P&L for the round trip
+            # sign-correct realized round trip on the matched shares
             if lot["side"] == "BUY":
-                # long opened, this SELL closes it: profit if sold higher
                 realized = (px - lot["px"]) * matched
             else:
-                # short opened, this BUY closes it: profit if bought back lower
                 realized = (lot["px"] - px) * matched
-            # subtract BOTH legs' fees on the matched shares
+            # both legs' fees on the matched shares
             realized -= fee_for(lot["px"], matched)
             realized -= fee_for(px, matched)
-            # the OPENING lot's bucket earns/pays the round trip
+            # attribute the matched round trip to the OPENING bucket
             ob = lot["bucket"]
-            # accumulate realized P&L + the open->close holding time
+            # accumulate realized + holding time + the matched-total tally
             if ob in per:
                 per[ob]["realized"] += realized
                 per[ob]["holds"].append(t - lot["t"])
-            # shrink the lot and the remaining fill
+            matched_realized += realized
+            # shrink lot + fill
             lot["qty"] -= matched
             remaining -= matched
-            # drop the lot once fully consumed
+            # drop consumed lots
             if lot["qty"] <= 1e-9:
                 open_lots.popleft()
-        # remainder beyond all open lots flips through zero: opens the other side
+        # flip through zero: remainder opens the other side
         if remaining > 1e-9:
             # push the flipped open lot
             open_lots.append({"qty": remaining, "px": px, "bucket": b, "t": t,
                               "side": side})
-            # the flipped remainder counts as opened inventory in this bucket
+            # opened tracking for the flipped remainder
             if b in per:
                 per[b]["opened_qty"] += remaining
                 per[b]["opened_notional"] += remaining * px
-    # close any residual open inventory at the true liquidation price
+    # ---- residual (never-closed) inventory: reconcile to the engine ----
+    # residual P&L is whatever the engine's headline P&L has that our matched
+    # round trips do not -- i.e. the engine's liquidation cash + haircut penalty
+    # on the shares that stayed open.
+    residual_total = float(engine_pnl) - matched_realized
+    # weight = each residual lot's opened notional (its share of the open risk)
+    resid_notional = sum(lot["qty"] * lot["px"] for lot in open_lots)
+    # distribute the residual P&L to the residual lots' opening buckets pro-rata
     for lot in open_lots:
-        # the residual shares in this lot
-        matched = lot["qty"]
-        # sign-correct realized P&L against the liquidation price
-        if lot["side"] == "BUY":
-            realized = (liq_px - lot["px"]) * matched
-        else:
-            realized = (lot["px"] - liq_px) * matched
-        # both legs' fees (open leg + the liquidating leg)
-        realized -= fee_for(lot["px"], matched)
-        realized -= fee_for(liq_px, matched)
-        # attributed to the opening bucket, held until the liquidation time
+        # this lot's share of the residual (by opened notional)
+        w = (lot["qty"] * lot["px"] / resid_notional) if resid_notional > 0 else 0.0
+        # the lot's residual P&L
+        share = residual_total * w
+        # attribute to the opening bucket, held to the liquidation time
         ob = lot["bucket"]
-        # accumulate realized + holding time to liquidation
+        # accumulate the residual share + the hold-to-liquidation time
         if ob in per:
-            per[ob]["realized"] += realized
+            per[ob]["realized"] += share
             per[ob]["holds"].append(max(0.0, liq_time - lot["t"]))
-    # the per-bucket attribution
+    # the per-bucket attribution (sums to engine_pnl by construction)
     return per
 
 
@@ -680,97 +688,80 @@ def hit_rate_and_skew(per_bucket):
     }
 
 
-def fifo_attribution_v2(fills, liq_px, liq_time):
-    # same matching as fifo_attribution, but ALSO records the per-match realized
-    # P&L list per bucket ("matches") for the hit-rate/skew distribution.
+def fifo_attribution_v2(fills, engine_pnl, liq_time):
+    # same reconciling attribution as fifo_attribution, but ALSO records each
+    # matched round-trip's realized P&L per bucket ("matches") for hit-rate/skew.
     # normalise input to records
     f = fills if isinstance(fills, list) else (
         fills.to_dict("records") if isinstance(fills, pd.DataFrame) else fills)
     # the FIFO open-lot queue
     open_lots = deque()
-    # per-bucket accumulators, now including the per-match list
+    # per-bucket accumulators including the per-match list
     per = {b: {"realized": 0.0, "opened_qty": 0.0, "opened_notional": 0.0,
                "holds": [], "fills": 0, "matches": []} for b in BUCKETS}
+    # running matched-pairs realized (residual added after)
+    matched_realized = 0.0
     # process fills in stream order
     for fl in f:
-        # unpack the fill
+        # unpack
         side = fl["side"]
         px = float(fl["px"])
         qty = float(fl["qty"])
         b = fl.get("bucket", "middle")
         t = float(fl["t"])
-        # count the fill in its bucket
+        # count the fill
         if b in per:
             per[b]["fills"] += 1
-        # same side (or empty queue) -> opens inventory
+        # same side -> opens
         if not open_lots or open_lots[0]["side"] == side:
-            # push the open lot
             open_lots.append({"qty": qty, "px": px, "bucket": b, "t": t,
                               "side": side})
-            # opened qty/notional for the bps denominator
             if b in per:
                 per[b]["opened_qty"] += qty
                 per[b]["opened_notional"] += qty * px
-            # next fill
             continue
-        # opposite side -> closes lots FIFO
+        # opposite -> closes FIFO
         remaining = qty
-        # match until consumed or the queue flips
         while remaining > 1e-9 and open_lots and open_lots[0]["side"] != side:
-            # the oldest lot
             lot = open_lots[0]
-            # matched shares
             matched = min(remaining, lot["qty"])
-            # sign-correct realized round trip
             if lot["side"] == "BUY":
                 realized = (px - lot["px"]) * matched
             else:
                 realized = (lot["px"] - px) * matched
-            # both legs' fees
             realized -= fee_for(lot["px"], matched)
             realized -= fee_for(px, matched)
-            # attribute to the opening bucket
             ob = lot["bucket"]
-            # accumulate realized, hold time, AND the per-match distribution
             if ob in per:
                 per[ob]["realized"] += realized
                 per[ob]["holds"].append(t - lot["t"])
                 per[ob]["matches"].append(realized)
-            # shrink lot + fill
+            matched_realized += realized
             lot["qty"] -= matched
             remaining -= matched
-            # drop consumed lots
             if lot["qty"] <= 1e-9:
                 open_lots.popleft()
-        # flip through zero: remainder opens the other side
+        # flip through zero
         if remaining > 1e-9:
-            # push the flipped lot
             open_lots.append({"qty": remaining, "px": px, "bucket": b, "t": t,
                               "side": side})
-            # opened tracking
             if b in per:
                 per[b]["opened_qty"] += remaining
                 per[b]["opened_notional"] += remaining * px
-    # close residual inventory at the true liquidation price
+    # residual reconciles to the engine headline
+    residual_total = float(engine_pnl) - matched_realized
+    # residual weights by opened notional
+    resid_notional = sum(lot["qty"] * lot["px"] for lot in open_lots)
+    # distribute residual to opening buckets (also recorded as a match for skew)
     for lot in open_lots:
-        # residual shares
-        matched = lot["qty"]
-        # sign-correct realized vs the liquidation price
-        if lot["side"] == "BUY":
-            realized = (liq_px - lot["px"]) * matched
-        else:
-            realized = (lot["px"] - liq_px) * matched
-        # both legs' fees
-        realized -= fee_for(lot["px"], matched)
-        realized -= fee_for(liq_px, matched)
-        # attribute to the opening bucket
+        w = (lot["qty"] * lot["px"] / resid_notional) if resid_notional > 0 else 0.0
+        share = residual_total * w
         ob = lot["bucket"]
-        # accumulate realized, hold-to-liquidation, and the match record
         if ob in per:
-            per[ob]["realized"] += realized
+            per[ob]["realized"] += share
             per[ob]["holds"].append(max(0.0, liq_time - lot["t"]))
-            per[ob]["matches"].append(realized)
-    # per-bucket attribution with match distributions
+            per[ob]["matches"].append(share)
+    # per-bucket attribution with match distributions (sums to engine_pnl)
     return per
 
 

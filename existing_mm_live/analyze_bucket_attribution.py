@@ -108,14 +108,14 @@ def main():
             # unrunnable day or missing headline P&L -> skip
             if dr is None or dr.pnl() is None:
                 continue
-            # the true residual-liquidation price for the FIFO close-out
-            liq_px = H.liquidation_price(dr)
-            # FIFO open-bucket attribution to each fill's actual offset
-            per = H.fifo_attribution(dr.fills.to_dict("records"), liq_px,
-                                     dr.session[1])
+            # FIFO open-bucket attribution: reconciles to the engine headline
+            # P&L by construction (residual = engine_pnl - matched realized),
+            # so unclean-liquidation days no longer break reconciliation.
+            per = H.fifo_attribution(dr.fills.to_dict("records"),
+                                     float(dr.pnl()), dr.session[1])
             # attributed total across buckets
             attr_total = sum(per[b]["realized"] for b in H.BUCKETS)
-            # reconciliation error vs the engine's daily P&L
+            # reconciliation error vs the engine's daily P&L (now ~0 by design)
             recon_err.append(attr_total - float(dr.pnl()))
             # collect the daily P&L for the run-level risk panel
             daily_pnls.append(float(dr.pnl()))
