@@ -157,6 +157,8 @@ class MicrostructureMM:
                  reactive_lookback_s=10.0,
                  bucket_mult=None, open_wait_s=0.0, open_spread_mult=None,
                  open_vol_mult=None,
+                 open_supp_on=False, open_supp_wait_s=0.0, open_supp_ref_med=0.0,
+                 open_supp_ref_sd=0.0, open_supp_k=2.0,
                  # lock thresholds in PERCENT OF PRICE (spread-free), plus the
                  # low-price tier floors in ticks (see module constants)
                  lock_ramp_pct=LOCK_RAMP_PCT,
@@ -193,6 +195,22 @@ class MicrostructureMM:
         self.open_wait_ms = open_wait_s * 1000.0
         self.open_spread_mult = open_spread_mult
         self.open_vol_mult = open_vol_mult
+        # ---- OPEN-SUPPRESSION GATE (2026-08-22) --------------------------------
+        # Fully suppress quoting during the open until price discovery settles, to
+        # avoid news-gap jumps being priced in through the wide opening spread.
+        # Clears when MAX/AND: (time elapsed >= open_supp_wait_ms) AND (current
+        # spread <= open_supp_ref_med + open_supp_k * open_supp_ref_sd). The
+        # reference med/sd are TRAILING per-name opening spreads (walk-forward,
+        # passed in -- never computed from the current day). off -> disabled.
+        self.open_supp_on = open_supp_on
+        self.open_supp_wait_ms = open_supp_wait_s * 1000.0
+        # trailing opening-spread reference (PKR): median and std across prior days
+        self.open_supp_ref_med = open_supp_ref_med
+        self.open_supp_ref_sd = open_supp_ref_sd
+        # how many sigma above the trailing median the spread may be to resume
+        self.open_supp_k = open_supp_k
+        # once cleared for the day, stays cleared (discovery does not un-happen)
+        self._open_cleared = False
         # per-bucket instrumentation: fills counted by the backtester via
         # current_bucket; holding-time sampled here. buckets: f/m/p/l.
         self._bucket_names = ("first15", "middle", "preclose45", "last15")
@@ -755,6 +773,32 @@ class MicrostructureMM:
         # No two-sided book with depth on both sides -> nothing to quote against.
         if bb is None or ba is None or bq <= 0 or aq <= 0:
             return {}
+        # ---- OPEN-SUPPRESSION GATE: sit out the volatile open until discovery
+        # settles (avoids overnight-news gaps being priced through the wide open
+        # spread). Only active in the FIRST 15 tradeable minutes and until cleared.
+        if self.open_supp_on and not self._open_cleared \
+                and self.session_segments is not None:
+            seg0 = self.session_segments[0][0]
+            since_open_ms = self.now - seg0
+            # only gate within the opening window; after 15 min, never suppress
+            if 0 <= since_open_ms <= 15 * 60000:
+                # MAX/AND: time must have elapsed AND spread must have settled to
+                # within k sigma of the trailing (prior-day) median opening spread
+                time_ok = since_open_ms >= self.open_supp_wait_ms
+                thr = self.open_supp_ref_med + self.open_supp_k * self.open_supp_ref_sd
+                # no valid reference -> spread condition passes (time-only gate)
+                spread_ok = (thr <= 0) or ((ba - bb) <= thr)
+                if time_ok and spread_ok:
+                    # discovery has settled -> resume for the rest of the day
+                    self._open_cleared = True
+                else:
+                    # still in the chaotic open -> quote nothing
+                    self.stats["open_suppressed"] = \
+                        self.stats.get("open_suppressed", 0) + 1
+                    return {}
+            else:
+                # past the opening window -> gate is done for the day
+                self._open_cleared = True
         # ---- holding-time instrumentation: integrate |pos| * dt into the bucket
         # that was active as of the PREVIOUS cycle (the position was held through
         # this interval in that bucket). mean|inv| per bucket = pos_area/inv_time.

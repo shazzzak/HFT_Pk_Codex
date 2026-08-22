@@ -50,6 +50,9 @@ import confirm_micro_vs_naive as C
 # raw store + results
 R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
 RESULTS = Path("/Users/shazzak/Capital Stake - Results")
+# the futures feature store (built by build_feature_store_futures.py) -- scoring
+# now routes through the ENGINE'S OWN mids here, not a local reimplementation
+FS_FUT = RESULTS / "feature_store_fut"
 PARSED = str(R.PARSED_ROOT)
 
 # ------------------------------ experiment knobs ------------------------------
@@ -157,35 +160,10 @@ def l1_mid_series(s):
     return l1[["ts", "bb", "ba", "mid"]].reset_index(drop=True)
 
 
-# ---- local net_bps scorer (futures have no feature store) --------------------
-# capture = signed (mid_at_fill - px); markout = signed (mid_+5s - mid_at_fill);
-# net = capture + markout - round-trip-fee/2 per side... consistent with the spot
-# scorer's per-fill convention: net_bps = (capture + markout)/mid*1e4 - fee_bps,
-# where fee_bps is the PER-SIDE fee in bps (each fill is one side).
-def local_net_bps(fills, mids):
-    f = fills if isinstance(fills, pd.DataFrame) else pd.DataFrame(fills)
-    if len(f) == 0 or mids is None or len(mids) < 2:
-        return 0, float("nan")
-    ts = mids["ts"].to_numpy()
-    mid = mids["mid"].to_numpy()
-    # mid at fill time (last snapshot at/before the fill)
-    i0 = np.clip(np.searchsorted(ts, f["t"].to_numpy(), side="right") - 1,
-                 0, len(mid) - 1)
-    # mid MARKOUT_S later
-    i1 = np.clip(np.searchsorted(ts, f["t"].to_numpy() + MARKOUT_S * 1000.0,
-                                 side="right") - 1, 0, len(mid) - 1)
-    m0, m1 = mid[i0], mid[i1]
-    # +1 for buys (we are long after), -1 for sells
-    sgn = np.where(f["side"].to_numpy() == "BUY", 1.0, -1.0)
-    px = f["px"].to_numpy()
-    # capture: how far inside the mid we transacted (positive = bought below mid)
-    cap = sgn * (m0 - px)
-    # markout: how the mid moved after, signed by our position direction
-    mko = sgn * (m1 - m0)
-    # per-side fee in bps
-    fee_bps = FUT_FEE_PER_SIDE * 1e4
-    net = (cap + mko) / m0 * 1e4 - fee_bps
-    return len(f), float(np.mean(net))
+# ---- scoring now uses the VALIDATED spot scorer C.score_bps against the
+# futures feature store (feature_store_fut). The local reimplementation was
+# deleted: it diverged from the engine's fills and produced the impossible
+# 'positive net_bps + negative P&L'. One price basis now -> consistent.
 
 
 def main():
@@ -315,9 +293,13 @@ def main():
             # skip dead contract-days (roll edges, expiry tails)
             if len(t) < MIN_TRADES_DAY or len(s) == 0:
                 continue
-            mids = l1_mid_series(s)
-            if mids is None:
+            # load the futures feature store for THIS active contract-day
+            fs_path = FS_FUT / sym / f"date={date}.parquet"
+            if not fs_path.exists():
                 continue
+            fs_day = pd.read_parquet(fs_path, columns=["ts_exch", "mid",
+                                     "spread_bps", "obi_1", "toxicity",
+                                     "realized_vol_bps"])
             events, snap_groups, t = R.build_events(u, s, t)
             cont = s[s["phase"] == "CONTINUOUS_AUCTION"]
             if len(cont) == 0:
@@ -339,7 +321,7 @@ def main():
                 strat = MicrostructureMM(session_ms=(t0_, t1_), **params)
                 bt = Backtester(strat, cfg)
                 fills, equity, stats = bt.run(events, snap_groups)
-                nf, net_b = local_net_bps(fills, mids)
+                nf, cap_b, mk_b, net_b = C.score_bps(fills, fs_day)
                 liq = bt.eod["equity_liquidated"] if bt.eod is not None else None
                 a = acc[(root, cl)]
                 if liq is not None:
@@ -351,7 +333,7 @@ def main():
                 if bt.eod is not None and bt.eod["liquidation_clean"] is False:
                     a["unclean"] += 1
                 # capital proxy: max_inv notional at the day's median mid
-                a["notional"].append(params["max_inv"] * float(mids["mid"].median()))
+                a["notional"].append(params["max_inv"] * float(fs_day["mid"].median()))
                 rows.append({"date": str(date), "root": root, "contract": sym,
                              "clip_lots": cl, "fills": nf,
                              "pnl_pkr": (round(float(liq), 2) if liq is not None else np.nan),
