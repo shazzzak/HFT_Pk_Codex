@@ -615,6 +615,12 @@ class Backtester:
         self.eod = None        # EOD book-walk liquidation report (filled once, at session end).
         # Last mid seen with a two-sided book -- EOD reference if the close is one-sided.
         self.last_good_mid = None
+        # ORDER LIFECYCLE LOG: oid -> {oid, side, px, qty, t_sent, t_live, t_end,
+        # end_reason}. Powers quote-uptime, quoted-spread, time-to-fill, and the
+        # per-order audit. Flushed to self.order_log (DataFrame) at end of run().
+        self._olog = {}
+        # outbound MESSAGE timestamps (order sends + cancel sends) for msgs/sec
+        self._msg_ts = []
         self.stats = {"rejected_crossing": 0, "n_orders_sent": 0, "n_cancels": 0,
                       # diagnostic counters, all start at 0:
                       "stale_cancels_ignored": 0, "requotes_blocked_by_ack": 0,
@@ -652,6 +658,10 @@ class Backtester:
                 if o is not None and o.oid == oid:  # is there an order on that side AND is it the SAME order this cancel targeted (matching oid)?
                     self.work.pop(side, None)  # yes -> remove it from our working orders (the cancel succeeded).
                     self.stats["n_cancels"] += 1  # count a successful cancel.
+                    # LIFECYCLE: the order ended by cancellation at this land-time
+                    if oid in self._olog:
+                        self._olog[oid]["t_end"] = t
+                        self._olog[oid]["end_reason"] = "cancelled"
                 else:  # no matching order: it was already filled, or already replaced by a newer order.
                     self.stats["stale_cancels_ignored"] += 1  # count a no-op cancel. This mirrors a real exchange CANCEL-REJECT (nothing there to cancel).
 
@@ -679,6 +689,9 @@ class Backtester:
         o.ahead = self.book.qty_at(o.side, o.price)  # order rests: snapshot our QUEUE POSITION -- {order_id: qty} of every order already resting at our price (all ahead of us under price-time priority).
         o.t_active = t  # record the exchange-time the order became live (used for timing/diagnostics).
         self.work[o.side] = o  # store the order as our working order on this side. It's now live and eligible to be filled by incoming flow.
+        # LIFECYCLE: the order is now live at the exchange (resting, matchable)
+        if o.oid in self._olog:
+            self._olog[o.oid]["t_live"] = t
 
     # ============ fill engine (runs BEFORE the event mutates the book) ====
     # Ordering matters: fills are judged against the book AS IT WAS when
@@ -735,10 +748,17 @@ class Backtester:
                            "window": getattr(self.strat, "current_window", "none"),
                            # ...and WHICH time-of-day bucket (first15/middle/
                            # preclose45/last15) for per-bucket net_bps analysis.
-                           "bucket": getattr(self.strat, "current_bucket", "middle")})
+                           "bucket": getattr(self.strat, "current_bucket", "middle"),
+                           # ...plus WHICH order this fill consumed (lifecycle join
+                           # key for time-to-fill / queue-wait in the harness).
+                           "oid": o.oid})
         o.qty -= take                                 # reduce our order's remaining quantity by what just filled.
         if o.qty <= 0:                                # if the order is now fully filled...
             self.work.pop(side, None)                 # ...remove it from working orders (it's done). A partial fill leaves it in place with reduced qty.
+            # LIFECYCLE: the order ended by being fully filled at this time
+            if o.oid in self._olog:
+                self._olog[o.oid]["t_end"] = t_exch
+                self._olog[o.oid]["end_reason"] = "filled"
 
     def _on_market_trade(self, r):
         """A historical trade printed. Could its aggressive flow have hit us?
@@ -939,6 +959,8 @@ class Backtester:
                     cur.cancel_at = ts_know + a_out
                     # Schedule the cancel to land, targeting this specific order (side, oid).
                     self._push(cur.cancel_at, "CANCEL", (side, cur.oid))
+                    # MESSAGE LOG: a halt-pull cancel is an outbound message too
+                    self._msg_ts.append(ts_know)
                     # In stochastic mode, mark this side unconfirmed until the ack returns.
                     if self.use_ack:
                         self.ack_until[side] = cur.cancel_at + self.lat.draw_ack()
@@ -998,6 +1020,9 @@ class Backtester:
                 cur.cancel_at = ts_know + a_out  # exchange stops matching here
                 # Schedule the cancel to land, targeting this specific order (side, oid).
                 self._push(cur.cancel_at, "CANCEL", (side, cur.oid))
+                # MESSAGE LOG: a cancel send is an outbound message (msgs/sec
+                # peaks need timestamps of every message, not just day totals)
+                self._msg_ts.append(ts_know)
                 # In stochastic mode, this side stays unconfirmed until the ack returns.
                 if self.use_ack:  # confirmed only after ack
                     self.ack_until[side] = cur.cancel_at + self.lat.draw_ack()
@@ -1011,6 +1036,15 @@ class Backtester:
                 t_land = ts_know + a_out
                 # Assign a unique id so a future cancel can target THIS specific order.
                 self._oid += 1
+                # MESSAGE LOG: an order send is an outbound message
+                self._msg_ts.append(ts_know)
+                # LIFECYCLE LOG: one record per order, keyed by oid. t_sent = the
+                # knowledge-time we decided to send; t_live set at _arrive;
+                # t_end + end_reason set at cancel-land / full fill.
+                self._olog[self._oid] = {"oid": self._oid, "side": side,
+                                         "px": w[0], "qty": w[1],
+                                         "t_sent": ts_know, "t_live": None,
+                                         "t_end": None, "end_reason": None}
                 # Schedule the new order to arrive; empty {} = queue-ahead filled at _arrive.
                 self._push(t_land, "ARRIVE",
                            MyOrder(side, w[0], w[1], {}, t_land, oid=self._oid))
@@ -1181,6 +1215,10 @@ class Backtester:
                         "unfilled_sh": unfilled,
                     }
         # Return the accounting logs as DataFrames, plus the diagnostic counters.
+        # flush the order lifecycle log to a DataFrame for the harness
+        # (rows: oid, side, px, qty, t_sent, t_live, t_end, end_reason)
+        self.order_log = pd.DataFrame(self._olog.values())
+        # unchanged return contract; order_log + _msg_ts are attributes
         return pd.DataFrame(self.fills), pd.DataFrame(self.equity), self.stats
 
 
