@@ -150,7 +150,7 @@ def trailing_median_trade_size(all_dates, names, ndays, heartbeat=50):
 class DayResult:
     # a thin container for one symbol-day's backtest outputs + derived stats
     def __init__(self, symbol, date, fills, equity, stats, eod, session,
-                 fs_day=None):
+                 fs_day=None, order_log=None):
         # the symbol this result belongs to
         self.symbol = symbol
         # the trading date
@@ -169,6 +169,11 @@ class DayResult:
         self.session = session
         # cached feature-store day for the 5s net_bps lens (optional)
         self.fs_day = fs_day
+        # per-order lifecycle log from the instrumented engine (quote uptime,
+        # time-to-fill, message rate); None when the engine wasn't instrumented
+        self.order_log = (order_log if isinstance(order_log, pd.DataFrame)
+                          else (pd.DataFrame(order_log)
+                                if order_log is not None else None))
 
     def pnl(self):
         # no EOD report -> no headline P&L for the day
@@ -263,8 +268,11 @@ def run_symbol_day(date, sym, dsets, params, want_fs=False):
             fs_day = pd.read_parquet(
                 fs_path, columns=["ts_exch", "mid", "spread_bps", "obi_1",
                                   "toxicity", "realized_vol_bps"])
-    # the packaged symbol-day result
-    return DayResult(sym, date, fills, equity, merged, bt.eod, (t0, t1), fs_day)
+    # the per-order lifecycle log if the engine was instrumented (else None)
+    olog = getattr(bt, "order_log", None)
+    # the packaged symbol-day result (with the lifecycle log stitched in)
+    return DayResult(sym, date, fills, equity, merged, bt.eod, (t0, t1),
+                     fs_day, order_log=olog)
 
 
 # ===========================================================================
