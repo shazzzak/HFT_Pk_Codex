@@ -61,6 +61,10 @@ RESULTS = Path("/Users/shazzak/Capital Stake - Results")
 # ------------------------------ experiment knobs ------------------------------
 # SMOKE: named roots, one span each, per-day ledger. Flip False for full run.
 SMOKE = True
+# ONE_MONTH: verification mode -- run only the first contract span per name so
+# the per-side buy/sell markout figures can be eyeballed before the full run.
+# Set False for the full multi-month run.
+ONE_MONTH = True
 # the top-liquidity futures names (TRG 10.5, MLCF 6.8, BOP 6.0 trades/min) --
 # the fairest test of "can the MOST liquid PSX futures support MM"
 SMOKE_ROOTS = ["TRG", "MLCF", "BOP"]
@@ -247,6 +251,10 @@ def main():
     # ---- walk each root's spans ----
     for root in live_roots:
         spans = CH.contract_spans(roll, root, run_dates)
+        # ONE_MONTH verification switch: when True, only the first span per name
+        # (fast check that the per-side figures populate before the full run)
+        if ONE_MONTH:
+            spans = spans[:1]
         # MULTI-MONTH: run ALL contract spans (every month) for these names,
         # so markout can be read per span/month (was: first span only in smoke).
         # SMOKE still controls the root list + per-day ledger verbosity.
@@ -425,13 +433,50 @@ def main():
                 lens["capture"] += cap_d
                 # accumulate markout (adverse selection to the same-day close)
                 lens["markout"] += mko_d
+                # the day's futures fee (per-side fee on the fill notional); a
+                # local so it feeds the from-fill quoting number below even when
+                # there are no fills (then it is zero)
+                day_fee = 0.0
                 # if there were fills, tally fees and feed the holding-time FIFO
                 if len(fills):
                     fdf = (fills if isinstance(fills, pd.DataFrame)
                            else pd.DataFrame(fills))
                     # fee = futures per-side fee on the day's fill notional
-                    lens["fees"] += float(
+                    day_fee = float(
                         (fdf["px"] * fdf["qty"]).sum() * FUT_FEE_PER_SIDE)
+                    # accumulate the day's fee into the lens total
+                    lens["fees"] += day_fee
+                    # ---- per-side flow split + per-side markout (to close) ----
+                    # the mid timeline (ms) and values for per-side markout
+                    ts_m = mids["ts"].to_numpy()
+                    # the mid values array
+                    mid_m = mids["mid"].to_numpy()
+                    # our BUY fills = someone hit our BID
+                    fb = fdf[fdf["side"] == "BUY"]
+                    # our SELL fills = someone lifted our ASK
+                    fs = fdf[fdf["side"] == "SELL"]
+                    # count + volume on the buy side
+                    side_stats["buy_fills"] += len(fb)
+                    side_stats["buy_vol"] += float(fb["qty"].sum()) if len(fb) else 0.0
+                    # count + volume on the sell side
+                    side_stats["sell_fills"] += len(fs)
+                    side_stats["sell_vol"] += float(fs["qty"].sum()) if len(fs) else 0.0
+                    # buy-side markout: signed +1, (F_close - mid_at_fill)*qty
+                    if len(fb):
+                        # mid index at (or just before) each buy fill
+                        ib = np.clip(np.searchsorted(ts_m, fb["t"].to_numpy(),
+                                     side="right") - 1, 0, len(mid_m) - 1)
+                        # accumulate buy-side markout (negative = toxic bid)
+                        side_stats["buy_markout"] += float(
+                            np.sum((F_close - mid_m[ib]) * fb["qty"].to_numpy()))
+                    # sell-side markout: signed -1, -(F_close - mid_at_fill)*qty
+                    if len(fs):
+                        # mid index at (or just before) each sell fill
+                        iss = np.clip(np.searchsorted(ts_m, fs["t"].to_numpy(),
+                                      side="right") - 1, 0, len(mid_m) - 1)
+                        # accumulate sell-side markout (negative = toxic ask)
+                        side_stats["sell_markout"] += float(
+                            np.sum(-(F_close - mid_m[iss]) * fs["qty"].to_numpy()))
                     # walk the day's fills in time order through the FIFO
                     for _, fl in fdf.sort_values("t").iterrows():
                         f_side, f_qty, f_t = fl["side"], float(fl["qty"]), float(fl["t"])
@@ -468,14 +513,22 @@ def main():
                 eqF_liq = float(eod.get("equity_liquidated") or eqF_mid)
                 # shares the POV unwind could NOT absorb (the residual)
                 unfilled = float(eod.get("unfilled_sh") or 0.0)
-                # drift on the carried-IN residual (intraday move)
+                # drift on any residual we walked in HOLDING (intraday move on
+                # carried-in inventory). On a clean same-day-flatten start we are
+                # FLAT, so pos_in = 0 and drift = 0; it is nonzero only after a
+                # prior day's POV could not fully flatten and left a residual.
                 drift_day = pos_in * (F_close - F_open)
-                # accumulate drift on the carried-in residual (intraday move)
+                # accumulate that carried-in drift (its own component)
                 dec["drift"] += drift_day
-                # quoting = mid-marked intraday change minus carried-in drift
-                dec["quoting"] += (eqF_mid - eqF_open) - drift_day
+                # QUOTING = the FROM-FILL edge: capture (spread earned at the
+                # fill instant) + markout (adverse move from fill to the same-day
+                # close) - the day's fee. This measures fill quality from the
+                # moment we traded, NOT an open-of-day equity difference -- so it
+                # needs no drift subtraction and means exactly "did our fills
+                # make money after adverse selection".
+                dec["quoting"] += cap_d + mko_d - day_fee
                 # flatten haircut = liquidation give-up vs mid mark (THE liquidity
-                # cost -- what it costs to exit into the thin futures book)
+                # cost -- what it costs to POV-exit into the thin futures book)
                 dec["flatten_haircut"] += eqF_liq - eqF_mid
                 # same-day-flatten bookkeeping
                 n_days += 1
@@ -654,7 +707,9 @@ def main():
     # (def: pnl_total)
     print("  pnl_total        = cash truth (futures + residual-hedge cash)")
     # (def: quoting)
-    print("  quoting          = MM edge, mid-marked, ex carried-in drift")
+    print("  quoting          = FROM-FILL edge = capture + markout - fee")
+    print("                     (spread earned at fill + adverse move to close);")
+    print("                     this IS the fill-quality number, no drift in it")
     # (def: drift)
     print("  drift            = intraday move on the carried-in RESIDUAL only")
     # (def: flatten_haircut)
