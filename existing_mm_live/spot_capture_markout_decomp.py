@@ -278,8 +278,14 @@ def _process(args):
                     per[b]["obi5_sum"] += eq_obi5[pos]
                     per[b]["obi_deep_sum"] += eq_obi_d[pos]
                     per[b]["obi_n"] += 1
-        # mid at this fill (for capture)
-        mid_at_fill = _mid_at(eq_t, eq_mid, t)
+        # mid at this fill (for capture). LIQ fills carry their own mid0 (closing
+        # mid the engine recorded); intraday fills do not -> equity-log lookup.
+        # Using mid0 for liq fills makes liquidation capture telescope exactly.
+        _fmid0 = fl.get("mid0", None)
+        if _fmid0 is not None and np.isfinite(_fmid0):
+            mid_at_fill = float(_fmid0)
+        else:
+            mid_at_fill = _mid_at(eq_t, eq_mid, t)
         # sign convention: BUY fills below the mid -> capture positive when
         # mid_at_fill > px; SELL fills above the mid -> capture positive when
         # px > mid_at_fill. So: capture = sign * (mid - px) * qty with sign +1 for BUY, -1 for SELL.
@@ -320,8 +326,9 @@ def _process(args):
             # A NEGATIVE markout means the price moved AGAINST our open position,
             # i.e. adverse selection on the opening fill. That is what "eats" capture.
             m_open = lot.get("mid_at_fill", np.nan)
-            # mid at the exit time (this fill's time)
-            m_exit = _mid_at(eq_t, eq_mid, t)
+            # exit mid: fill's own mid0 when present (liq fills), else lookup --
+            # consistent with the capture mid above so telescoping is exact.
+            m_exit = mid_at_fill
             # markout in price units on the matched shares
             if np.isfinite(m_open) and np.isfinite(m_exit):
                 # opening-leg sign (BUY=+1 wants mid up; SELL=-1 wants mid down)
@@ -344,8 +351,13 @@ def _process(args):
             else:
                 # missing mid -> zero contribution
                 mko = 0.0; mko_jump = 0.0; mko_diff = 0.0
-            # two-leg fees on the matched shares (opening + closing)
-            fee = H.fee_for(lot["px"], matched) + H.fee_for(px, matched)
+            # two-leg fees on the matched shares (opening + closing). EXCEPTION:
+            # a liq_residual close is a haircut MARK, not a traded exit -- no fee
+            # (matches the engine, which charges none on residual_mark). Charging
+            # one here would re-introduce a reconciliation residual.
+            close_is_mark = (fl.get("reason", "") == "liq_residual")
+            fee = H.fee_for(lot["px"], matched) + (
+                0.0 if close_is_mark else H.fee_for(px, matched))
             # attribute markout, jump/diff, fees, holds to the OPENING bucket
             ob = lot["bucket"]
             # book to bucket
@@ -380,71 +392,29 @@ def _process(args):
                 # capture on the remainder (scale by remainder/qty)
                 if qty > 0:
                     per[b]["capture"] += cap * (remaining / qty)
-    # ---- residual (never-closed) lots: mark to the liquidation VWAP + time ----
-    # liquidation time from the engine's EOD
-    liq_time = float(dr.session[1]) if dr.session is not None else 0.0
-    # liquidation price (VWAP) from the engine's EOD; fallback to last mid
-    liq_px = H.liquidation_price(dr) if hasattr(H, "liquidation_price") else float("nan")
-    # if the liq VWAP is nan, fall back to the last observed mid
-    if not (isinstance(liq_px, float) and np.isfinite(liq_px)) or liq_px <= 0:
-        liq_px = float(eq_mid[-1]) if len(eq_mid) else 0.0
-    # residual lots -> markout to liq using liq_px as the "exit mid"
-    for lot in open_lots:
-        # opening bucket
-        ob = lot["bucket"]
-        # opening leg sign
-        open_sign = 1.0 if lot["side"] == "BUY" else -1.0
-        # mid at open
-        m_open = lot.get("mid_at_fill", np.nan)
-        # residual markout on the unmatched qty
-        if np.isfinite(m_open):
-            mko = open_sign * (liq_px - m_open) * lot["qty"]
-            # jump component over [t_open, liq_time]
-            jm, dm_unused = _split_move(eq_t, eq_mid, lot["t"], liq_time)
-            mko_jump = open_sign * jm * lot["qty"]
-            # diffusion as the residual plug (jump + diff == markout exactly)
-            mko_diff = mko - mko_jump
-            # book
-            if ob in per:
-                per[ob]["markout"] += mko
-                per[ob]["jump_markout"] += mko_jump
-                per[ob]["diff_markout"] += mko_diff
-                # LIQUIDATION FEE: the engine's liquidation_value() charges a fee
-                # per level walked (verified: cash -= fee_fn(px, take)). That fee
-                # is real and already inside engine P&L, hence inside the liq_loss
-                # plug. Itemize it into the fee column so the fee attribution is
-                # honest (fee bps were reading ~1.04 instead of ~1.55 in last15
-                # precisely because liquidation fees were hidden in liq_loss).
-                # The reconciliation plug below subtracts this from liq_loss, so
-                # the TOTAL net is unchanged -- only the fee/liq_loss split moves.
-                per[ob]["liq_fee"] += H.fee_for(liq_px, lot["qty"])
-                per[ob]["holds"].append(max(0.0, liq_time - lot["t"]))
-            # add to the daily series
-            fill_markouts.append({"t": liq_time, "markout": mko, "bucket": ob})
-    # ---- RECONCILIATION PLUG (the fix): the mid-referenced decomposition
-    # (capture + markout - fees) does NOT equal the engine's realized cash on
-    # days with residual inventory or book-walk liquidation slippage, because
-    # capture/markout are measured vs the MID, not the true fill/liquidation
-    # cash. We close the gap with an explicit LIQUIDATION-LOSS plug, attributed
-    # to opening buckets pro-rata by opened notional -- the same residual-plug
-    # pattern fifo_attribution uses. This makes
-    #     capture + markout - fees + liq_loss == engine_pnl   (exactly)
-    # so the columns reconcile by construction, and liq_loss IS the extra cost
-    # (book-walk slippage + haircut + mid-vs-cash basis) the mid view misses.
-    # the decomposition total across all buckets (pre-plug)
+    # ---- EOD RESIDUAL: nothing to model, and NO plug. In Stage 2 the engine
+    # emits the EOD book-walk as real liq/liq_residual fills that the FIFO loop
+    # above already matched against the open lots (opposite side, own mid0). So
+    # capture + markout - fees already telescopes to engine realized cash INCL.
+    # liquidation. The old pro-rata residual reconstruction AND the liquidation-
+    # loss plug are both DELETED. liq_loss is now the honest measured residual
+    # (should be ~0); it is a diagnostic, never distributed to force a match.
+    # the decomposition total across all buckets (measured, no plug)
     dec_total = sum(per[b]["capture"] + per[b]["markout"] - per[b]["fee"]
                     for b in H.BUCKETS)
-    # the gap to the engine's headline P&L = the liquidation loss to distribute
-    liq_gap = float(dr.pnl()) - dec_total
-    # weight each bucket by its opened notional (its share of the risk taken)
+    # the honest residual: if the measurements are right this is ~0 (floating
+    # point). A large value is a REAL error to fix, NOT something to distribute.
+    recon_gap = float(dr.pnl()) - dec_total
+    # store it per bucket pro-rata purely as a DIAGNOSTIC so the anchor can show
+    # whether the measured decomposition reconciles -- this is a CHECK, not a plug
+    # (the value is reported, never added into net_pnl to force the identity).
     tot_opened = sum(per[b]["opened_notional"] for b in H.BUCKETS)
-    # distribute the plug pro-rata (equal split if no opened notional)
     for b in H.BUCKETS:
-        # this bucket's share of the plug
+        # this bucket's notional weight (equal split if nothing opened)
         w = (per[b]["opened_notional"] / tot_opened) if tot_opened > 0 \
             else (1.0 / len(H.BUCKETS))
-        # attribute the liquidation-loss plug
-        per[b]["liq_loss"] += liq_gap * w
+        # record the residual as a diagnostic (liq_loss = unexplained, ~0)
+        per[b]["liq_loss"] = recon_gap * w
     # return everything the parent needs (all picklable)
     return {"date": str(date), "symbol": sym, "clip_mult": clip_mult,
             "per": per, "fill_markouts": fill_markouts,

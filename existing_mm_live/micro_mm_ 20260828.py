@@ -183,25 +183,7 @@ class MicrostructureMM:
                  # engages (0.15 -> engages when imb <0.35 or >0.65)
                  obi_defensive_thresh=0.15,
                  # how many ticks to widen the disadvantaged side when engaged
-                 obi_defensive_ticks=1.0,
-                 # ---- OFI-DEFENSIVE (Stage 3): trailing-FLOW retreat ----
-                 # master switch: widen the side the trailing order FLOW is
-                 # running against. RETREAT-ONLY (never a fair-value lean; the
-                 # sweep proved leaning destructive). Hard-OFF in first15 (the
-                 # horserace measured zero signal there on every window).
-                 ofi_defensive=False,
-                 # min-window EVENT cap: trailing window holds at most N book
-                 # events (the horserace-winning min(N ev, T s) hybrid form)
-                 ofi_window_ev=50,
-                 # min-window TIME cap (seconds): entries older are evicted;
-                 # whichever cap holds FEWER events binds
-                 ofi_window_s=5.0,
-                 # engage threshold on the NORMALIZED trailing OFI in [-1,+1]
-                 # (window sum of signed flow / window sum of |flow|; +1 = all
-                 # buying). Bounded like OBI's imbalance -> same interpretability.
-                 ofi_defensive_thresh=0.30,
-                 # ticks to widen the threatened side when OFI-defensive fires
-                 ofi_defensive_ticks=1.0):
+                 obi_defensive_ticks=1.0):
         # Baseline quote size in shares (Ch 3.4: this gets cut when flow is toxic).
         self.size0 = size
         # Hard inventory cap in shares (a backstop; the skew is the real control).
@@ -307,25 +289,6 @@ class MicrostructureMM:
         self.obi_defensive_thresh = obi_defensive_thresh
         # ticks to widen the disadvantaged side
         self.obi_defensive_ticks = obi_defensive_ticks
-        # --- OFI-defensive (Stage 3; False = current behavior) ---
-        # master toggle
-        self.ofi_defensive = ofi_defensive
-        # min-window caps: at most N events AND at most T seconds old
-        self.ofi_window_ev = int(ofi_window_ev)
-        self.ofi_window_s = float(ofi_window_s)
-        # engage threshold on the normalized [-1,+1] trailing OFI
-        self.ofi_defensive_thresh = ofi_defensive_thresh
-        # ticks to widen the threatened side
-        self.ofi_defensive_ticks = ofi_defensive_ticks
-        # trailing (ts_ms, ofi_increment) events; evicted by the time cap on
-        # update, capped to the last N events at READ time (min-window semantics)
-        self._ofi_events = deque()
-        # previous touch (bb, bq, ba, aq) for the Cont-Kukanov L1 increment
-        self._ofi_prev_touch = None
-        # total increments seen today (event-cap warm-up: need >= N seen)
-        self._ofi_seen = 0
-        # exchange-ms of the first increment today (time-cap warm-up)
-        self._ofi_first_ts = None
         # rolling EMA of the market spread (0 until the first quote cycle seeds it);
         # updated in quotes() because that is where the live book is visible.
         self.ema_spread = 0.0
@@ -722,103 +685,6 @@ class MicrostructureMM:
         # return the per-side action set
         return act
 
-    # ---- OFI-defensive machinery (Stage 3) ----------------------------------
-    def _ofi_update(self, bb, bq, ba, aq):
-        # Cont-Kukanov L1 order-flow increment between the PREVIOUS touch state
-        # and this one. Positive = net buying pressure. quotes() sees every event
-        # inside the session, so consecutive touches here = event-level OFI (the
-        # same definition as the feature store's ofi_l1 that won the horserace).
-        if self._ofi_prev_touch is not None:
-            # unpack the previous touch
-            pbb, pbq, pba, paq = self._ofi_prev_touch
-            # bid-side flow: improve -> +new qty; same level -> qty delta;
-            # retreat -> -old qty (bids pulled/consumed)
-            if bb > pbb:
-                e_bid = bq
-            elif bb == pbb:
-                e_bid = bq - pbq
-            else:
-                e_bid = -pbq
-            # ask-side flow (mirrored): improve (down) -> +new qty; same -> delta;
-            # retreat (up) -> -old qty
-            if ba < pba:
-                e_ask = aq
-            elif ba == pba:
-                e_ask = aq - paq
-            else:
-                e_ask = -paq
-            # the signed increment: buy pressure minus sell pressure
-            e = float(e_bid - e_ask)
-            # append to the trailing window
-            self._ofi_events.append((self.now, e))
-            # warm-up counters: total seen + first timestamp
-            self._ofi_seen += 1
-            if self._ofi_first_ts is None:
-                self._ofi_first_ts = self.now
-            # evict entries older than the TIME cap (event cap applied at read)
-            cutoff = self.now - self.ofi_window_s * 1000.0
-            while self._ofi_events and self._ofi_events[0][0] < cutoff:
-                self._ofi_events.popleft()
-        # remember this touch for the next increment
-        self._ofi_prev_touch = (bb, bq, ba, aq)
-
-    def _ofi_signal(self):
-        # The NORMALIZED trailing OFI in [-1, +1], or None when not warm / not
-        # applicable. Warm-up guard (mirrors the horserace exactly): the signal
-        # is OFF until (a) >= N increments have been seen today (event cap warm),
-        # (b) >= T seconds have elapsed since the first increment (time cap warm),
-        # and (c) the current window holds >= 2 events. NaN-equivalent = None.
-        if not self.ofi_defensive:
-            return None
-        # hard-OFF in first15: the horserace measured ZERO signal there on every
-        # window (thin frenetic book: state = flow); acting on noise only hurts.
-        if self._bucket_now() == "first15":
-            return None
-        # event-cap warm-up: need to have SEEN at least N increments
-        if self._ofi_seen < self.ofi_window_ev:
-            return None
-        # time-cap warm-up: need T seconds of history since the first increment
-        if self._ofi_first_ts is None \
-                or (self.now - self._ofi_first_ts) < self.ofi_window_s * 1000.0:
-            return None
-        # the deque already holds only the last T seconds; the MIN window binds
-        # by whichever holds fewer events -> cap to the last N entries
-        ev = list(self._ofi_events)
-        if len(ev) > self.ofi_window_ev:
-            ev = ev[-self.ofi_window_ev:]
-        # need at least 2 events in the bound window
-        if len(ev) < 2:
-            return None
-        # normalized signed flow: sum(e) / sum(|e|) in [-1, +1]
-        s = sum(x for _, x in ev)
-        a = sum(abs(x) for _, x in ev)
-        # degenerate (all-zero) window -> no signal
-        if a <= 0:
-            return None
-        # the bounded, threshold-comparable signal
-        return s / a
-
-    def _bucket_now(self):
-        # canonical session bucket of self.now, keyed off the session segments
-        # (first15/middle/preclose45/last15). Falls back to t0/t1 when segments
-        # are absent.
-        if self.session_segments:
-            open_ms = self.session_segments[0][0]
-            close_ms = self.session_segments[-1][1]
-        else:
-            open_ms, close_ms = self.t0, self.t1
-        # first 15 minutes after the open
-        if self.now < open_ms + 15 * 60000:
-            return "first15"
-        # last 15 minutes before the close
-        if self.now >= close_ms - 15 * 60000:
-            return "last15"
-        # the 45 minutes before last15
-        if self.now >= close_ms - 60 * 60000:
-            return "preclose45"
-        # everything else
-        return "middle"
-
     # ---- quoting -----------------------------------------------------------
     def quotes(self, bb, bq, ba, aq, pos):
         # No two-sided book with depth on both sides -> nothing to quote against.
@@ -861,18 +727,6 @@ class MicrostructureMM:
                         return {}
         # Bid share of top-of-book depth.
         imb = bq / (bq + aq)
-        # --- OFI-defensive: fold this touch into the trailing flow window and
-        # compute the normalized signal ONCE for both sides. Runs ONLY when the
-        # master switch is on -- with it off this path never executes, so
-        # ofi_defensive=False is byte-identical to the pre-Stage-3 strategy
-        # (the before/after test asserts this).
-        if self.ofi_defensive:
-            # update the trailing Cont-Kukanov window from this touch
-            self._ofi_update(bb, bq, ba, aq)
-            # the normalized [-1,+1] signal, or None (warm-up / first15 / off)
-            ofi_sig = self._ofi_signal()
-        else:
-            ofi_sig = None
         # Ch 3.3 microprice: heavier bid depth pulls fair value UP toward the ask.
         # This is DIRECTIONAL -- the confirmed cause of the short drift (micro sells
         # into ask-heavy books, buys into bid-heavy ones). use_microprice=False
@@ -1061,14 +915,6 @@ class MicrostructureMM:
             if self.obi_defensive and (0.5 - imb) > self.obi_defensive_thresh:
                 # push the bid DOWN by the defensive ticks (less likely to fill)
                 px = px - self.obi_defensive_ticks * self.tick
-            # --- STAGE 3: OFI-defensive widen (RETREAT-ONLY, mirrors OBI) ---
-            # ofi_sig < -thresh = sustained SELLING flow -> price likely to fall
-            # -> buying here is adverse -> push the bid DOWN. Never improves a
-            # quote toward the pressure (the anti-microprice guard); the post-only
-            # clip below still governs last. None = off/warm-up/first15.
-            if ofi_sig is not None and ofi_sig < -self.ofi_defensive_thresh:
-                # widen the threatened bid by the OFI defensive ticks
-                px = px - self.ofi_defensive_ticks * self.tick
             # Post-only clip (the engine's cross guard): stay at least one tick
             # inside the ask. Applied LAST so it governs the base quote, the exit
             # skew, and the OBI widen identically -- nothing can cross the ask.
@@ -1114,13 +960,6 @@ class MicrostructureMM:
             if self.obi_defensive and (imb - 0.5) > self.obi_defensive_thresh:
                 # push the ask UP by the defensive ticks (less likely to fill)
                 px = px + self.obi_defensive_ticks * self.tick
-            # --- STAGE 3: OFI-defensive widen (RETREAT-ONLY, mirrors OBI) ---
-            # ofi_sig > +thresh = sustained BUYING flow -> price likely to rise
-            # -> selling here is adverse -> push the ask UP. Retreat only; the
-            # post-only clip below still governs last. None = off/warm-up/first15.
-            if ofi_sig is not None and ofi_sig > self.ofi_defensive_thresh:
-                # widen the threatened ask by the OFI defensive ticks
-                px = px + self.ofi_defensive_ticks * self.tick
             # Post-only clip (the engine's cross guard): stay at least one tick
             # outside the bid. Applied LAST so it governs the base quote, the exit
             # skew, and the OBI widen identically -- nothing can cross the bid.
