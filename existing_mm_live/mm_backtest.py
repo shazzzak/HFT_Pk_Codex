@@ -1132,9 +1132,15 @@ class Backtester:
                 # capture sweep) set cfg["log_equity"]=False to skip this entirely --
                 # fills are computed in steps (1)-(3) ABOVE and are unaffected.
                 if self.log_equity:
+                    # best bid/ask at this event, for realized ticks-inside-the-
+                    # touch analysis (the skew sweep needs bb/ba to measure how far
+                    # inside the touch each fill actually landed). Cheap: bbo() is a
+                    # single top-of-book read, unlike the obi() level scans below.
+                    _lbb, _, _lba, _ = self.book.bbo()
                     self.equity.append({"t": ts_exch, "mid": mid,
                                         "equity": self.cash + self.pos * mid,
                                         "pos": self.pos,
+                                        "bb": _lbb, "ba": _lba,
                                         "obi_5": self.book.obi(5),
                                         "obi_deep": self.book.obi(None)})
                 else:

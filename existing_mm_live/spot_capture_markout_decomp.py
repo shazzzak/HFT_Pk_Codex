@@ -92,6 +92,28 @@ def _init_worker(calib):
     _G.update(calib)
 
 
+# CANONICAL session-bucket for a fill timestamp (matches futures_mm_run.py:200-202
+# and build_volume_profile). Keyed off the day's SEGMENTS (break-aware), in
+# exchange-MILLISECONDS. Fills reach attribution without a populated 'bucket'
+# column -> everything defaulted to middle; this tags each fill by its own time.
+def _bucket_of(t, segs):
+    # session open (first segment start) and close (last segment end), ms
+    open_ms = segs[0][0]
+    close_ms = segs[-1][1]
+    # first 15 minutes after the open
+    if t < open_ms + 15 * 60000:
+        return "first15"
+    # last 15 minutes before the close
+    if t >= close_ms - 15 * 60000:
+        return "last15"
+    # the 45 minutes before last15 (60..15 min before close)
+    if t >= close_ms - 60 * 60000:
+        return "preclose45"
+    # everything in between
+    return "middle"
+
+
+
 # ---- helpers: mid asof and jump detection ----
 
 # mid at time t via asof over an (equity_t, equity_mid) time series (arrays)
@@ -242,8 +264,10 @@ def _process(args):
         side = fl["side"]
         px = float(fl["px"])
         qty = float(fl["qty"])
-        b = fl.get("bucket", "middle")
         t = float(fl["t"])
+        # assign the session bucket BY TIMESTAMP (fills' 'bucket' column is
+        # never populated -> was defaulting everything to middle)
+        b = _bucket_of(t, segs)
         # count the fill in its bucket
         if b in per:
             per[b]["fills"] += 1

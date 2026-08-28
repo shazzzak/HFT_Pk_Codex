@@ -71,6 +71,10 @@ OBI_DEF_TICKS = 1.0
 # jump detector (same as the decomposition)
 JUMP_K = 4.0
 # smoke: first N days (None -> full ~207)
+# smoke: first N days. DEFAULT 5 -> a ~5-minute run that prints the
+# reconciliation anchor so any bug shows up BEFORE the 3-hour full run.
+# Set to None ONLY after the smoke's reconciliation anchor reads OK for all 8
+# configs. (Hard lesson: a 3-hour run was burned on an unverified sweep.)
 SMOKE_DAYS = None
 # workers
 WORKERS = None
@@ -83,6 +87,29 @@ _G = {}
 # worker init
 def _init_worker(calib):
     _G.update(calib)
+
+
+# CANONICAL session-bucket for a fill timestamp, matching the futures runners
+# (futures_mm_run.py:200-202) and build_volume_profile EXACTLY. Keyed off the
+# day's session SEGMENTS (break-aware: correct on Friday-split / Ramadan days),
+# in exchange-MILLISECONDS. This is the assignment that was MISSING from the
+# fills pipeline -- fills reached attribution with a default 'middle', so every
+# bucket but middle was empty. Applying it here tags each fill by its own time.
+def _bucket_of(t, segs):
+    # session open (first segment start) and close (last segment end), in ms
+    open_ms = segs[0][0]
+    close_ms = segs[-1][1]
+    # first 15 minutes after the open
+    if t < open_ms + 15 * 60000:
+        return "first15"
+    # last 15 minutes before the close
+    if t >= close_ms - 15 * 60000:
+        return "last15"
+    # the 45 minutes before last15 (i.e. 60..15 min before the close)
+    if t >= close_ms - 60 * 60000:
+        return "preclose45"
+    # everything in between
+    return "middle"
 
 
 # one (date, symbol, exit_ticks, obi_defensive) cell
@@ -162,7 +189,10 @@ def _process(args):
     # walk fills
     for fl in fills:
         side = fl["side"]; px = float(fl["px"]); qty = float(fl["qty"])
-        t = float(fl["t"]); b = fl.get("bucket", "middle")
+        t = float(fl["t"])
+        # assign the session bucket BY TIMESTAMP (the fills' own 'bucket' column
+        # is never populated by the engine -> was defaulting everything to middle)
+        b = _bucket_of(t, segs)
         # count trade + shares + fill in its bucket
         if b in per:
             per[b]["fills"] += 1
@@ -188,15 +218,25 @@ def _process(args):
                     per[b]["obi5_sell_sum"] += eq_obi5[idx]
                     per[b]["obi5_sell_n"] += 1
                 per[b]["obi_n"] += 1
-            # realized ticks inside the touch: for a BUY fill, how far above bb;
-            # for a SELL fill, how far below ba. Measures the sweep's actual
-            # aggressiveness on filled orders.
-            if have_touch and np.isfinite(eq_bb[idx]) and np.isfinite(eq_ba[idx]):
+            # realized ticks inside the touch: measure against the touch just
+            # BEFORE the fill (idx-1). The fill's own equity row reflects the
+            # POST-fill book (our fill consumed/moved a level), so using idx
+            # gives a moved reference and nonsense magnitudes. idx-1 is the book
+            # our order was resting against. Clamp to [0, spread_ticks] since a
+            # post-only maker cannot be more than the spread inside the touch.
+            ref = idx - 1 if idx >= 1 else idx
+            if have_touch and np.isfinite(eq_bb[ref]) and np.isfinite(eq_ba[ref]) \
+                    and eq_ba[ref] > eq_bb[ref]:
+                # spread in ticks (the max sane ticks-inside)
+                spr_ticks = (eq_ba[ref] - eq_bb[ref]) / tick
                 if side == "BUY":
-                    ti = (px - eq_bb[idx]) / tick
+                    ti = (px - eq_bb[ref]) / tick
                 else:
-                    ti = (eq_ba[idx] - px) / tick
-                per[b]["ticks_inside"].append(ti)
+                    ti = (eq_ba[ref] - px) / tick
+                # keep only economically sensible values (0 = at touch, up to the
+                # full spread inside); drop crossed/stale-reference outliers
+                if 0.0 <= ti <= spr_ticks + 1e-9:
+                    per[b]["ticks_inside"].append(ti)
         # mid at fill for capture
         mid_at_fill = _mid_at(eq_t, eq_mid, t)
         cap_sign = 1.0 if side == "BUY" else -1.0
@@ -280,7 +320,12 @@ def _process(args):
         per[b]["liq_loss"] += liq_gap * w
     # bundle
     return {"exit_ticks": exit_ticks, "obi_def": obi_def, "per": per,
-            "daily_pnl": float(dr.pnl()), "date": str(date)}
+            "daily_pnl": float(dr.pnl()), "date": str(date),
+            # RAW engine P&L for this cell -- the reconciliation ANCHOR. The
+            # decomposed net (capture+markout-fees+liq) must equal the sum of
+            # these across cells, per config. Printed in the summary so any
+            # attribution bug shows up immediately, not after a 3-hour run.
+            "engine_pnl": float(dr.pnl())}
 
 
 def main():
@@ -325,6 +370,8 @@ def main():
            for (et, od) in configs}
     # per-config daily portfolio markout for significance
     daily_mko = {(et, od): {} for (et, od) in configs}
+    # per-config RAW engine P&L accumulator (the reconciliation anchor)
+    engine_pnl_agg = {(et, od): 0.0 for (et, od) in configs}
     # run
     done = 0
     with mp.Pool(processes=nproc, initializer=_init_worker,
@@ -355,6 +402,8 @@ def main():
             day = res["date"]
             dsum = sum(res["per"][b]["markout"] for b in H.BUCKETS)
             daily_mko[key][day] = daily_mko[key].get(day, 0.0) + dsum
+            # accumulate raw engine P&L for the reconciliation anchor
+            engine_pnl_agg[key] += res["engine_pnl"]
     # ---- reporting ----
     print("\n" + "=" * 84)
     print(f"### 2D SKEW SWEEP DONE: {H._fmt(time.perf_counter() - t0)} "
@@ -373,6 +422,23 @@ def main():
             on = sum(a[b]["opened_notional"] for b in H.BUCKETS)
             row[od] = (1e4 * net / on) if on > 0 else float("nan")
         print(f"{et:>10d} {row[False]:>16.3f} {row[True]:>16.3f}")
+    # ---- RECONCILIATION ANCHOR: decomposed net PKR vs RAW engine P&L per config.
+    # These MUST match to the rupee. If they diverge, the decomposition is buggy
+    # and NO net_bps above is trustworthy -- catch it here, not after a long run.
+    print("\n=== RECONCILIATION ANCHOR: decomposed net vs raw engine P&L ===")
+    print(f"{'exit_ticks':>10s} {'obi_def':>8s} {'decomposed_net':>16s} "
+          f"{'engine_pnl':>16s} {'gap':>12s} {'ok?':>5s}")
+    for (et, od) in configs:
+        a = agg[(et, od)]
+        dec_net = sum(a[b]["capture"] + a[b]["markout"]
+                      - (a[b]["fee"] + a[b]["liq_fee"])
+                      + (a[b]["liq_loss"] + a[b]["liq_fee"]) for b in H.BUCKETS)
+        eng = engine_pnl_agg[(et, od)]
+        gap = dec_net - eng
+        # tolerance: 1 PKR per cell-day is rounding; larger is a real divergence
+        ok = "OK" if abs(gap) < max(1.0, 1e-6 * abs(eng)) else "BAD"
+        print(f"{et:>10d} {str(od):>8s} {dec_net:>16,.0f} {eng:>16,.0f} "
+              f"{gap:>12,.2f} {ok:>5s}")
     # detailed per-config tables
     for (et, od) in configs:
         a = agg[(et, od)]
