@@ -354,6 +354,14 @@ def _process(args):
                 per[ob]["jump_markout"] += mko_jump
                 per[ob]["diff_markout"] += mko_diff
                 per[ob]["fee"] += fee
+                # THE MISSING TERM (same fix as skew_sweep_2d): the CLOSING leg's
+                # capture -- the exit fill's half-spread vs the mid at exit,
+                # pro-rated to the matched shares, booked to the opening bucket.
+                # Identity: cap_open + cap_close + markout - fees == engine
+                # realized, EXACTLY. Without it, measured_net undercounts by the
+                # exit capture (~half of gross capture).
+                if qty > 0:
+                    per[ob]["capture"] += cap * (matched / qty)
                 per[ob]["holds"].append(t - lot["t"])
             # shrink lot + fill
             lot["qty"] -= matched

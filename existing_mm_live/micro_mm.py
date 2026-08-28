@@ -780,14 +780,38 @@ class MicrostructureMM:
         # spread is too tight for profitable quoting -- during the unwind we are
         # deliberately paying edge to get flat (min_edge is waived on the exit side).
         trig = self._trigger_state(bb, ba, pos)
+        # INVENTORY-EXIT bypass: when we are holding past the exit threshold and
+        # the exit skew is active, the exit side is trying to GET FLAT -- the same
+        # "getting flat > earning edge" logic as the EOD unwind. So it may post on
+        # a tight book too, bounded by the EXACT fee floor in the skew placement
+        # (never below fee-solvency). When FLAT (skew inactive) the gate applies
+        # normally: no inventory to exit -> quotes must be fully viable.
+        holding_exit = (self.exit_ticks_inside > 0
+                        and abs(pos_lots) >= self.exit_inv_threshold)
+        # If holding_exit is bypassing the gate on a tight book, we must post ONLY
+        # the exit side -- never ADD inventory on an unviable book. Suppress the
+        # adding side (long -> BUY adds; short -> SELL adds). This mirrors the
+        # holding-rule pull, but applies mid-session too, which is exactly the
+        # case the inventory-exit bypass opens up. Only bites when the gate would
+        # otherwise have blocked (tight book); on a viable book this is harmless
+        # because the adding side quotes normally below.
+        gate_would_block = self.require_viable and (ba - bb) < 2.0 * half
+        if holding_exit and gate_would_block and not trig["lean_exit"]:
+            # long: adding side is BUY; short: adding side is SELL
+            if pos > 0:
+                trig["kill_buy"] = True
+            else:
+                trig["kill_sell"] = True
+            self.stats["hold_add_pulled"] += 1
         # Ch 7.1 VIABILITY GATE: if the market's spread is narrower than the
         # spread we require, no profitable passive quote exists -> stand aside.
         # NOTE: evaluated on the BASE half, before any trigger widening -- the
         # widening is deliberate unfillable-ness, not an economics test.
-        # UNWIND EXCEPTION: when lean_exit is active the gate is bypassed; the
-        # adding side is killed by the trigger anyway, and the exit side posts at
-        # the touch regardless of edge economics (getting flat > earning edge).
-        if self.require_viable and (ba - bb) < 2.0 * half and not trig["lean_exit"]:
+        # BYPASS when lean_exit (EOD unwind) OR holding_exit (inventory skew): both
+        # are deliberately paying edge to get flat, fee-floored in placement, and
+        # in both cases the ADDING side is suppressed so only the exit posts.
+        if self.require_viable and (ba - bb) < 2.0 * half \
+                and not trig["lean_exit"] and not holding_exit:
             self.stats["no_quote_unviable"] += 1
             return {}
 
@@ -852,24 +876,37 @@ class MicrostructureMM:
                 and (self.soft_inv is None or pos < self.soft_inv):
             # Floor onto the tick grid so rounding never makes us more aggressive.
             px = math.floor((reservation - half_buy) / self.tick) * self.tick
-            # Post-only clip: stay at least one tick inside the ask.
-            px = min(px, ba - self.tick)
             # Bounded exit lean: SHORT + inside a trigger window -> BUY is the exit;
             # place it at the most aggressive post-only price (the bound is
             # structural: post-only cannot cross, so ba - tick is the ceiling).
             if trig["lean_exit"] and pos < 0:
                 px = ba - self.tick
-            # --- SWEEP AXIS 1: inventory-exit tick skew ---
-            # BUY is the EXIT side when we are SHORT (pos < 0). When loaded beyond
-            # the threshold, post exit_ticks_inside ticks inside the touch to leave
-            # faster (post-only clip ba - tick is the most aggressive bound, so we
-            # move UP toward it by N ticks from our computed px). N=0 -> no change.
+            # --- SWEEP AXIS 1: inventory-exit tick skew (bb + N*tick, venue-agnostic) ---
+            # BUY is the EXIT side when we are SHORT (pos < 0). Improve our own bid
+            # by exit_ticks_inside TICKS above the best bid (N*self.tick scales to
+            # ANY venue's tick automatically). This sets the DESIRED price; the
+            # engine's post-only clip below then governs it exactly as it governs
+            # the base quote -- one gate, applied last. N=0 -> no change.
             if (self.exit_ticks_inside > 0 and pos < 0
                     and -pos_lots >= self.exit_inv_threshold):
-                # target = N ticks inside the touch, but never cross post-only
-                target = ba - self.tick - (self.exit_ticks_inside - 1) * self.tick
-                # only ever make the exit MORE aggressive (raise the bid), never less
-                px = max(px, min(ba - self.tick, target))
+                # improve our bid N ticks above the best bid
+                improved = bb + self.exit_ticks_inside * self.tick
+                # OPTION B fee floor: the exit skew may spend the min_edge cushion
+                # (that IS the idea -- waive edge to get flat) but must NEVER buy
+                # above the fee-covering price, or the round trip loses on fees.
+                true_mid = 0.5 * (bb + ba)
+                # EXACT fee ceiling. The exchange charges the fee on the ACTUAL
+                # fill price -- and for a limit BUY the fill price IS px (the level
+                # we post at). Capture on a BUY at px is (mid - px). Fee-covering
+                # requires capture >= fee charged on px:
+                #     mid - px >= fee_pct * px   ->   px <= mid / (1 + fee_pct)
+                # So px is its OWN fee base (the truth), not fee_pct*fair or
+                # fee_pct*mid. N-independent, venue-safe. Ceiling for a BUY:
+                fee_ceiling_buy = true_mid / (1.0 + self.fee_pct)
+                # take the improvement, but never above the fee-covering ceiling
+                improved = min(improved, fee_ceiling_buy)
+                # only ever MORE aggressive than the base quote (never less)
+                px = max(px, improved)
             # --- SWEEP AXIS 2: OBI-defensive widen ---
             # imb = bq/(bq+aq); imb < 0.5 = ask-heavy (sellers stacked) -> buying
             # here is adverse (price likely to fall). Widen our BUY (lower px) so we
@@ -878,8 +915,10 @@ class MicrostructureMM:
             if self.obi_defensive and (0.5 - imb) > self.obi_defensive_thresh:
                 # push the bid DOWN by the defensive ticks (less likely to fill)
                 px = px - self.obi_defensive_ticks * self.tick
-                # keep on the grid + post-only
-                px = min(math.floor(px / self.tick) * self.tick, ba - self.tick)
+            # Post-only clip (the engine's cross guard): stay at least one tick
+            # inside the ask. Applied LAST so it governs the base quote, the exit
+            # skew, and the OBI widen identically -- nothing can cross the ask.
+            px = min(px, ba - self.tick)
             out["BUY"] = (round(px, 2), size)
         # Offer unless: trigger-killed, short at the hard cap, or short past the
         # soft band (past -soft_inv we stop selling so only the bid remains).
@@ -887,23 +926,33 @@ class MicrostructureMM:
                 and (self.soft_inv is None or pos > -self.soft_inv):
             # Ceil onto the tick grid (again, never more aggressive).
             px = math.ceil((reservation + half_sell) / self.tick) * self.tick
-            # Post-only clip: stay at least one tick outside the bid.
-            px = max(px, bb + self.tick)
             # Bounded exit lean: LONG + inside a trigger window -> SELL is the exit;
             # most aggressive post-only placement is bb + tick.
             if trig["lean_exit"] and pos > 0:
                 px = bb + self.tick
-            # --- SWEEP AXIS 1: inventory-exit tick skew ---
-            # SELL is the EXIT side when we are LONG (pos > 0). When loaded beyond
-            # the threshold, post exit_ticks_inside ticks inside the touch (move
-            # DOWN toward bb + tick, the post-only floor) to leave faster. N=0 ->
-            # no change.
+            # --- SWEEP AXIS 1: inventory-exit tick skew (ba - N*tick, venue-agnostic) ---
+            # SELL is the EXIT side when we are LONG (pos > 0). Improve our own ask
+            # by exit_ticks_inside TICKS below the best ask (N*self.tick scales to
+            # any venue's tick). Sets the DESIRED price; the engine's post-only
+            # clip below governs it exactly as it governs the base quote. N=0 -> no change.
             if (self.exit_ticks_inside > 0 and pos > 0
                     and pos_lots >= self.exit_inv_threshold):
-                # target = N ticks inside the touch from the bid side
-                target = bb + self.tick + (self.exit_ticks_inside - 1) * self.tick
-                # only ever make the exit MORE aggressive (lower the ask), never less
-                px = min(px, max(bb + self.tick, target))
+                # improve our ask N ticks below the best ask
+                improved = ba - self.exit_ticks_inside * self.tick
+                # OPTION B raw-fee floor: the exit skew may spend the min_edge
+                # cushion but must NEVER sell below the fee-covering price. Floor
+                # for a SELL = mid + fee (selling any lower earns less than the
+                # fee). True mid, venue-safe (scales with fee_pct/fair, any N).
+                true_mid = 0.5 * (bb + ba)
+                # EXACT fee floor (mirror of BUY). Fee is charged on the fill
+                # price; capture on a SELL at px is (px - mid). Fee-covering:
+                #     px - mid >= fee_pct * px   ->   px >= mid / (1 - fee_pct)
+                # Uses the transaction price as its own fee base. Floor for a SELL:
+                fee_floor_sell = true_mid / (1.0 - self.fee_pct)
+                # take the improvement, but never below the fee-covering floor
+                improved = max(improved, fee_floor_sell)
+                # only ever MORE aggressive than the base quote (never less)
+                px = min(px, improved)
             # --- SWEEP AXIS 2: OBI-defensive widen ---
             # imb > 0.5 = bid-heavy (buyers stacked) -> selling here is adverse
             # (price likely to rise). Widen our SELL (raise px) so we stop resting
@@ -911,8 +960,10 @@ class MicrostructureMM:
             if self.obi_defensive and (imb - 0.5) > self.obi_defensive_thresh:
                 # push the ask UP by the defensive ticks (less likely to fill)
                 px = px + self.obi_defensive_ticks * self.tick
-                # keep on the grid + post-only
-                px = max(math.ceil(px / self.tick) * self.tick, bb + self.tick)
+            # Post-only clip (the engine's cross guard): stay at least one tick
+            # outside the bid. Applied LAST so it governs the base quote, the exit
+            # skew, and the OBI widen identically -- nothing can cross the bid.
+            px = max(px, bb + self.tick)
             out["SELL"] = (round(px, 2), size)
 
         # QUOTE PEGGING (burst-flow names): hold the previous desired quote until

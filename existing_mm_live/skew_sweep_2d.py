@@ -63,6 +63,19 @@ TRAIL_DAYS = 10
 EXIT_TICKS = [0, 1, 2, 3]
 # AXIS 2: OBI-defensive skew on/off
 OBI_MODES = [False, True]
+# AXIS 3: OBI IN THE QUOTES -- use_microprice on/off. When on, fair leans with
+# book imbalance (fair = ba*imb + bb*(1-imb), Ch 3.3 microprice): quotes lean
+# AWAY from the side the book is stacked against. False = production baseline
+# (plain mid). This is the "we get filled in drifts -> put OBI in the quotes"
+# experiment from the trace's through-dominance finding.
+MICRO_MODES = [False, True]
+# AXIS 4: quote-pegging hysteresis (tol_ticks). 0 = chase every ideal-price move
+# (requote constantly -- ALWAYS at the back of the queue, so benign at_queue
+# fills rarely reach us). 1/2 = hold the quote until the ideal drifts N ticks --
+# staler, but KEEPS time priority, converting through-dominance toward benign
+# at_queue fills. Tests chasing-vs-queue-priority, motivated by the trace's
+# through median 2.1s vs at_queue 4.1s asymmetry.
+TOL_MODES = [0.0, 1.0, 2.0]
 # inventory threshold (lots) beyond which the tick-exit engages
 EXIT_INV_THRESHOLD = 1.0
 # OBI-defensive engage threshold (|imb-0.5|) and widen ticks
@@ -75,7 +88,7 @@ JUMP_K = 4.0
 # reconciliation anchor so any bug shows up BEFORE the 3-hour full run.
 # Set to None ONLY after the smoke's reconciliation anchor reads OK for all 8
 # configs. (Hard lesson: a 3-hour run was burned on an unverified sweep.)
-SMOKE_DAYS = None
+SMOKE_DAYS = 5
 # workers
 WORKERS = None
 # -----------------------------------------------------------------------------
@@ -112,10 +125,10 @@ def _bucket_of(t, segs):
     return "middle"
 
 
-# one (date, symbol, exit_ticks, obi_defensive) cell
+# one (date, symbol, exit_ticks, obi_defensive, use_micro) cell
 def _process(args):
     # unpack the work tuple
-    date, sym, exit_ticks, obi_def = args
+    date, sym, exit_ticks, obi_def, use_micro, tol = args
     # calibration
     scales = _G["scales"]; profiles = _G["profiles"]; windows = _G["windows"]
     segments = _G["segments"]; all_dates = _G["all_dates"]; tstats = _G["tstats"]
@@ -143,7 +156,12 @@ def _process(args):
                    "exit_inv_threshold": EXIT_INV_THRESHOLD,
                    "obi_defensive": obi_def,
                    "obi_defensive_thresh": OBI_DEF_THRESH,
-                   "obi_defensive_ticks": OBI_DEF_TICKS})
+                   "obi_defensive_ticks": OBI_DEF_TICKS,
+                   # AXIS 3: OBI in the quotes (microprice fair). False = the
+                   # production baseline (build_micro_params sets it False).
+                   "use_microprice": use_micro,
+                   # AXIS 4: pegging hysteresis (0 = chase, N = hold until N-tick drift)
+                   "tol_ticks": tol})
     # run
     dr = H.run_symbol_day(date, sym, dsets, params)
     if dr is None or dr.pnl() is None:
@@ -170,6 +188,7 @@ def _process(args):
                "jump_markout": 0.0, "diff_markout": 0.0, "liq_loss": 0.0,
                "opened_notional": 0.0, "opened_qty": 0.0, "holds": [],
                "fills": 0, "trades": 0, "shares": 0.0,
+               "n_through": 0, "n_atq": 0,
                # raw OBI at fill (book-signed) and DIRECTION-signed OBI at fill,
                # split by buy vs sell fills (the corrected metric)
                "obi5_raw_sum": 0.0, "obi5_signed_sum": 0.0,
@@ -198,6 +217,14 @@ def _process(args):
             per[b]["fills"] += 1
             per[b]["trades"] += 1
             per[b]["shares"] += qty
+            # reason mix: through = price moved THROUGH our resting quote (stale);
+            # at_queue = queue ahead cleared to us (benign). The tol/microprice
+            # axes are adjudicated by how this mix shifts.
+            rsn = fl.get("reason", "")
+            if rsn == "through":
+                per[b]["n_through"] += 1
+            elif rsn in ("at_queue", "at_optimistic"):
+                per[b]["n_atq"] += 1
         # asof book state at the fill
         idx = _asof_idx(t)
         # OBI at fill (raw + direction-signed) and ticks-inside
@@ -218,25 +245,28 @@ def _process(args):
                     per[b]["obi5_sell_sum"] += eq_obi5[idx]
                     per[b]["obi5_sell_n"] += 1
                 per[b]["obi_n"] += 1
-            # realized ticks inside the touch: measure against the touch just
-            # BEFORE the fill (idx-1). The fill's own equity row reflects the
-            # POST-fill book (our fill consumed/moved a level), so using idx
-            # gives a moved reference and nonsense magnitudes. idx-1 is the book
-            # our order was resting against. Clamp to [0, spread_ticks] since a
-            # post-only maker cannot be more than the spread inside the touch.
+            # PLACEMENT vs MID (signed): how far our fill price sat from the mid,
+            # in ticks, signed so POSITIVE = passive (we posted inside our side of
+            # the mid and earned part of the spread) and NEGATIVE = we CROSSED the
+            # mid (a marketable/EOD-unwind fill that PAID the spread). Measuring
+            # vs the opposite touch (the old bug) turned a sell that crossed the
+            # bid into a nonsense "+26 ticks inside" -- it was really paying to
+            # cross. The mid is the neutral reference that makes the sign mean
+            # "did we earn or pay the spread on this fill".
             ref = idx - 1 if idx >= 1 else idx
             if have_touch and np.isfinite(eq_bb[ref]) and np.isfinite(eq_ba[ref]) \
                     and eq_ba[ref] > eq_bb[ref]:
-                # spread in ticks (the max sane ticks-inside)
-                spr_ticks = (eq_ba[ref] - eq_bb[ref]) / tick
+                # mid just before the fill
+                mid_ref = 0.5 * (eq_bb[ref] + eq_ba[ref])
+                # BUY: passive if we bought BELOW mid -> +(mid-px); crossing if above
+                # SELL: passive if we sold ABOVE mid -> +(px-mid); crossing if below
                 if side == "BUY":
-                    ti = (px - eq_bb[ref]) / tick
+                    ti = (mid_ref - px) / tick
                 else:
-                    ti = (eq_ba[ref] - px) / tick
-                # keep only economically sensible values (0 = at touch, up to the
-                # full spread inside); drop crossed/stale-reference outliers
-                if 0.0 <= ti <= spr_ticks + 1e-9:
-                    per[b]["ticks_inside"].append(ti)
+                    ti = (px - mid_ref) / tick
+                # record the SIGNED value (no clamp: negative crossing fills are
+                # real information -- they show the exit mechanism paying to cross)
+                per[b]["ticks_inside"].append(ti)
         # mid at fill for capture
         mid_at_fill = _mid_at(eq_t, eq_mid, t)
         cap_sign = 1.0 if side == "BUY" else -1.0
@@ -275,6 +305,18 @@ def _process(args):
                 per[ob]["diff_markout"] += mko_diff
                 per[ob]["fee"] += fee
                 per[ob]["holds"].append(t - lot["t"])
+                # THE MISSING TERM (root of the -70% unexplained): the CLOSING
+                # leg's capture -- the half-spread the exit fill earns vs the mid
+                # at exit, cap*(matched/qty) pro-rated to this match, booked to
+                # the opening bucket like the rest of the round trip. Identity:
+                #   engine realized (ps-pb)q - fees
+                #     = cap_open (m0-pb)q + cap_close (ps-m1)q
+                #       + markout (m1-m0)q - fees              [exact]
+                # Dropping cap_close ("attribute capture to the OPENING side
+                # only") silently discarded the exit half-spread -- ~half of
+                # gross capture on the baseline configs.
+                if qty > 0:
+                    per[ob]["capture"] += cap * (matched / qty)
             lot["qty"] -= matched
             remaining -= matched
             if lot["qty"] <= 1e-9:
@@ -288,43 +330,95 @@ def _process(args):
                 per[b]["opened_qty"] += remaining
                 if qty > 0:
                     per[b]["capture"] += cap * (remaining / qty)
-    # residual lots -> liquidation mark + itemized liq fee
+    # ---- RESIDUAL LOTS: use the engine's MEASURED book-walk liquidation, not a
+    # plug. The engine flattened residual inventory at EOD by walking the real
+    # book (liquidation_value): liq_vwap is the achieved volume-weighted exit
+    # price (spread paid, worse levels eaten), unfilled_sh is what the book could
+    # NOT absorb (marked at a 3% overnight haircut). We attribute each residual
+    # lot's TRUE liquidation cost = signed(liq_vwap - mid_at_fill) * qty, and the
+    # engine's own fee is inside liq_vwap's cash already, so we itemize it from
+    # the per-share slippage. NO plug: every column is measured, and we ASSERT
+    # the sum reconciles to engine P&L (a check, not a forced identity). ----
+    eod = dr.eod or {}
+    # achieved liquidation VWAP (the real exit price the book-walk got)
+    liq_vwap = eod.get("liq_vwap")
+    # closing mid (for the residual haircut reference)
+    mid_close = eod.get("mid_at_close")
+    # shares the book could not absorb (marked at haircut, held overnight)
+    unfilled_sh = float(eod.get("unfilled_sh", 0.0) or 0.0)
+    # the engine's measured haircut mark on the unfilled residual (signed cash)
+    residual_marked = float(eod.get("residual_marked", 0.0) or 0.0)
+    # liquidation time for the hold-duration bookkeeping
     liq_time = float(dr.session[1]) if dr.session is not None else 0.0
-    liq_px = H.liquidation_price(dr) if hasattr(H, "liquidation_price") else float("nan")
-    if not (isinstance(liq_px, float) and np.isfinite(liq_px)) or liq_px <= 0:
-        liq_px = float(eq_mid[-1]) if len(eq_mid) else 0.0
+    # total residual shares across all still-open lots (to split residual_marked)
+    tot_resid = sum(l["qty"] for l in open_lots) or 1.0
+    # attribute each residual lot's measured liquidation to its opening bucket
     for lot in open_lots:
         ob = lot["bucket"]
+        # opening-leg sign (+1 long, -1 short)
         open_sign = 1.0 if lot["side"] == "BUY" else -1.0
+        # mid when the lot was opened (for the markout-to-liquidation piece)
         m_open = lot.get("mid_at_fill", np.nan)
-        if np.isfinite(m_open):
-            mko = open_sign * (liq_px - m_open) * lot["qty"]
+        # this lot's share of the book-absorbed vs unfilled split
+        lot_qty = lot["qty"]
+        # the book-absorbed portion of THIS lot (pro-rata to the day's fill ratio)
+        # fraction of total residual that the book actually absorbed
+        absorbed_frac = 1.0 - (unfilled_sh / tot_resid if tot_resid > 0 else 0.0)
+        # shares of this lot flattened via the book-walk
+        absorbed_qty = lot_qty * absorbed_frac
+        # shares of this lot left unfilled (marked at haircut)
+        lot_unfilled = lot_qty - absorbed_qty
+        if np.isfinite(m_open) and liq_vwap is not None:
+            # MEASURED liquidation markout on the absorbed part: the real exit
+            # price (liq_vwap) vs the mid we opened at, signed by our side.
+            mko_liq = open_sign * (liq_vwap - m_open) * absorbed_qty
+            # the unfilled part's cost = its share of the engine's measured
+            # haircut mark, minus what holding it at m_open would imply (so the
+            # attribution equals the engine's residual_marked contribution)
+            unfilled_share = (residual_marked * (lot_unfilled / unfilled_sh)
+                              if unfilled_sh > 0 else 0.0)
+            # unfilled markout vs open mid (measured against the haircut mark)
+            mko_unfilled = (unfilled_share - open_sign * m_open * lot_unfilled)
+            # jump/diffusion split over [open, liq_time] for the absorbed part
             jm, _ = _split_move(eq_t, eq_mid, lot["t"], liq_time)
-            mko_jump = open_sign * jm * lot["qty"]
-            mko_diff = mko - mko_jump
+            mko_jump = open_sign * jm * absorbed_qty
+            # book to the opening bucket
             if ob in per:
-                per[ob]["markout"] += mko
+                # total residual markout = absorbed + unfilled, both measured
+                per[ob]["markout"] += mko_liq + mko_unfilled
                 per[ob]["jump_markout"] += mko_jump
-                per[ob]["diff_markout"] += mko_diff
+                # diffusion is (total residual markout) - jump, still exact
+                per[ob]["diff_markout"] += (mko_liq + mko_unfilled) - mko_jump
                 per[ob]["holds"].append(max(0.0, liq_time - lot["t"]))
-                # itemized liquidation fee (engine charges it; surface it)
-                per[ob]["liq_fee"] += H.fee_for(liq_px, lot["qty"])
-    # reconciliation plug: liq_loss = engine_pnl - (capture + markout - fee)
+                # MEASURED liquidation fee on the absorbed shares (the engine
+                # charged fee_for per level; liq_vwap already nets it, so we
+                # surface the same fee here for the fee column)
+                per[ob]["liq_fee"] += H.fee_for(liq_vwap, absorbed_qty)
+    # ---- RECONCILIATION CHECK (assert, do NOT force): every column above is a
+    # measured quantity. Their sum should already equal engine P&L. We compute
+    # the gap and store it as a DIAGNOSTIC (liq_loss now means "unexplained
+    # residual" -- if the measurements are right it is ~0). It is NOT distributed
+    # to make things match; a large value means a real measurement error to fix.
     dec_total = sum(per[b]["capture"] + per[b]["markout"] - per[b]["fee"]
                     for b in H.BUCKETS)
-    liq_gap = float(dr.pnl()) - dec_total
+    # the residual gap: if our measurements are correct this is ~0
+    recon_gap = float(dr.pnl()) - dec_total
+    # store the gap itself (per bucket, pro-rata) purely as a DIAGNOSTIC so the
+    # anchor can show whether the measured decomposition actually reconciles
     tot_opened = sum(per[b]["opened_notional"] for b in H.BUCKETS)
     for b in H.BUCKETS:
         w = (per[b]["opened_notional"] / tot_opened) if tot_opened > 0 \
             else (1.0 / len(H.BUCKETS))
-        per[b]["liq_loss"] += liq_gap * w
+        # liq_loss is now the UNEXPLAINED residual (diagnostic), not a plug that
+        # defines the answer -- a healthy run has this ~0
+        per[b]["liq_loss"] = recon_gap * w
     # bundle
-    return {"exit_ticks": exit_ticks, "obi_def": obi_def, "per": per,
+    return {"exit_ticks": exit_ticks, "obi_def": obi_def, "use_micro": use_micro,
+            "tol": tol, "per": per,
             "daily_pnl": float(dr.pnl()), "date": str(date),
-            # RAW engine P&L for this cell -- the reconciliation ANCHOR. The
-            # decomposed net (capture+markout-fees+liq) must equal the sum of
-            # these across cells, per config. Printed in the summary so any
-            # attribution bug shows up immediately, not after a 3-hour run.
+            # per-cell unexplained residual (should be ~0 if measurements right)
+            "recon_gap": recon_gap,
+            # RAW engine P&L for this cell -- the reconciliation ANCHOR.
             "engine_pnl": float(dr.pnl())}
 
 
@@ -346,32 +440,40 @@ def main():
     # workers
     nproc = WORKERS or mp.cpu_count()
     # the 8 configs
-    configs = [(et, od) for et in EXIT_TICKS for od in OBI_MODES]
-    # work list: every (date, symbol, exit_ticks, obi_def)
-    work = [(date, sym, et, od)
-            for date in run_dates for sym in NAMES for (et, od) in configs]
+    configs = [(et, od, um, tl) for et in EXIT_TICKS for od in OBI_MODES
+               for um in MICRO_MODES for tl in TOL_MODES]
+    # work list: every (date, symbol, exit_ticks, obi_def, use_micro)
+    work = [(date, sym, et, od, um, tl)
+            for date in run_dates for sym in NAMES for (et, od, um, tl) in configs]
     total = len(work)
-    print(f"\n2D skew sweep: {len(EXIT_TICKS)} tick-levels x {len(OBI_MODES)} "
-          f"OBI-modes = {len(configs)} configs", flush=True)
+    print(f"\n3D skew sweep: {len(EXIT_TICKS)} tick-levels x {len(OBI_MODES)} "
+          f"OBI-modes x {len(MICRO_MODES)} microprice x {len(TOL_MODES)} tol = "
+          f"{len(configs)} configs",
+          flush=True)
     print(f"  x {len(NAMES)} names x {len(run_dates)} days = {total} cells",
           flush=True)
     print(f"  workers: {nproc}\n", flush=True)
     # per-config accumulators keyed by (exit_ticks, obi_def)
-    agg = {(et, od): {b: {"capture": 0.0, "markout": 0.0, "fee": 0.0,
+    agg = {(et, od, um, tl): {b: {"capture": 0.0, "markout": 0.0, "fee": 0.0,
                           "liq_fee": 0.0, "jump_markout": 0.0,
                           "diff_markout": 0.0, "liq_loss": 0.0,
                           "opened_notional": 0.0, "opened_qty": 0.0,
                           "holds": [], "fills": 0, "trades": 0, "shares": 0.0,
+                          "n_through": 0, "n_atq": 0,
                           "obi5_raw_sum": 0.0, "obi5_signed_sum": 0.0,
                           "obi5_buy_sum": 0.0, "obi5_buy_n": 0,
                           "obi5_sell_sum": 0.0, "obi5_sell_n": 0, "obi_n": 0,
                           "ticks_inside": []}
                       for b in H.BUCKETS}
-           for (et, od) in configs}
+           for (et, od, um, tl) in configs}
     # per-config daily portfolio markout for significance
-    daily_mko = {(et, od): {} for (et, od) in configs}
+    daily_mko = {(et, od, um, tl): {} for (et, od, um, tl) in configs}
     # per-config RAW engine P&L accumulator (the reconciliation anchor)
-    engine_pnl_agg = {(et, od): 0.0 for (et, od) in configs}
+    engine_pnl_agg = {(et, od, um, tl): 0.0 for (et, od, um, tl) in configs}
+    # accumulate the unexplained residual (measured decomposition vs engine P&L);
+    # ~0 means the book-walk liquidation attribution is correct, non-zero flags
+    # a real measurement error (NOT hidden by a plug anymore)
+    recon_gap_agg = {(et, od, um, tl): 0.0 for (et, od, um, tl) in configs}
     # run
     done = 0
     with mp.Pool(processes=nproc, initializer=_init_worker,
@@ -384,14 +486,15 @@ def main():
                       f"ETA {H._fmt(el / done * (total - done))}", flush=True)
             if res is None:
                 continue
-            key = (res["exit_ticks"], res["obi_def"])
+            key = (res["exit_ticks"], res["obi_def"], res["use_micro"], res["tol"])
             for b in H.BUCKETS:
                 s = res["per"][b]; d = agg[key][b]
                 # sum scalar accumulators
                 for k in ("capture", "markout", "fee", "liq_fee",
                           "jump_markout", "diff_markout", "liq_loss",
                           "opened_notional", "opened_qty", "fills", "trades",
-                          "shares", "obi5_raw_sum", "obi5_signed_sum",
+                          "shares", "n_through", "n_atq",
+                          "obi5_raw_sum", "obi5_signed_sum",
                           "obi5_buy_sum", "obi5_buy_n", "obi5_sell_sum",
                           "obi5_sell_n", "obi_n"):
                     d[k] += s[k]
@@ -404,6 +507,8 @@ def main():
             daily_mko[key][day] = daily_mko[key].get(day, 0.0) + dsum
             # accumulate raw engine P&L for the reconciliation anchor
             engine_pnl_agg[key] += res["engine_pnl"]
+            # accumulate the unexplained residual (measured recon quality)
+            recon_gap_agg[key] += res["recon_gap"]
     # ---- reporting ----
     print("\n" + "=" * 84)
     print(f"### 2D SKEW SWEEP DONE: {H._fmt(time.perf_counter() - t0)} "
@@ -411,61 +516,91 @@ def main():
     print("=" * 84)
     # summary matrix: net-bps (portfolio) per (exit_ticks x obi_def)
     print("\n=== SUMMARY: portfolio net-bps by config (the decision matrix) ===")
-    print(f"{'exit_ticks':>10s} {'obi_off_net_bps':>16s} {'obi_on_net_bps':>16s}")
-    for et in EXIT_TICKS:
-        row = {}
-        for od in OBI_MODES:
-            a = agg[(et, od)]
-            net = sum(a[b]["capture"] + a[b]["markout"]
-                      - (a[b]["fee"] + a[b]["liq_fee"])
-                      + (a[b]["liq_loss"] + a[b]["liq_fee"]) for b in H.BUCKETS)
-            on = sum(a[b]["opened_notional"] for b in H.BUCKETS)
-            row[od] = (1e4 * net / on) if on > 0 else float("nan")
-        print(f"{et:>10d} {row[False]:>16.3f} {row[True]:>16.3f}")
-    # ---- RECONCILIATION ANCHOR: decomposed net PKR vs RAW engine P&L per config.
-    # These MUST match to the rupee. If they diverge, the decomposition is buggy
-    # and NO net_bps above is trustworthy -- catch it here, not after a long run.
-    print("\n=== RECONCILIATION ANCHOR: decomposed net vs raw engine P&L ===")
-    print(f"{'exit_ticks':>10s} {'obi_def':>8s} {'decomposed_net':>16s} "
-          f"{'engine_pnl':>16s} {'gap':>12s} {'ok?':>5s}")
-    for (et, od) in configs:
-        a = agg[(et, od)]
-        dec_net = sum(a[b]["capture"] + a[b]["markout"]
-                      - (a[b]["fee"] + a[b]["liq_fee"])
-                      + (a[b]["liq_loss"] + a[b]["liq_fee"]) for b in H.BUCKETS)
-        eng = engine_pnl_agg[(et, od)]
-        gap = dec_net - eng
-        # tolerance: 1 PKR per cell-day is rounding; larger is a real divergence
-        ok = "OK" if abs(gap) < max(1.0, 1e-6 * abs(eng)) else "BAD"
-        print(f"{et:>10d} {str(od):>8s} {dec_net:>16,.0f} {eng:>16,.0f} "
-              f"{gap:>12,.2f} {ok:>5s}")
+    print(f"{'exit_ticks':>10s} {'obi-_mp-':>12s} {'obi+_mp-':>12s} "
+          f"{'obi-_mp+':>12s} {'obi+_mp+':>12s}   (mp = microprice/OBI-in-quotes)")
+    for tl in TOL_MODES:
+        print(f"\n--- tol_ticks = {tl:.0f} "
+              f"({'chase every move' if tl == 0 else f'hold until {tl:.0f}-tick drift (keeps queue priority)'}) ---")
+        print(f"{'exit_ticks':>10s} {'obi-_mp-':>12s} {'obi+_mp-':>12s} "
+              f"{'obi-_mp+':>12s} {'obi+_mp+':>12s}")
+        for et in EXIT_TICKS:
+            row = {}
+            for od in OBI_MODES:
+                for um in MICRO_MODES:
+                    a = agg[(et, od, um, tl)]
+                    # MEASURED net: capture + markout (incl. book-walk liquidation)
+                    # minus all fees. NO plug -- see the anchor's 'unexplained'.
+                    net = sum(a[b]["capture"] + a[b]["markout"]
+                              - (a[b]["fee"] + a[b]["liq_fee"]) for b in H.BUCKETS)
+                    on = sum(a[b]["opened_notional"] for b in H.BUCKETS)
+                    row[(od, um)] = (1e4 * net / on) if on > 0 else float("nan")
+            print(f"{et:>10d} {row[(False, False)]:>12.3f} {row[(True, False)]:>12.3f} "
+                  f"{row[(False, True)]:>12.3f} {row[(True, True)]:>12.3f}")
+    # ---- RECONCILIATION ANCHOR: the MEASURED decomposition (capture + markout
+    # incl. book-walk liquidation - fees) vs raw engine P&L. NO plug is added
+    # here -- 'unexplained' is the honest residual. If the book-walk liquidation
+    # attribution is correct it is ~0; a large value is a REAL measurement error
+    # to fix, not something to hide. (liq_loss in the tables holds this same
+    # residual as a diagnostic, distributed pro-rata.)
+    print("\n=== RECONCILIATION ANCHOR: MEASURED decomposition vs engine P&L ===")
+    print(f"{'exit_ticks':>10s} {'obi_def':>8s} {'micro':>6s} {'tol':>4s} {'measured_net':>16s} "
+          f"{'engine_pnl':>16s} {'unexplained':>13s} {'pct':>7s} {'ok?':>5s}")
+    for (et, od, um, tl) in configs:
+        a = agg[(et, od, um, tl)]
+        # MEASURED net: capture + markout (incl. measured liquidation) - all fees.
+        # NOTE: liq_loss is DELIBERATELY EXCLUDED -- it is the diagnostic residual,
+        # not part of the measurement. If measurements are right, measured_net
+        # already equals engine P&L without it.
+        measured_net = sum(a[b]["capture"] + a[b]["markout"]
+                           - (a[b]["fee"] + a[b]["liq_fee"]) for b in H.BUCKETS)
+        eng = engine_pnl_agg[(et, od, um, tl)]
+        # the honest unexplained residual (should be ~0)
+        unexplained = measured_net - eng
+        pct = (100.0 * unexplained / eng) if abs(eng) > 1 else float("nan")
+        # tolerance: within 2% of engine P&L is a sound measurement
+        ok = "OK" if abs(pct) < 2.0 or abs(unexplained) < max(1.0, 0.0) \
+            else "BAD"
+        print(f"{et:>10d} {str(od):>8s} {str(um):>6s} {tl:>4.0f} {measured_net:>16,.0f} {eng:>16,.0f} "
+              f"{unexplained:>13,.0f} {pct:>6.1f}% {ok:>5s}")
     # detailed per-config tables
-    for (et, od) in configs:
-        a = agg[(et, od)]
+    for (et, od, um, tl) in configs:
+        a = agg[(et, od, um, tl)]
         print(f"\n{'=' * 84}")
-        print(f"CONFIG: exit_ticks_inside={et}   obi_defensive={od}")
+        print(f"CONFIG: exit_ticks_inside={et}   obi_defensive={od}   use_microprice={um}   tol_ticks={tl}")
         print("=" * 84)
-        # per-bucket detail
+        # per-bucket detail. NOTE: mko_bps now INCLUDES the measured book-walk
+        # liquidation markout for residual lots (real exit price, not a mark).
+        # 'unexpl_bps' is the diagnostic residual (measured decomposition vs
+        # engine P&L, pro-rata) -- should be ~0 if the book-walk attribution is
+        # right. net_bps = cap + mko - fees (MEASURED, no plug added in).
         print(f"{'bucket':11s} {'cap_bps':>8s} {'mko_bps':>8s} {'jmp_bps':>8s} "
-              f"{'dif_bps':>8s} {'fee_bps':>8s} {'liq_bps':>8s} {'net_bps':>8s} "
-              f"{'med_hld':>8s} {'mean_hld':>8s} {'med_tk_in':>9s} "
-              f"{'trades':>8s} {'sh/trd':>8s}")
+              f"{'dif_bps':>8s} {'fee_bps':>8s} {'unexpl':>8s} {'net_bps':>8s} "
+              f"{'med_hld':>8s} {'mean_hld':>8s} {'med_tks_mid':>11s} "
+              f"{'thr%':>5s} {'trades':>8s} {'sh/trd':>8s}")
         for b in H.BUCKETS:
             d = a[b]
             on = d["opened_notional"]
             def _bps(x):
                 return (1e4 * x / on) if on > 0 else float("nan")
+            # all-in measured fee (round-trip + measured liquidation fee)
             fee_all = d["fee"] + d["liq_fee"]
-            liq_net = d["liq_loss"] + d["liq_fee"]
-            net_bps = _bps(d["capture"] + d["markout"] - fee_all + liq_net)
+            # MEASURED net: no plug. If book-walk attribution is right, the
+            # unexplained residual (liq_loss) is ~0 and this ~= the bucket's true P&L.
+            net_bps = _bps(d["capture"] + d["markout"] - fee_all)
+            # the diagnostic residual (should be ~0)
+            unexpl_bps = _bps(d["liq_loss"])
             hs = np.array(d["holds"]) / 1000.0 if d["holds"] else np.array([0.0])
             tks = np.array(d["ticks_inside"]) if d["ticks_inside"] else np.array([0.0])
             sh_per = (d["shares"] / d["trades"]) if d["trades"] > 0 else 0.0
+            # through share: fraction of classified fills where price moved
+            # THROUGH the resting quote (the staleness signature)
+            n_cls = d["n_through"] + d["n_atq"]
+            thr_pct = (100.0 * d["n_through"] / n_cls) if n_cls > 0 else float("nan")
             print(f"{b:11s} {_bps(d['capture']):>8.3f} {_bps(d['markout']):>8.3f} "
                   f"{_bps(d['jump_markout']):>8.3f} {_bps(d['diff_markout']):>8.3f} "
-                  f"{_bps(-fee_all):>8.3f} {_bps(liq_net):>8.3f} {net_bps:>8.3f} "
-                  f"{np.median(hs):>8.1f} {hs.mean():>8.1f} {np.median(tks):>9.2f} "
-                  f"{d['trades']:>8,d} {sh_per:>8.0f}")
+                  f"{_bps(-fee_all):>8.3f} {unexpl_bps:>8.3f} {net_bps:>8.3f} "
+                  f"{np.median(hs):>8.1f} {hs.mean():>8.1f} {np.median(tks):>11.2f} "
+                  f"{thr_pct:>5.0f} {d['trades']:>8,d} {sh_per:>8.0f}")
         # OBI-at-fill: raw vs direction-signed, split by buy/sell
         print(f"\n{'bucket':11s} {'raw_obi5':>10s} {'signed_obi5':>12s} "
               f"{'buy_obi5':>10s} {'sell_obi5':>10s}  (signed<0 = book against us)")
@@ -478,7 +613,7 @@ def main():
             sell = (d["obi5_sell_sum"] / d["obi5_sell_n"]) if d["obi5_sell_n"] > 0 else float("nan")
             print(f"{b:11s} {raw:>10.4f} {signed:>12.4f} {buy:>10.4f} {sell:>10.4f}")
         # daily markout significance (day as unit)
-        dm = pd.Series(daily_mko[(et, od)]).sort_index().to_numpy()
+        dm = pd.Series(daily_mko[(et, od, um, tl)]).sort_index().to_numpy()
         if len(dm) >= 20:
             t_stat, t_p = stats.ttest_1samp(dm, 0.0, nan_policy="omit")
             dm_nz = dm[dm != 0]
@@ -491,14 +626,15 @@ def main():
                   f"Wilcoxon p={w_p:.3g}")
     # save the summary matrix
     rows = []
-    for (et, od) in configs:
-        a = agg[(et, od)]
+    for (et, od, um, tl) in configs:
+        a = agg[(et, od, um, tl)]
+        # MEASURED net, consistent with the summary matrix (no plug)
         net = sum(a[b]["capture"] + a[b]["markout"]
-                  - (a[b]["fee"] + a[b]["liq_fee"])
-                  + (a[b]["liq_loss"] + a[b]["liq_fee"]) for b in H.BUCKETS)
+                  - (a[b]["fee"] + a[b]["liq_fee"]) for b in H.BUCKETS)
         on = sum(a[b]["opened_notional"] for b in H.BUCKETS)
         allhold = [h for b in H.BUCKETS for h in a[b]["holds"]]
-        rows.append({"exit_ticks": et, "obi_defensive": od,
+        rows.append({"exit_ticks": et, "obi_defensive": od, "use_microprice": um,
+                     "tol_ticks": tl,
                      "net_bps": (1e4 * net / on) if on > 0 else np.nan,
                      "median_hold_s": (np.median(allhold) / 1000.0
                                        if allhold else np.nan),

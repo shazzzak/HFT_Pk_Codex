@@ -361,12 +361,9 @@ class Book:
         successively worse levels. Includes __H_ hidden lumps; EXCLUDES the __AGG_
         deep residual (its price is a synthetic placeholder, not a tradable level).
         """
-        # Nothing to liquidate -> zero cash, zero unfilled, no vwap, no fills.
-        # (4th return is ADDITIVE: per-level liquidation fills for attribution.
-        # Existing callers unpacking 3 values are unaffected -- see back-compat
-        # test. Each entry is (price, qty) for one book level the walk consumed.)
+        # Nothing to liquidate -> zero cash, zero unfilled, no vwap.
         if pos == 0:
-            return 0.0, 0.0, None, []
+            return 0.0, 0.0, None
         # We hit the OPPOSITE side of the book: long sells into resting BUYs (bids),
         # short buys back from resting SELLs (asks).
         side_wanted = "BUY" if pos > 0 else "SELL"
@@ -394,9 +391,6 @@ class Book:
         filled = 0.0
         # Sum of price*qty actually filled (for the vwap).
         notional = 0.0
-        # ADDITIVE: per-level liquidation fills, (price, qty) each. This is the
-        # itemization of the same walk -- it does NOT change cash/filled/vwap.
-        liq_fills = []
         # Walk the levels best-first, consuming each until we are flat or the book runs out.
         for px, avail in ordered:
             # Fully flattened -> stop walking.
@@ -412,16 +406,12 @@ class Book:
             # Track fill totals for the vwap.
             notional += take * px
             filled += take
-            # ADDITIVE: record this level as a liquidation fill (price, qty).
-            # Same px/take the cash line above used -- pure itemization.
-            liq_fills.append((px, take))
             # Reduce what is left to flatten.
             remaining -= take
         # Volume-weighted average execution price, or None if the book had nothing.
         vwap = (notional / filled) if filled > 0 else None
         # remaining > 0 means the visible book could not absorb the full position.
-        # 4th value (liq_fills) is ADDITIVE -- the per-level itemization.
-        return cash, remaining, vwap, liq_fills
+        return cash, remaining, vwap
 
     def pinned(self):
         """Best bid at/above upper limit (limit-up) or best ask at/below lower
@@ -1190,13 +1180,8 @@ class Backtester:
                     # Void all in-flight messages: nothing of ours may land, fill,
                     # or change position after this report (makes eod final).
                     self.pending.clear()
-                    # position we are about to flatten (sign fixes the liq side)
-                    pos_at_liq = self.pos
-                    # Walk the book to flatten the position, fees included. The 4th
-                    # return (liq_level_fills) is the per-level itemization of THIS
-                    # walk -- same cash, now attributable fill-by-fill.
-                    liq_cash, unfilled, vwap, liq_level_fills = \
-                        self.book.liquidation_value(self.pos, fee_fn=fee_for)
+                    # Walk the book to flatten the position, fees included.
+                    liq_cash, unfilled, vwap = self.book.liquidation_value(self.pos, fee_fn=fee_for)
                     # Read the closing touch for the comparison mid-mark.
                     bb_e, _, ba_e, _ = self.book.bbo()
                     # Mid only exists if both sides are present.
@@ -1235,78 +1220,6 @@ class Backtester:
                         # Size the visible book could not absorb -- genuinely unpriceable.
                         "unfilled_sh": unfilled,
                     }
-                    # ---- EMIT LIQUIDATION FILLS (Stage 1) --------------------
-                    # The EOD walk flattened the position; book each consumed
-                    # level as a real fill so the FIFO decomposition matches it
-                    # against the open lots exactly (no modelled reconstruction,
-                    # no plug). The liquidating side is OPPOSITE our position:
-                    # long (pos>0) -> we SELL into bids; short -> we BUY asks.
-                    if pos_at_liq != 0:
-                        # side that flattens the position
-                        liq_side = "SELL" if pos_at_liq > 0 else "BUY"
-                        # timestamp for every liquidation fill = the crossing event
-                        liq_ts = int(ts_exch)
-                        # closing mid recorded on each liq fill (mid0 analogue);
-                        # None-safe -- falls back to last good mid.
-                        liq_mid = mid_e if mid_e is not None else self.last_good_mid
-                        # each book level the walk consumed -> one fill at its px
-                        for _lpx, _lqty in liq_level_fills:
-                            # append with the SAME schema as _fill's rows, tagged
-                            # reason="liq" so downstream can identify EOD exits
-                            self.fills.append({
-                                # crossing-event exchange time
-                                "t": liq_ts,
-                                # the flattening side
-                                "side": liq_side,
-                                # the actual level price the walk paid/received
-                                "px": float(_lpx),
-                                # shares taken at this level
-                                "qty": float(_lqty),
-                                # provenance: end-of-day book-walk liquidation
-                                "reason": "liq",
-                                # no trigger window applies to the EOD flatten
-                                "window": "eod",
-                                # last15 by construction (crossing session end)
-                                "bucket": getattr(self.strat, "current_bucket", "last15"),
-                                # closing mid, carried for the decomposition's capture
-                                "mid0": (float(liq_mid) if liq_mid is not None else np.nan),
-                                # liquidation fills have no working-order id
-                                "oid": None})
-                        # residual the book could NOT absorb: one fill at the
-                        # haircut mark price, so equity_liquidated reconciles to
-                        # the sum of ALL liq fills exactly. residual_mark is the
-                        # signed CASH of the mark; recover a per-share price so
-                        # the fill's px*qty*sign matches that cash.
-                        if unfilled > 0 and ref is not None:
-                            # sign of the flattening trade (opposite of position)
-                            _rsgn = -1.0 if pos_at_liq > 0 else 1.0
-                            # per-share haircut price implied by residual_mark:
-                            # residual_mark = pos_sgn * unfilled * ref*(1-pos_sgn*hc)
-                            # so the per-share mark price is ref*(1 - pos_sgn*hc).
-                            _pos_sgn = 1.0 if pos_at_liq > 0 else -1.0
-                            _hc = self.cfg.get("unfilled_haircut_pct", 0.03)
-                            # the haircut per-share price (what we "exit" residual at)
-                            _rpx = ref * (1.0 - _pos_sgn * _hc)
-                            # append the residual as its own tagged fill
-                            self.fills.append({
-                                # same EOD timestamp
-                                "t": liq_ts,
-                                # same flattening side as the rest of the walk
-                                "side": liq_side,
-                                # the haircut mark price
-                                "px": float(_rpx),
-                                # the unfilled shares
-                                "qty": float(unfilled),
-                                # provenance: haircut-marked overnight residual
-                                "reason": "liq_residual",
-                                # no trigger window
-                                "window": "eod",
-                                # last15 bucket
-                                "bucket": getattr(self.strat, "current_bucket", "last15"),
-                                # closing mid reference
-                                "mid0": (float(liq_mid) if liq_mid is not None else np.nan),
-                                # no order id
-                                "oid": None})
         # Return the accounting logs as DataFrames, plus the diagnostic counters.
         # flush the order lifecycle log to a DataFrame for the harness
         # (rows: oid, side, px, qty, t_sent, t_live, t_end, end_reason)
