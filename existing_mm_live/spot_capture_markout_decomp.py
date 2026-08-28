@@ -225,6 +225,7 @@ def _process(args):
     # per-bucket decomposition accumulators
     per = {b: {"capture": 0.0, "markout": 0.0, "fee": 0.0,
                "jump_markout": 0.0, "diff_markout": 0.0, "liq_loss": 0.0,
+               "liq_fee": 0.0,
                "opened_notional": 0.0, "opened_qty": 0.0, "holds": [], "fills": 0,
                "obi5_sum": 0.0, "obi_deep_sum": 0.0, "obi_n": 0}
            for b in H.BUCKETS}
@@ -376,6 +377,15 @@ def _process(args):
                 per[ob]["markout"] += mko
                 per[ob]["jump_markout"] += mko_jump
                 per[ob]["diff_markout"] += mko_diff
+                # LIQUIDATION FEE: the engine's liquidation_value() charges a fee
+                # per level walked (verified: cash -= fee_fn(px, take)). That fee
+                # is real and already inside engine P&L, hence inside the liq_loss
+                # plug. Itemize it into the fee column so the fee attribution is
+                # honest (fee bps were reading ~1.04 instead of ~1.55 in last15
+                # precisely because liquidation fees were hidden in liq_loss).
+                # The reconciliation plug below subtracts this from liq_loss, so
+                # the TOTAL net is unchanged -- only the fee/liq_loss split moves.
+                per[ob]["liq_fee"] += H.fee_for(liq_px, lot["qty"])
                 per[ob]["holds"].append(max(0.0, liq_time - lot["t"]))
             # add to the daily series
             fill_markouts.append({"t": liq_time, "markout": mko, "bucket": ob})
@@ -449,7 +459,7 @@ def main():
     # accumulators per clip_mult
     clip_agg = {cm: {b: {"capture": 0.0, "markout": 0.0, "fee": 0.0,
                          "jump_markout": 0.0, "diff_markout": 0.0,
-                         "liq_loss": 0.0, "opened_notional": 0.0,
+                         "liq_loss": 0.0, "liq_fee": 0.0, "opened_notional": 0.0,
                          "opened_qty": 0.0, "holds": [], "fills": 0,
                          "obi5_sum": 0.0, "obi_deep_sum": 0.0, "obi_n": 0}
                      for b in H.BUCKETS} for cm in CLIP_MULTS}
@@ -486,6 +496,7 @@ def main():
                 dst["opened_notional"] += src["opened_notional"]
                 dst["opened_qty"] += src["opened_qty"]
                 dst["liq_loss"] += src["liq_loss"]
+                dst["liq_fee"] += src["liq_fee"]
                 dst["holds"].extend(src["holds"])
                 dst["fills"] += src["fills"]
                 dst["obi5_sum"] += src["obi5_sum"]
@@ -514,12 +525,18 @@ def main():
         recon_total = 0.0
         for b in H.BUCKETS:
             a = clip_agg[cm][b]
-            # net = capture + markout - fees + liq_loss  (== engine P&L by construction)
-            net = a["capture"] + a["markout"] - a["fee"] + a["liq_loss"]
+            # ALL-IN fee = round-trip fees + liquidation fees (itemized out of liq_loss)
+            fee_all = a["fee"] + a["liq_fee"]
+            # liq_loss adjusted: moving the liq fee (a cost) OUT to the fee column
+            # makes liq_loss LESS negative by that amount, so we ADD it back.
+            # (net = cap+mko-fee_all+liq_net stays == engine P&L; verified.)
+            liq_net = a["liq_loss"] + a["liq_fee"]
+            # net = capture + markout - fee_all + liq_net  (== engine P&L; unchanged)
+            net = a["capture"] + a["markout"] - fee_all + liq_net
             recon_total += net
             print(f"{b:12s} {a['capture']:>12,.0f} {a['markout']:>12,.0f} "
                   f"{a['jump_markout']:>11,.0f} {a['diff_markout']:>12,.0f} "
-                  f"{-a['fee']:>10,.0f} {a['liq_loss']:>12,.0f} {net:>12,.0f} "
+                  f"{-fee_all:>10,.0f} {liq_net:>12,.0f} {net:>12,.0f} "
                   f"{a['fills']:>8,d}")
         # the reconciliation line (should equal the engine P&L sum for this clip)
         print(f"{'TOTAL net':12s} {'':>12s} {'':>12s} {'':>11s} {'':>12s} "
@@ -537,12 +554,15 @@ def main():
             # a helper for component -> bps
             def _bps(x):
                 return (1e4 * x / on) if on > 0 else float("nan")
-            # net in bps
-            net_bps = _bps(a["capture"] + a["markout"] - a["fee"] + a["liq_loss"])
+            # all-in fee + adjusted liq_loss (liq fee moved to fee col -> add back)
+            fee_all = a["fee"] + a["liq_fee"]
+            liq_net = a["liq_loss"] + a["liq_fee"]
+            # net in bps (unchanged total)
+            net_bps = _bps(a["capture"] + a["markout"] - fee_all + liq_net)
             print(f"{b:12s} {_bps(a['capture']):>10.3f} "
                   f"{_bps(a['markout']):>10.3f} {_bps(a['jump_markout']):>10.3f} "
-                  f"{_bps(a['diff_markout']):>10.3f} {_bps(-a['fee']):>10.3f} "
-                  f"{_bps(a['liq_loss']):>10.3f} {net_bps:>10.3f}")
+                  f"{_bps(a['diff_markout']):>10.3f} {_bps(-fee_all):>10.3f} "
+                  f"{_bps(liq_net):>10.3f} {net_bps:>10.3f}")
 
         # ---- TABLE 3: per-share averages (component / opened shares) ----
         print(f"\n-- PER-SHARE (PKR per opened share) + HOLD TIME by bucket --")
