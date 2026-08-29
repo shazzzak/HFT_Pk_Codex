@@ -76,10 +76,9 @@ TOL_MODES = [0.0]
 # AXIS 5 (STAGE 3): OFI-defensive window -- None = OFF (the control), else the
 # min(N events, T seconds) hybrid from the horserace. Per-bucket best is read
 # from the per-bucket tables (one window per config; buckets independent).
-# RUN A (lambda sweep): OFI restricted to OFF so only the defensive-lean sweep
-# runs. The OFI verdict is settled (n=197: ties/loses); re-running OFI configs
-# here would waste ~12h. To re-enable the full OFI grid, restore the 5-window list.
-OFI_MODES = [None]
+# RUN B (per-name OFI): full OFI grid ON. This RE-runs the OFI sweep but with
+# the per-name CSV this time (the axis dropped in the first OFI run). lambda OFF.
+OFI_MODES = [None, (20, 2.0), (50, 5.0), (70, 7.0), (90, 9.0)]
 # AXIS 6 (STAGE 3): engage threshold on the NORMALIZED [-1,+1] trailing OFI.
 # Only applies when a window is on (the OFF config is not duplicated per thresh).
 OFI_THRESH = [0.20, 0.40]
@@ -88,7 +87,8 @@ OFI_THRESH = [0.20, 0.40]
 # pick-offs). These NEGATIVE values lean the OTHER way (away from imbalance) to
 # convert 'through' fills into 'at_queue'. Swept only on the OFF config (no
 # crossing with OFI windows). None = the mid baseline (unchanged behavior).
-MICRO_LAMBDA = [None, -1.5, -2.0, -2.5, -3.0, -3.5, -4.0, -4.5, -5.0]
+# RUN B: lambda OFF (baseline only); lambda is Run A's job.
+MICRO_LAMBDA = [None]
 # inventory threshold (lots) beyond which the tick-exit engages
 EXIT_INV_THRESHOLD = 1.0
 # OBI-defensive engage threshold (|imb-0.5|) and widen ticks
@@ -845,7 +845,7 @@ def main():
                      "median_hold_s": (np.median(allhold) / 1000.0
                                        if allhold else np.nan),
                      "trades": sum(a[b]["trades"] for b in H.BUCKETS)})
-    out = RESULTS / f"skew_sweep_2d_{stamp}.csv"
+    out = RESULTS / f"skew_sweep_2d_RUNB_{stamp}.csv"
     pd.DataFrame(rows).to_csv(out, index=False)
     print(f"\nwrote {out}")
 
@@ -908,7 +908,7 @@ def main():
                              for b in H.BUCKETS if b in daily_bkt[key][day]),
                 "off_minus_this_bps": diff})
     # write the granular daily CSV
-    dout = RESULTS / f"skew_sweep_2d_DAILY_{stamp}.csv"
+    dout = RESULTS / f"skew_sweep_2d_RUNB_DAILY_{stamp}.csv"
     pd.DataFrame(drows).to_csv(dout, index=False)
     print(f"wrote {dout}  ({len(drows)} rows: per config x day x bucket + ALL)")
 
@@ -939,7 +939,7 @@ def main():
                 # and markout in bps (the adverse-selection read, per name)
                 "markout_bps": _b(mko_pkr),
                 "opened_notional": on, "fills": fills})
-    nout = RESULTS / f"skew_sweep_2d_PERNAME_{stamp}.csv"
+    nout = RESULTS / f"skew_sweep_2d_RUNB_PERNAME_{stamp}.csv"
     pd.DataFrame(nrows).to_csv(nout, index=False)
     print(f"wrote {nout}  ({len(nrows)} rows: per config x day x name x bucket)")
 

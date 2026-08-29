@@ -146,7 +146,13 @@ class MicrostructureMM:
                  # soft_inv=N -> once |pos|>N, stop quoting the side that ADDS to the
                  # position (pull that quote) so fills can only reduce it. None
                  # disables the band.
-                 *, session_scale, use_microprice=True, soft_inv=None,
+                 *, session_scale, use_microprice=True,
+                 # continuous microprice lean coefficient. None -> derive from the
+                 # use_microprice boolean (back-compat). Set explicitly to sweep the
+                 # lean: +1 = classic microprice, 0 = mid, <0 = DEFENSIVE (lean away
+                 # from imbalance to convert 'through' pick-offs into 'at_queue').
+                 micro_lambda=None,
+                 soft_inv=None,
                  # --- EOD / LOCK triggers (OFF by default: PPL/UBL runs are
                  # unaffected unless a config explicitly enables them) ---
                  enable_eod_trigger=False, enable_lock_trigger=False,
@@ -214,6 +220,8 @@ class MicrostructureMM:
         # plain mid (neutral, like naive). The microprice is the confirmed cause of
         # the short drift, so this exists to test/disable it.
         self.use_microprice = use_microprice
+        # continuous lean coefficient (None -> derived from the boolean at quote time)
+        self.micro_lambda = micro_lambda
         # Risk aversion. Scales BOTH the inventory skew and the risk half-spread.
         self.gamma = gamma
         # Dimensional bridge (units 1/PKR) scaling the inventory skew from PKR
@@ -873,14 +881,24 @@ class MicrostructureMM:
             ofi_sig = self._ofi_signal()
         else:
             ofi_sig = None
-        # Ch 3.3 microprice: heavier bid depth pulls fair value UP toward the ask.
-        # This is DIRECTIONAL -- the confirmed cause of the short drift (micro sells
-        # into ask-heavy books, buys into bid-heavy ones). use_microprice=False
-        # quotes around the plain mid, like naive, to remove the lean.
-        if self.use_microprice:
-            fair = ba * imb + bb * (1.0 - imb)
+        # Ch 3.3 microprice, GENERALIZED to a continuous lean coefficient lambda:
+        #   fair = mid + lambda * (imb - 0.5) * spread
+        # lambda=+1 == the classic microprice (heavy bid -> fair UP, the confirmed
+        #   destructive lean); lambda=0 == plain mid; lambda<0 == DEFENSIVE lean
+        #   (heavy bid -> fair DOWN -> our bid pulls BACK from the buying pressure,
+        #   converting 'through' pick-offs toward 'at_queue' fills). Proven equal
+        #   to the old boolean code at lambda in {0,1} (100k-case identity test).
+        # Resolve lambda: explicit micro_lambda wins; else fall back to the boolean
+        # (True->1.0, False->0.0) so existing callers are byte-identical.
+        if self.micro_lambda is not None:
+            _lam = self.micro_lambda
         else:
-            fair = 0.5 * (bb + ba)
+            _lam = 1.0 if self.use_microprice else 0.0
+        # mid and spread
+        _mid = 0.5 * (bb + ba)
+        _spr = ba - bb
+        # the continuous-lambda fair value
+        fair = _mid + _lam * (imb - 0.5) * _spr
         # Ho-Stoll horizon.
         tau = self._horizon()
         # Per-unit inventory risk: risk aversion x variance x remaining horizon.

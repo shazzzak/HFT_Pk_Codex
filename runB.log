@@ -1,0 +1,4 @@
+pre-pass: calibration + trailing median trade size
+  pre-pass 50/207  0m22s
+  pre-pass 100/207  0m40s
+  pre-pass 150/207  0m58s
