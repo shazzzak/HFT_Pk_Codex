@@ -9,3 +9,7 @@ STAGE-3 OFI sweep (winner frozen: et1/obi+/tol0/mid): 1 windows x 2 thresholds (
   x 38 names x 197 days = 67374 cells
   workers: 10
 
+  200/67374  5m31s  ETA 1853m19s
+  400/67374  9m27s  ETA 1584m30s
+  600/67374  13m31s  ETA 1505m43s
+  800/67374  18m29s  ETA 1539m15s

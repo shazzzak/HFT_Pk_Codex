@@ -103,7 +103,7 @@ JUMP_K = 4.0
 # (Hard lesson: a multi-hour run was burned on an unverified sweep.)
 SMOKE_DAYS = None
 # workers
-WORKERS = None
+WORKERS = 4
 # -----------------------------------------------------------------------------
 
 # worker globals
@@ -509,9 +509,9 @@ def main():
             for date in run_dates for sym in NAMES
             for (et, od, um, tl, ofw, oth, mlam) in configs]
     total = len(work)
-    print(f"\nSTAGE-3 OFI sweep (winner frozen: et1/obi+/tol0/mid): "
-          f"{len(OFI_MODES)} windows x {len(OFI_THRESH)} thresholds "
-          f"(OFF deduped) = {len(configs)} configs", flush=True)
+    print(f"\nRUN B -- per-name OFI sweep (winner frozen: et1/obi+/tol0/mid; "
+          f"lambda off): {len(OFI_MODES)-1} windows x {len(OFI_THRESH)} thresholds "
+          f"+ 1 OFF = {len(configs)} configs", flush=True)
     print(f"  x {len(NAMES)} names x {len(run_dates)} days = {total} cells",
           flush=True)
     print(f"  workers: {nproc}\n", flush=True)

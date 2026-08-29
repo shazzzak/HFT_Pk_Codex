@@ -2,3 +2,13 @@ pre-pass: calibration + trailing median trade size
   pre-pass 50/207  0m22s
   pre-pass 100/207  0m40s
   pre-pass 150/207  0m58s
+  pre-pass 200/207  1m21s
+  pre-pass 207/207  1m25s
+
+STAGE-3 OFI sweep (winner frozen: et1/obi+/tol0/mid): 5 windows x 2 thresholds (OFF deduped) = 9 configs
+  x 38 names x 197 days = 67374 cells
+  workers: 10
+
+  200/67374  5m44s  ETA 1925m48s
+  400/67374  9m40s  ETA 1619m17s
+  600/67374  13m46s  ETA 1533m36s
