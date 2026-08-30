@@ -487,6 +487,29 @@ class Book:
         aq = sum(q for _, q in sorted(asks.items())[:n]) if asks else 0.0  # ask depth: sort levels LOW-to-HIGH (best ask first, no reverse), take top n, sum. 0.0 if no asks.
         return (bq - aq) / (bq + aq) if bq + aq > 0 else None  # imbalance = (bid depth - ask depth)/(total depth). Range [-1,+1]: +ve = buy pressure, -ve = sell pressure. None if book empty (avoid /0).
 
+    def ranked_depth(self, n=10, include_deep=False):
+        # Ranked (price, qty) levels per side, best-first, for multi-level OFI.
+        # Returns (bids, asks): bids sorted HIGH->LOW (best bid first), asks
+        # sorted LOW->HIGH (best ask first), each truncated to the top n levels.
+        # Mirrors obi()'s level aggregation exactly (net qty per price, __AGG_
+        # skipped unless include_deep, empty levels dropped) so the deep-OFI
+        # signal is consistent with the OBI depth the engine already exposes.
+        bids, asks = {}, {}
+        # aggregate net qty per price level, same rules as obi()
+        for k, o in self.o.items():
+            if k.startswith("__AGG_") and not include_deep:
+                continue
+            d = bids if o.side == "BUY" else asks
+            d[o.price] = d.get(o.price, 0.0) + o.qty
+        # drop levels that netted to <= 0
+        bids = {p: q for p, q in bids.items() if q > 0}
+        asks = {p: q for p, q in asks.items() if q > 0}
+        # best-first ranked (price, qty) tuples, truncated to n levels
+        bid_levels = sorted(bids.items(), reverse=True)[:n]
+        ask_levels = sorted(asks.items())[:n]
+        # return as (bids, asks) lists of (price, qty)
+        return (bid_levels, ask_levels)
+
 @dataclass
 class MyOrder:
     """One of OUR simulated orders, with the state a real order carries.
@@ -979,8 +1002,14 @@ class Backtester:
 
         # Read the current best bid/offer (with qtys) from the reconstructed book.
         bb, bq, ba, aq = self.book.bbo()
+        # DEEP-OFI SUPPORT: if the strategy uses multi-level OFI (ofi_depth_levels
+        # > 1), supply ranked (price, qty) depth; otherwise pass None (L1 path,
+        # zero extra cost -- byte-identical to the pre-deep-OFI call). getattr
+        # guards strategies that lack the attribute entirely.
+        _depth = (self.book.ranked_depth(getattr(self.strat, "ofi_depth_levels", 1))
+                  if getattr(self.strat, "ofi_depth_levels", 1) > 1 else None)
         # Ask the strategy where it wants to quote: {side: (price, qty)}, sides may be omitted.
-        want = self.strat.quotes(bb, bq, ba, aq, self.pos)
+        want = self.strat.quotes(bb, bq, ba, aq, self.pos, depth=_depth)
 
         # BAND CLAMP: exchange rejects orders outside [limit_dn, limit_up]
         # Clamp each desired price into the allowed circuit band before sending.
@@ -1355,8 +1384,10 @@ class NaiveSymmetricMM:
         # size = shares per quote. max_inv = hard inventory cap in shares.
         self.hs, self.size, self.max_inv = half_spread, size, max_inv
 
-    def quotes(self, bb, bq, ba, aq, pos):
+    def quotes(self, bb, bq, ba, aq, pos, depth=None):
         # No two-sided book (pre-open, halt, one side empty) -> quote nothing.
+        # depth accepted for interface parity with the deep-OFI strategy; the
+        # naive reference strategy ignores it.
         if bb is None or ba is None:
             return {}
         # Reference price: the arithmetic midpoint of the touch.

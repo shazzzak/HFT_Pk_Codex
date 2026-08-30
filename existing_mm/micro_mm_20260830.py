@@ -209,28 +209,9 @@ class MicrostructureMM:
                  # ticks to widen the threatened side when OFI-defensive fires
                  ofi_defensive_ticks=1.0,
                  # number of price levels used by OFI. 1 preserves the validated
-                 # L1 touch path byte-for-byte; 5/10 enable the multi-level
-                 # extension. Deep mode requires the caller to pass ranked depth
-                 # into quotes(depth=...).
-                 ofi_depth_levels=1,
-                 # ---- SIZE THROTTLE (Stage 4): cut CLIP SIZE on the exposed
-                 # side when the book/flow is adverse, instead of (or on top of)
-                 # widening. The "0.5x clip instead of base" idea, time-boxed.
-                 # All flags default OFF -> byte-identical to the pre-throttle
-                 # strategy (the before/after identity test asserts this).
-                 obi_throttle=False,
-                 ofi_throttle=False,
-                 # fraction of base clip to quote while throttled (0.5 = half)
-                 throttle_frac=0.5,
-                 # OBI engage threshold (mirrors obi_defensive_thresh form)
-                 obi_throttle_thresh=0.15,
-                 # OFI engage threshold on the normalized [-1,+1] trailing OFI
-                 ofi_throttle_thresh=0.30,
-                 # time-box (ms of EXCHANGE time): a triggered side stays
-                 # throttled this long, then restores. Brackets the 100-500ms
-                 # window from the throttle diagnostic. 0 => only the trigger
-                 # cycle is throttled (no hold).
-                 throttle_hold_ms=300.0):
+                 # L1 path; 5/10 enable the experimental multi-level extension.
+                 # Deep mode requires the caller to pass depth into quotes().
+                 ofi_depth_levels=1):
         # Baseline quote size in shares (Ch 3.4: this gets cut when flow is toxic).
         self.size0 = size
         # Hard inventory cap in shares (a backstop; the skew is the real control).
@@ -348,30 +329,18 @@ class MicrostructureMM:
         self.ofi_defensive_thresh = ofi_defensive_thresh
         # ticks to widen the threatened side
         self.ofi_defensive_ticks = ofi_defensive_ticks
-        # OFI depth is a separate axis from window/threshold: lets L1, L5, L10 be
-        # compared without changing any other knob. 1 = validated L1 path.
+        # OFI depth is deliberately a separate axis from its window/threshold.
+        # This lets L1, L5 and L10 be compared without changing any other knob.
         self.ofi_depth_levels = int(ofi_depth_levels)
         if not 1 <= self.ofi_depth_levels <= 10:
             raise ValueError("ofi_depth_levels must be between 1 and 10")
-        # --- SIZE THROTTLE (Stage 4; all default False -> byte-identical off) ---
-        self.obi_throttle = obi_throttle
-        self.ofi_throttle = ofi_throttle
-        self.throttle_frac = float(throttle_frac)
-        self.obi_throttle_thresh = float(obi_throttle_thresh)
-        self.ofi_throttle_thresh = float(ofi_throttle_thresh)
-        self.throttle_hold_ms = float(throttle_hold_ms)
-        # per-side hold-until timestamps (exchange-ms); None = not throttled. A
-        # trigger sets these to now+hold_ms; the cut persists across quote cycles
-        # until self.now passes them (this implements the time-box).
-        self._throttle_buy_until = None
-        self._throttle_sell_until = None
         # trailing (ts_ms, ofi_increment) events; evicted by the time cap on
         # update, capped to the last N events at READ time (min-window semantics)
         self._ofi_events = deque()
         # previous touch (bb, bq, ba, aq) for the Cont-Kukanov L1 increment
         self._ofi_prev_touch = None
-        # previous ranked book for multi-level OFI: (bids, asks), each a tuple of
-        # (price, aggregate_qty) best-first. L1 mode never reads it.
+        # Previous ranked book for multi-level OFI: (bids best-first, asks
+        # best-first), each a tuple of (price, aggregate_qty). L1 never reads it.
         self._ofi_prev_depth = None
         # total increments seen today (event-cap warm-up: need >= N seen)
         self._ofi_seen = 0
@@ -775,15 +744,11 @@ class MicrostructureMM:
 
     # ---- OFI-defensive machinery (Stage 3) ----------------------------------
     def _ofi_append(self, e):
-        # append one signed OFI increment and maintain the trailing window's
-        # warm-up state. Shared by the L1 and deep paths so both feed ONE window.
+        """Append one signed OFI increment and maintain window warm-up state."""
         self._ofi_events.append((self.now, float(e)))
-        # warm-up counter: total increments seen today
         self._ofi_seen += 1
-        # first-increment timestamp for the time-cap warm-up
         if self._ofi_first_ts is None:
             self._ofi_first_ts = self.now
-        # evict entries older than the TIME cap (event cap applied at read)
         cutoff = self.now - self.ofi_window_s * 1000.0
         while self._ofi_events and self._ofi_events[0][0] < cutoff:
             self._ofi_events.popleft()
@@ -821,9 +786,12 @@ class MicrostructureMM:
 
     @staticmethod
     def _ofi_rank_increment(previous, current, side):
-        # Cont-Kukanov increment for ONE ranked price level. previous/current are
-        # (price, qty) or None. Positive always = buy pressure: bid additions/
-        # improvements and ask removals/retreats are positive; mirrors negative.
+        """Cont-Kukanov increment for one ranked price level.
+
+        ``previous``/``current`` are ``(price, qty)`` or ``None``. Positive
+        output always means buy pressure: bid additions/improvements and ask
+        removals/retreats are positive; their mirrors are negative.
+        """
         if previous is None and current is None:
             return 0.0
         if previous is None:
@@ -847,34 +815,27 @@ class MicrostructureMM:
         return float(old_qty - new_qty)
 
     def _ofi_update_depth(self, depth):
-        # Equal-weight multi-level OFI from a ranked depth snapshot. The scalar
-        # increment is the SUM of the canonical increment at ranks 1..N. Leaves
-        # depth N as an experiment axis rather than baking in a decay curve.
-        # depth = (bids, asks), each a list of (price, qty) best-first.
+        """Append equal-weight multi-level OFI from a ranked depth snapshot.
+
+        The scalar increment is the sum of the canonical increment at ranks
+        1..N. This deliberately leaves depth N as an experiment axis instead
+        of tuning an unvalidated decay curve into the signal.
+        """
         bids, asks = depth
-        # cap to the configured number of levels
         bids = tuple(bids[:self.ofi_depth_levels])
         asks = tuple(asks[:self.ofi_depth_levels])
-        # this cycle's ranked book
         current = (bids, asks)
-        # need a previous ranked book to difference against
         if self._ofi_prev_depth is not None:
-            # unpack previous ranked book
             old_bids, old_asks = self._ofi_prev_depth
-            # accumulate the per-rank increments
             e = 0.0
             for rank in range(self.ofi_depth_levels):
-                # previous/current (price,qty) at this rank, or None if absent
                 old_bid = old_bids[rank] if rank < len(old_bids) else None
                 new_bid = bids[rank] if rank < len(bids) else None
                 old_ask = old_asks[rank] if rank < len(old_asks) else None
                 new_ask = asks[rank] if rank < len(asks) else None
-                # bid-side + ask-side increments at this rank
                 e += self._ofi_rank_increment(old_bid, new_bid, "BUY")
                 e += self._ofi_rank_increment(old_ask, new_ask, "SELL")
-            # one scalar increment for the whole depth snapshot
             self._ofi_append(e)
-        # remember this ranked book for the next increment
         self._ofi_prev_depth = current
 
     def _ofi_signal(self):
@@ -883,7 +844,7 @@ class MicrostructureMM:
         # is OFF until (a) >= N increments have been seen today (event cap warm),
         # (b) >= T seconds have elapsed since the first increment (time cap warm),
         # and (c) the current window holds >= 2 events. NaN-equivalent = None.
-        if not (self.ofi_defensive or self.ofi_throttle):
+        if not self.ofi_defensive:
             return None
         # hard-OFF in first15: the horserace measured ZERO signal there on every
         # window (thin frenetic book: state = flow); acting on noise only hurts.
@@ -982,8 +943,8 @@ class MicrostructureMM:
         # ofi_defensive=False is byte-identical to the pre-Stage-3 strategy
         # (the before/after test asserts this).
         if self.ofi_defensive:
-            # L1 retains the validated touch path byte-for-byte; deep mode
-            # consumes ranked market depth supplied by the engine.
+            # L1 retains the already-validated touch path byte-for-byte. Deep
+            # mode consumes ranked market depth supplied by the engine.
             if self.ofi_depth_levels == 1:
                 self._ofi_update(bb, bq, ba, aq)
             else:
@@ -995,40 +956,6 @@ class MicrostructureMM:
             ofi_sig = self._ofi_signal()
         else:
             ofi_sig = None
-        # --- SIZE THROTTLE (Stage 4): feed the OFI window when the throttle
-        # needs it but ofi_defensive is off, then decide per-side throttling. ---
-        if self.ofi_throttle and not self.ofi_defensive:
-            # keep the trailing OFI window fed so ofi_sig is valid for throttling
-            if self.ofi_depth_levels == 1:
-                self._ofi_update(bb, bq, ba, aq)
-            else:
-                if depth is None:
-                    raise ValueError(
-                        "deep OFI requires ranked depth passed to quotes()")
-                self._ofi_update_depth(depth)
-            # the normalized signal for the throttle path
-            ofi_sig = self._ofi_signal()
-        # BUY-side trigger: adverse OBI (ask-heavy) or adverse OFI (selling flow)
-        buy_trig = ((self.obi_throttle
-                     and (0.5 - imb) > self.obi_throttle_thresh)
-                    or (self.ofi_throttle and ofi_sig is not None
-                        and ofi_sig < -self.ofi_throttle_thresh))
-        # SELL-side trigger: adverse OBI (bid-heavy) or adverse OFI (buying flow)
-        sell_trig = ((self.obi_throttle
-                      and (imb - 0.5) > self.obi_throttle_thresh)
-                     or (self.ofi_throttle and ofi_sig is not None
-                         and ofi_sig > self.ofi_throttle_thresh))
-        # time-box: a fresh trigger (re)arms the hold to now+hold_ms; with
-        # hold_ms=0 the hold expires immediately (only the trigger cycle cut)
-        if buy_trig:
-            self._throttle_buy_until = self.now + self.throttle_hold_ms
-        if sell_trig:
-            self._throttle_sell_until = self.now + self.throttle_hold_ms
-        # a side is throttled NOW if its hold is set and not yet expired
-        buy_throttled = (self._throttle_buy_until is not None
-                         and self.now <= self._throttle_buy_until)
-        sell_throttled = (self._throttle_sell_until is not None
-                          and self.now <= self._throttle_sell_until)
         # Ch 3.3 microprice, GENERALIZED to a continuous lean coefficient lambda:
         #   fair = mid + lambda * (imb - 0.5) * spread
         # lambda=+1 == the classic microprice (heavy bid -> fair UP, the confirmed
@@ -1239,11 +1166,7 @@ class MicrostructureMM:
             # inside the ask. Applied LAST so it governs the base quote, the exit
             # skew, and the OBI widen identically -- nothing can cross the ask.
             px = min(px, ba - self.tick)
-            # SIZE THROTTLE: cut BUY clip while throttled (>=1 share). When no
-            # throttle switch is on, buy_throttled is False -> size unchanged.
-            size_buy = max(1.0, round(size * self.throttle_frac)) \
-                if buy_throttled else size
-            out["BUY"] = (round(px, 2), size_buy)
+            out["BUY"] = (round(px, 2), size)
         # Offer unless: trigger-killed, short at the hard cap, or short past the
         # soft band (past -soft_inv we stop selling so only the bid remains).
         if (not trig["kill_sell"]) and pos > -self.max_inv \
@@ -1295,10 +1218,7 @@ class MicrostructureMM:
             # outside the bid. Applied LAST so it governs the base quote, the exit
             # skew, and the OBI widen identically -- nothing can cross the bid.
             px = max(px, bb + self.tick)
-            # SIZE THROTTLE: cut SELL clip while throttled (>=1 share).
-            size_sell = max(1.0, round(size * self.throttle_frac)) \
-                if sell_throttled else size
-            out["SELL"] = (round(px, 2), size_sell)
+            out["SELL"] = (round(px, 2), size)
 
         # QUOTE PEGGING (burst-flow names): hold the previous desired quote until
         # the ideal drifts >= tol_ticks. Returns the FULL desired state (our
