@@ -33,6 +33,8 @@
 # paths + timing
 from pathlib import Path
 import time
+import json
+import os
 from datetime import datetime
 # parallelism
 import multiprocessing as mp
@@ -103,7 +105,7 @@ JUMP_K = 4.0
 # (Hard lesson: a multi-hour run was burned on an unverified sweep.)
 SMOKE_DAYS = None
 # workers
-WORKERS = 5
+WORKERS = 3
 # -----------------------------------------------------------------------------
 
 # worker globals
@@ -508,7 +510,36 @@ def main():
     work = [(date, sym, et, od, um, tl, ofw, oth, mlam)
             for date in run_dates for sym in NAMES
             for (et, od, um, tl, ofw, oth, mlam) in configs]
+    total_all = len(work)
+    # ---- CHECKPOINTING (crash/kill/quit-proof): a JOURNAL appends one flushed
+    # line per completed (config, date, sym) cell. On restart, load it and SKIP
+    # done cells -> RESUME not restart. The polished CSVs are still built from the
+    # in-memory aggregation at the end. Fixed-named so a resume finds it. The
+    # resume key is the VARYING config axes for this sweep: (date, sym, ofw, oth,
+    # mlam) -- uniquely identifies every cell for both the lambda and OFI grids.
+    ckpt_path = RESULTS / "skew_sweep_2d_CKPT.jsonl"
+    done_keys = set()
+    if ckpt_path.exists():
+        with open(ckpt_path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                    done_keys.add((r["date"], r["sym"], str(r["ofw"]),
+                                   r["oth"], str(r["mlam"])))
+                except (ValueError, KeyError):
+                    continue
+        print(f"  RESUME: journal has {len(done_keys)} completed cells; "
+              f"skipping those.", flush=True)
+    if done_keys:
+        work = [w for w in work
+                if (w[0], w[1], str(w[6]), w[7], str(w[8])) not in done_keys]
     total = len(work)
+    print(f"  {total} cells to run this session ({total_all} total, "
+          f"{total_all - total} already journaled).", flush=True)
+    ckpt_fh = open(ckpt_path, "a", buffering=1)
     print(f"\nRUN A -- microprice defensive-lean sweep (winner frozen: "
           f"et1/obi+/tol0; OFI off): "
           f"{len(MICRO_LAMBDA)} lambda values = {len(configs)} configs",
@@ -570,6 +601,21 @@ def main():
                 continue
             key = (res["exit_ticks"], res["obi_def"], res["use_micro"], res["tol"],
                res["ofi_win"], res["ofi_th"], res["mlam"])
+            # ---- CHECKPOINT: journal this completed cell IMMEDIATELY (before
+            # aggregation) with its full per-bucket decomposition, flushed +
+            # fsync'd so it survives a hard kill / PyCharm quit / power loss. The
+            # PERNAME CSV is rebuildable from the journal alone.
+            _jrow = {"date": res["date"], "sym": res["sym"],
+                     "ofw": res["ofi_win"], "oth": res["ofi_th"],
+                     "mlam": res["mlam"],
+                     "per": {b: {k: res["per"][b][k]
+                                 for k in ("capture", "markout", "fee", "liq_fee",
+                                           "liq_cap", "liq_mko", "opened_notional",
+                                           "fills")}
+                             for b in H.BUCKETS}}
+            ckpt_fh.write(json.dumps(_jrow) + "\n")
+            ckpt_fh.flush()
+            os.fsync(ckpt_fh.fileno())
             for b in H.BUCKETS:
                 s = res["per"][b]; d = agg[key][b]
                 # sum scalar accumulators
@@ -632,6 +678,18 @@ def main():
             engine_pnl_agg[key] += res["engine_pnl"]
             # accumulate the unexplained residual (measured recon quality)
             recon_gap_agg[key] += res["recon_gap"]
+    # ---- CHECKPOINT: pool finished cleanly. Close + rename journal to .done so
+    # a future run starts FRESH (not "resuming" a completed sweep). If the run
+    # had died, this is never reached -> journal stays for the next resume.
+    ckpt_fh.close()
+    _done = ckpt_path.with_suffix(ckpt_path.suffix + ".done")
+    try:
+        if _done.exists():
+            _done.unlink()
+        ckpt_path.rename(_done)
+        print(f"\n  checkpoint complete -> {_done.name}", flush=True)
+    except OSError:
+        pass
     # ---- reporting ----
     print("\n" + "=" * 84)
     print(f"### 2D SKEW SWEEP DONE: {H._fmt(time.perf_counter() - t0)} "

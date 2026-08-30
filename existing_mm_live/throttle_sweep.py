@@ -33,6 +33,8 @@
 # paths + timing
 from pathlib import Path
 import time
+import json
+import os
 from datetime import datetime
 # parallelism
 import multiprocessing as mp
@@ -117,7 +119,7 @@ JUMP_K = 4.0
 # (Hard lesson: a multi-hour run was burned on an unverified sweep.)
 SMOKE_DAYS = None
 # workers
-WORKERS = 5
+WORKERS = 3
 # -----------------------------------------------------------------------------
 
 # worker globals
@@ -529,7 +531,44 @@ def main():
     work = [(date, sym, et, od, um, tl, ofw, oth, mlam, thr)
             for date in run_dates for sym in NAMES
             for (et, od, um, tl, ofw, oth, mlam, thr) in configs]
+    total_all = len(work)
+    # ---- CHECKPOINTING (crash/kill/quit-proof): a JOURNAL that appends one raw
+    # line per completed (config, date, sym) as it finishes, flushed every time.
+    # If the run dies (OOM, PyCharm quit, power loss), completed work is on disk.
+    # On restart, we load the journal and SKIP work already done -> resume, not
+    # restart. The journal is the finest grain; the polished CSVs are still built
+    # from the in-memory aggregation at the end (unchanged). File is fixed-named
+    # (no stamp) so a resume finds the SAME journal.
+    ckpt_path = RESULTS / "throttle_sweep_CKPT.jsonl"
+    # a work item's identity for resume = (date, sym, thr) -- the only varying
+    # axes here (everything else is a singleton). Load any already-done keys.
+    done_keys = set()
+    if ckpt_path.exists():
+        # read the journal; each line is a JSON dict of one completed cell
+        with open(ckpt_path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                    done_keys.add((r["date"], r["sym"], r["thr"]))
+                except (ValueError, KeyError):
+                    # a torn last line from a hard kill -> skip it, harmless
+                    continue
+        print(f"  RESUME: journal has {len(done_keys)} completed cells; "
+              f"skipping those.", flush=True)
+    # filter the work list to only NOT-yet-done cells (resume)
+    if done_keys:
+        work = [w for w in work
+                if (w[0], w[1], w[9]) not in done_keys]
     total = len(work)
+    print(f"  {total} cells to run this session "
+          f"({total_all} total, {total_all - total} already journaled).",
+          flush=True)
+    # open the journal in APPEND mode for this session (line-buffered so every
+    # write hits disk promptly; we also flush explicitly per cell)
+    ckpt_fh = open(ckpt_path, "a", buffering=1)
     print(f"\nSTAGE 4 -- OBI+OFI size-throttle sweep (winner frozen "
           f"et1/obi+/tol0/mid, OFI-defensive off; framing #2 = throttle STACKS "
           f"on obi_defensive): OFF vs ON = {len(configs)} configs",
@@ -591,6 +630,20 @@ def main():
                 continue
             key = (res["exit_ticks"], res["obi_def"], res["use_micro"], res["tol"],
                res["ofi_win"], res["ofi_th"], res["mlam"], res["thr"])
+            # ---- CHECKPOINT: journal this completed cell IMMEDIATELY (before any
+            # aggregation) so a crash right now still keeps it. One JSON line with
+            # the full per-bucket decomposition -> the PERNAME CSV can be rebuilt
+            # from the journal alone if the final write never happens. Flushed +
+            # fsync'd so it survives a hard kill.
+            _jrow = {"date": res["date"], "sym": res["sym"], "thr": res["thr"],
+                     "per": {b: {k: res["per"][b][k]
+                                 for k in ("capture", "markout", "fee", "liq_fee",
+                                           "liq_cap", "liq_mko", "opened_notional",
+                                           "fills")}
+                             for b in H.BUCKETS}}
+            ckpt_fh.write(json.dumps(_jrow) + "\n")
+            ckpt_fh.flush()
+            os.fsync(ckpt_fh.fileno())
             for b in H.BUCKETS:
                 s = res["per"][b]; d = agg[key][b]
                 # sum scalar accumulators
@@ -653,6 +706,21 @@ def main():
             engine_pnl_agg[key] += res["engine_pnl"]
             # accumulate the unexplained residual (measured recon quality)
             recon_gap_agg[key] += res["recon_gap"]
+    # ---- CHECKPOINT: the pool finished cleanly. Close the journal and rename it
+    # to .done so a future run starts FRESH instead of wrongly "resuming" a
+    # completed sweep. (If the run had died, this line is never reached and the
+    # journal stays as .jsonl -> the next launch resumes from it.)
+    ckpt_fh.close()
+    done_marker = ckpt_path.with_suffix(".jsonl.done")
+    try:
+        # replace any stale marker, then rename
+        if done_marker.exists():
+            done_marker.unlink()
+        ckpt_path.rename(done_marker)
+        print(f"\n  checkpoint complete -> {done_marker.name}", flush=True)
+    except OSError:
+        # non-fatal: the polished CSVs are the real output
+        pass
     # ---- reporting ----
     print("\n" + "=" * 84)
     print(f"### 2D SKEW SWEEP DONE: {H._fmt(time.perf_counter() - t0)} "

@@ -32,8 +32,9 @@
 
 # paths + timing
 from pathlib import Path
-import os
 import time
+import json
+import os
 from datetime import datetime
 # parallelism
 import multiprocessing as mp
@@ -50,8 +51,7 @@ from spot_capture_markout_decomp import _mid_at, _split_move
 
 # store paths
 R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
-RESULTS = Path(os.environ.get(
-    "OFI_RESULTS_ROOT", "/Users/shazzak/Capital Stake - Results"))
+RESULTS = Path("/Users/shazzak/Capital Stake - Results")
 
 # ------------------------------ config ---------------------------------------
 # the top-10 production book
@@ -60,10 +60,6 @@ NAMES = ['AKBL', 'ATRL', 'BAFL', 'BOP', 'DGKC', 'ENGROH', 'FFC', 'FNEL',
          'NBP', 'NCPL', 'NML', 'NPL', 'NRL', 'OGDC', 'PACE', 'PAEL',
          'PIAHCLA', 'PIBTL', 'PIOC', 'PPL', 'PSO', 'PTC', 'SAZEW', 'SEARL',
          'SYS', 'THCCL', 'TOMCL', 'TPL', 'TRG', 'UBL']
-# Optional comma-separated canary subset, e.g. OFI_NAMES=PPL,UBL.
-if os.environ.get("OFI_NAMES"):
-    NAMES = [s.strip().upper() for s in os.environ["OFI_NAMES"].split(",")
-             if s.strip()]
 # single production clip (capacity already settled; this is a mechanism sweep)
 CLIP_MULT = 3.0
 # trailing median-trade-size window (days)
@@ -88,11 +84,6 @@ OFI_MODES = [None, (20, 2.0), (50, 5.0), (70, 7.0), (90, 9.0)]
 # AXIS 6 (STAGE 3): engage threshold on the NORMALIZED [-1,+1] trailing OFI.
 # Only applies when a window is on (the OFF config is not duplicated per thresh).
 OFI_THRESH = [0.20, 0.40]
-# Depth experiment axis. Run this script separately at L1, L5 and L10 so every
-# output file is one clean, auditable panel. L1 is the already-validated path.
-OFI_DEPTH_LEVELS = int(os.environ.get("OFI_DEPTH_LEVELS", "1"))
-if OFI_DEPTH_LEVELS not in (1, 5, 10):
-    raise ValueError("OFI_DEPTH_LEVELS must be one of 1, 5, 10")
 # AXIS 7 (microprice defensive lean): continuous lambda on OFI=OFF ONLY. The
 # classic microprice (lambda=+1) was destructive (leans INTO flow -> 'through'
 # pick-offs). These NEGATIVE values lean the OTHER way (away from imbalance) to
@@ -112,10 +103,9 @@ JUMP_K = 4.0
 # not 4 hours. Set to None for the FULL ~207-day run ONLY after the canary's
 # anchor reads 0 on all 9 configs and preflight_coverage.py shows all names OK.
 # (Hard lesson: a multi-hour run was burned on an unverified sweep.)
-_smoke_days = os.environ.get("OFI_SMOKE_DAYS")
-SMOKE_DAYS = int(_smoke_days) if _smoke_days else None
+SMOKE_DAYS = None
 # workers
-WORKERS = int(os.environ.get("OFI_WORKERS", "4"))
+WORKERS = 3
 # -----------------------------------------------------------------------------
 
 # worker globals
@@ -212,8 +202,6 @@ def _process(args):
                    "ofi_window_ev": (ofi_win[0] if ofi_win is not None else 50),
                    "ofi_window_s": (ofi_win[1] if ofi_win is not None else 5.0),
                    "ofi_defensive_thresh": ofi_th,
-                   # L1/L5/L10 experiment axis (fixed for one process/output).
-                   "ofi_depth_levels": OFI_DEPTH_LEVELS,
                    # AXIS 7: continuous microprice lean. None -> use_microprice
                    # governs (baseline); negative -> defensive lean (OFF config).
                    "micro_lambda": micro_lam})
@@ -522,10 +510,38 @@ def main():
     work = [(date, sym, et, od, um, tl, ofw, oth, mlam)
             for date in run_dates for sym in NAMES
             for (et, od, um, tl, ofw, oth, mlam) in configs]
+    total_all = len(work)
+    # ---- CHECKPOINTING (crash/kill/quit-proof): a JOURNAL appends one flushed
+    # line per completed (config, date, sym) cell. On restart, load it and SKIP
+    # done cells -> RESUME not restart. The polished CSVs are still built from the
+    # in-memory aggregation at the end. Fixed-named so a resume finds it. The
+    # resume key is the VARYING config axes for this sweep: (date, sym, ofw, oth,
+    # mlam) -- uniquely identifies every cell for both the lambda and OFI grids.
+    ckpt_path = RESULTS / "skew_sweep_2d_RUNB_CKPT.jsonl"
+    done_keys = set()
+    if ckpt_path.exists():
+        with open(ckpt_path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                    done_keys.add((r["date"], r["sym"], str(r["ofw"]),
+                                   r["oth"], str(r["mlam"])))
+                except (ValueError, KeyError):
+                    continue
+        print(f"  RESUME: journal has {len(done_keys)} completed cells; "
+              f"skipping those.", flush=True)
+    if done_keys:
+        work = [w for w in work
+                if (w[0], w[1], str(w[6]), w[7], str(w[8])) not in done_keys]
     total = len(work)
-    print(f"\nRUN B -- per-name L{OFI_DEPTH_LEVELS} OFI sweep "
-          f"(winner frozen: et1/obi+/tol0/mid; lambda off): "
-          f"{len(OFI_MODES)-1} windows x {len(OFI_THRESH)} thresholds "
+    print(f"  {total} cells to run this session ({total_all} total, "
+          f"{total_all - total} already journaled).", flush=True)
+    ckpt_fh = open(ckpt_path, "a", buffering=1)
+    print(f"\nRUN B -- per-name OFI sweep (winner frozen: et1/obi+/tol0/mid; "
+          f"lambda off): {len(OFI_MODES)-1} windows x {len(OFI_THRESH)} thresholds "
           f"+ 1 OFF = {len(configs)} configs", flush=True)
     print(f"  x {len(NAMES)} names x {len(run_dates)} days = {total} cells",
           flush=True)
@@ -584,6 +600,21 @@ def main():
                 continue
             key = (res["exit_ticks"], res["obi_def"], res["use_micro"], res["tol"],
                res["ofi_win"], res["ofi_th"], res["mlam"])
+            # ---- CHECKPOINT: journal this completed cell IMMEDIATELY (before
+            # aggregation) with its full per-bucket decomposition, flushed +
+            # fsync'd so it survives a hard kill / PyCharm quit / power loss. The
+            # PERNAME CSV is rebuildable from the journal alone.
+            _jrow = {"date": res["date"], "sym": res["sym"],
+                     "ofw": res["ofi_win"], "oth": res["ofi_th"],
+                     "mlam": res["mlam"],
+                     "per": {b: {k: res["per"][b][k]
+                                 for k in ("capture", "markout", "fee", "liq_fee",
+                                           "liq_cap", "liq_mko", "opened_notional",
+                                           "fills")}
+                             for b in H.BUCKETS}}
+            ckpt_fh.write(json.dumps(_jrow) + "\n")
+            ckpt_fh.flush()
+            os.fsync(ckpt_fh.fileno())
             for b in H.BUCKETS:
                 s = res["per"][b]; d = agg[key][b]
                 # sum scalar accumulators
@@ -646,6 +677,18 @@ def main():
             engine_pnl_agg[key] += res["engine_pnl"]
             # accumulate the unexplained residual (measured recon quality)
             recon_gap_agg[key] += res["recon_gap"]
+    # ---- CHECKPOINT: pool finished cleanly. Close + rename journal to .done so
+    # a future run starts FRESH (not "resuming" a completed sweep). If the run
+    # had died, this is never reached -> journal stays for the next resume.
+    ckpt_fh.close()
+    _done = ckpt_path.with_suffix(ckpt_path.suffix + ".done")
+    try:
+        if _done.exists():
+            _done.unlink()
+        ckpt_path.rename(_done)
+        print(f"\n  checkpoint complete -> {_done.name}", flush=True)
+    except OSError:
+        pass
     # ---- reporting ----
     print("\n" + "=" * 84)
     print(f"### 2D SKEW SWEEP DONE: {H._fmt(time.perf_counter() - t0)} "
@@ -847,7 +890,6 @@ def main():
         allhold = [h for b in H.BUCKETS for h in a[b]["holds"]]
         rows.append({"exit_ticks": et, "obi_defensive": od, "use_microprice": um,
                      "tol_ticks": tl,
-                     "ofi_depth_levels": OFI_DEPTH_LEVELS,
                      "ofi_window": ("OFF" if ofw is None
                                     else f"min{ofw[0]}ev{ofw[1]:.0f}s"),
                      "ofi_thresh": (float("nan") if ofw is None else oth),
@@ -861,7 +903,7 @@ def main():
                      "median_hold_s": (np.median(allhold) / 1000.0
                                        if allhold else np.nan),
                      "trades": sum(a[b]["trades"] for b in H.BUCKETS)})
-    out = RESULTS / f"skew_sweep_2d_RUNB_L{OFI_DEPTH_LEVELS}_{stamp}.csv"
+    out = RESULTS / f"skew_sweep_2d_RUNB_{stamp}.csv"
     pd.DataFrame(rows).to_csv(out, index=False)
     print(f"\nwrote {out}")
 
@@ -899,8 +941,7 @@ def main():
                     continue
                 bnet, bon, bfills = acc
                 drows.append({
-                    "date": day, "ofi_depth_levels": OFI_DEPTH_LEVELS,
-                    "ofi_window": wlab, "ofi_thresh": tlab,
+                    "date": day, "ofi_window": wlab, "ofi_thresh": tlab,
                     "bucket": b,
                     "net_bps": (1e4 * bnet / bon) if bon > 0 else float("nan"),
                     "net_pkr": bnet, "opened_notional": bon, "fills": bfills,
@@ -918,15 +959,14 @@ def main():
             # portfolio net_pkr + notional for the ALL row
             npkr, on = daily_net[key].get(day, (float("nan"), 0.0))
             drows.append({
-                "date": day, "ofi_depth_levels": OFI_DEPTH_LEVELS,
-                "ofi_window": wlab, "ofi_thresh": tlab,
+                "date": day, "ofi_window": wlab, "ofi_thresh": tlab,
                 "bucket": "ALL",
                 "net_bps": pbps, "net_pkr": npkr, "opened_notional": on,
                 "fills": sum(daily_bkt[key][day][b][2]
                              for b in H.BUCKETS if b in daily_bkt[key][day]),
                 "off_minus_this_bps": diff})
     # write the granular daily CSV
-    dout = RESULTS / f"skew_sweep_2d_RUNB_L{OFI_DEPTH_LEVELS}_DAILY_{stamp}.csv"
+    dout = RESULTS / f"skew_sweep_2d_RUNB_DAILY_{stamp}.csv"
     pd.DataFrame(drows).to_csv(dout, index=False)
     print(f"wrote {dout}  ({len(drows)} rows: per config x day x bucket + ALL)")
 
@@ -948,7 +988,6 @@ def main():
             _b = (lambda x: (1e4 * x / on) if on > 0 else float("nan"))
             nrows.append({
                 "date": day, "symbol": sym,
-                "ofi_depth_levels": OFI_DEPTH_LEVELS,
                 "ofi_window": wlab, "ofi_thresh": tlab, "bucket": b,
                 # net (the headline) in bps + PKR
                 "net_bps": _b(net_pkr), "net_pkr": net_pkr,
@@ -958,7 +997,7 @@ def main():
                 # and markout in bps (the adverse-selection read, per name)
                 "markout_bps": _b(mko_pkr),
                 "opened_notional": on, "fills": fills})
-    nout = RESULTS / f"skew_sweep_2d_RUNB_L{OFI_DEPTH_LEVELS}_PERNAME_{stamp}.csv"
+    nout = RESULTS / f"skew_sweep_2d_RUNB_PERNAME_{stamp}.csv"
     pd.DataFrame(nrows).to_csv(nout, index=False)
     print(f"wrote {nout}  ({len(nrows)} rows: per config x day x name x bucket)")
 
