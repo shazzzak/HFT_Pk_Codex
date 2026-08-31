@@ -155,7 +155,7 @@ JUMP_K = 4.0
 # not 4 hours. Set to None for the FULL ~207-day run ONLY after the canary's
 # anchor reads 0 on all 9 configs and preflight_coverage.py shows all names OK.
 # (Hard lesson: a multi-hour run was burned on an unverified sweep.)
-SMOKE_DAYS = 2
+SMOKE_DAYS = None
 # workers
 WORKERS = 5
 # -----------------------------------------------------------------------------
