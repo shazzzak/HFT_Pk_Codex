@@ -92,18 +92,56 @@ OFI_THRESH = [0.20, 0.40]
 # crossing with OFI windows). None = the mid baseline (unchanged behavior).
 MICRO_LAMBDA = [None]
 # ---- STAGE 4 THROTTLE AXIS (the ONLY axis this sweep varies) ----
-# Each entry is a dict of throttle overrides. Config 1 = OFF (all throttle
-# flags off -> byte-identical to the frozen winner, proven in micro_mm tests).
-# Config 2 = ON: both OBI and OFI throttle active, framing #2 (STACKS on top of
-# obi_defensive which is already True in OBI_MODES). 0.5x clip, 300ms time-box.
+# QDR SWEEP. 8 configs. thr indexes THROTTLE_MODES; THROTTLE_LABELS is the
+# parallel human label written into every CSV (fixes the old bug where every
+# config collapsed to "OFF"). Each dict is merged AFTER build_micro_params.
+#   NONE      = frozen winner, no size throttle at all (the clean reference).
+#   OBIOFI    = the current production throttle (OBI+OFI, 0.5x/300ms) -> the
+#               +0.852 config; the reference for "does QDR add ON TOP".
+#   QDRonly_* = QDR throttle alone (OBI/OFI off), 3 thresholds around 0.40.
+#   QDRstk_*  = QDR stacked on the OBI+OFI throttle, same 3 thresholds.
+# All share the frozen 0.5x clip / 300ms hold so only the QDR trigger varies.
 THROTTLE_MODES = [
-    # ---- OFF: the current production winner, untouched ----
-    {"obi_throttle": False, "ofi_throttle": False},
-    # ---- ON: 0.5x clip on the exposed side, OBI+OFI, 300ms hold ----
+    # NONE -- no throttle (byte-identical to the frozen winner)
+    {"obi_throttle": False, "ofi_throttle": False, "qdr_throttle": False},
+    # OBIOFI -- the current production throttle (the +0.852 winner)
     {"obi_throttle": True, "ofi_throttle": True,
      "throttle_frac": 0.5,
      "obi_throttle_thresh": 0.15, "ofi_throttle_thresh": 0.30,
-     "throttle_hold_ms": 300.0},
+     "throttle_hold_ms": 300.0, "qdr_throttle": False},
+    # QDR alone, threshold 0.30
+    {"obi_throttle": False, "ofi_throttle": False,
+     "qdr_throttle": True, "qdr_throttle_thresh": 0.30,
+     "throttle_frac": 0.5, "throttle_hold_ms": 300.0},
+    # QDR alone, threshold 0.40 (the diagnostic's active level)
+    {"obi_throttle": False, "ofi_throttle": False,
+     "qdr_throttle": True, "qdr_throttle_thresh": 0.40,
+     "throttle_frac": 0.5, "throttle_hold_ms": 300.0},
+    # QDR alone, threshold 0.50
+    {"obi_throttle": False, "ofi_throttle": False,
+     "qdr_throttle": True, "qdr_throttle_thresh": 0.50,
+     "throttle_frac": 0.5, "throttle_hold_ms": 300.0},
+    # QDR stacked on OBI+OFI, threshold 0.30
+    {"obi_throttle": True, "ofi_throttle": True,
+     "obi_throttle_thresh": 0.15, "ofi_throttle_thresh": 0.30,
+     "qdr_throttle": True, "qdr_throttle_thresh": 0.30,
+     "throttle_frac": 0.5, "throttle_hold_ms": 300.0},
+    # QDR stacked on OBI+OFI, threshold 0.40
+    {"obi_throttle": True, "ofi_throttle": True,
+     "obi_throttle_thresh": 0.15, "ofi_throttle_thresh": 0.30,
+     "qdr_throttle": True, "qdr_throttle_thresh": 0.40,
+     "throttle_frac": 0.5, "throttle_hold_ms": 300.0},
+    # QDR stacked on OBI+OFI, threshold 0.50
+    {"obi_throttle": True, "ofi_throttle": True,
+     "obi_throttle_thresh": 0.15, "ofi_throttle_thresh": 0.30,
+     "qdr_throttle": True, "qdr_throttle_thresh": 0.50,
+     "throttle_frac": 0.5, "throttle_hold_ms": 300.0},
+]
+# Parallel labels (one per THROTTLE_MODES entry, same order) -> written to CSVs.
+THROTTLE_LABELS = [
+    "NONE", "OBIOFI",
+    "QDRonly_t30", "QDRonly_t40", "QDRonly_t50",
+    "QDRstk_t30", "QDRstk_t40", "QDRstk_t50",
 ]
 # inventory threshold (lots) beyond which the tick-exit engages
 EXIT_INV_THRESHOLD = 1.0
@@ -117,7 +155,7 @@ JUMP_K = 4.0
 # not 4 hours. Set to None for the FULL ~207-day run ONLY after the canary's
 # anchor reads 0 on all 9 configs and preflight_coverage.py shows all names OK.
 # (Hard lesson: a multi-hour run was burned on an unverified sweep.)
-SMOKE_DAYS = None
+SMOKE_DAYS = 2
 # workers
 WORKERS = 5
 # -----------------------------------------------------------------------------
@@ -539,7 +577,7 @@ def main():
     # restart. The journal is the finest grain; the polished CSVs are still built
     # from the in-memory aggregation at the end (unchanged). File is fixed-named
     # (no stamp) so a resume finds the SAME journal.
-    ckpt_path = RESULTS / "throttle_sweep_CKPT.jsonl"
+    ckpt_path = RESULTS / "throttle_qdr_sweep_CKPT.jsonl"
     # a work item's identity for resume = (date, sym, thr) -- the only varying
     # axes here (everything else is a singleton). Load any already-done keys.
     done_keys = set()
@@ -923,7 +961,7 @@ def main():
         rows.append({"exit_ticks": et, "obi_defensive": od, "use_microprice": um,
                      "tol_ticks": tl,
                      # STAGE 4: the config identity for THIS sweep
-                     "throttle": ("ON" if thr == 1 else "OFF"),
+                     "throttle": THROTTLE_LABELS[thr],
                      "ofi_window": ("OFF" if ofw is None
                                     else f"min{ofw[0]}ev{ofw[1]:.0f}s"),
                      "ofi_thresh": (float("nan") if ofw is None else oth),
@@ -937,7 +975,7 @@ def main():
                      "median_hold_s": (np.median(allhold) / 1000.0
                                        if allhold else np.nan),
                      "trades": sum(a[b]["trades"] for b in H.BUCKETS)})
-    out = RESULTS / f"throttle_sweep_{stamp}.csv"
+    out = RESULTS / f"throttle_qdr_sweep_{stamp}.csv"
     pd.DataFrame(rows).to_csv(out, index=False)
     print(f"\nwrote {out}")
 
@@ -975,7 +1013,7 @@ def main():
                     continue
                 bnet, bon, bfills = acc
                 drows.append({
-                    "date": day, "ofi_window": wlab, "ofi_thresh": tlab,
+                    "date": day, "throttle": THROTTLE_LABELS[thr], "ofi_window": wlab, "ofi_thresh": tlab,
                     "bucket": b,
                     "net_bps": (1e4 * bnet / bon) if bon > 0 else float("nan"),
                     "net_pkr": bnet, "opened_notional": bon, "fills": bfills,
@@ -993,14 +1031,14 @@ def main():
             # portfolio net_pkr + notional for the ALL row
             npkr, on = daily_net[key].get(day, (float("nan"), 0.0))
             drows.append({
-                "date": day, "ofi_window": wlab, "ofi_thresh": tlab,
+                "date": day, "throttle": THROTTLE_LABELS[thr], "ofi_window": wlab, "ofi_thresh": tlab,
                 "bucket": "ALL",
                 "net_bps": pbps, "net_pkr": npkr, "opened_notional": on,
                 "fills": sum(daily_bkt[key][day][b][2]
                              for b in H.BUCKETS if b in daily_bkt[key][day]),
                 "off_minus_this_bps": diff})
     # write the granular daily CSV
-    dout = RESULTS / f"throttle_sweep_DAILY_{stamp}.csv"
+    dout = RESULTS / f"throttle_qdr_sweep_DAILY_{stamp}.csv"
     pd.DataFrame(drows).to_csv(dout, index=False)
     print(f"wrote {dout}  ({len(drows)} rows: per config x day x bucket + ALL)")
 
@@ -1022,6 +1060,7 @@ def main():
             _b = (lambda x: (1e4 * x / on) if on > 0 else float("nan"))
             nrows.append({
                 "date": day, "symbol": sym,
+                "throttle": THROTTLE_LABELS[thr],
                 "ofi_window": wlab, "ofi_thresh": tlab, "bucket": b,
                 # net (the headline) in bps + PKR
                 "net_bps": _b(net_pkr), "net_pkr": net_pkr,
@@ -1031,7 +1070,7 @@ def main():
                 # and markout in bps (the adverse-selection read, per name)
                 "markout_bps": _b(mko_pkr),
                 "opened_notional": on, "fills": fills})
-    nout = RESULTS / f"throttle_sweep_PERNAME_{stamp}.csv"
+    nout = RESULTS / f"throttle_qdr_sweep_PERNAME_{stamp}.csv"
     pd.DataFrame(nrows).to_csv(nout, index=False)
     print(f"wrote {nout}  ({len(nrows)} rows: per config x day x name x bucket)")
 

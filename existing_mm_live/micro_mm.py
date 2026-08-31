@@ -226,6 +226,11 @@ class MicrostructureMM:
                  obi_throttle_thresh=0.15,
                  # OFI engage threshold on the normalized [-1,+1] trailing OFI
                  ofi_throttle_thresh=0.30,
+                 # QDR SIZE THROTTLE: on/off + the fraction of the own-side touch
+                 # queue eaten in ONE event (at a stable price) that trips the
+                 # cut. 0.40 is where the diagnostic's toxic depletion mass sits.
+                 qdr_throttle=False,
+                 qdr_throttle_thresh=0.40,
                  # time-box (ms of EXCHANGE time): a triggered side stays
                  # throttled this long, then restores. Brackets the 100-500ms
                  # window from the throttle diagnostic. 0 => only the trigger
@@ -365,6 +370,15 @@ class MicrostructureMM:
         # until self.now passes them (this implements the time-box).
         self._throttle_buy_until = None
         self._throttle_sell_until = None
+        # --- QDR SIZE THROTTLE state (default off -> byte-identical) ---
+        # on/off switch and the depletion fraction that trips the cut
+        self.qdr_throttle = qdr_throttle
+        self.qdr_throttle_thresh = float(qdr_throttle_thresh)
+        # previous-event touch, needed for the event-to-event depletion math
+        self._qdr_prev_bb = None
+        self._qdr_prev_bq = 0.0
+        self._qdr_prev_ba = None
+        self._qdr_prev_aq = 0.0
         # trailing (ts_ms, ofi_increment) events; evicted by the time cap on
         # update, capped to the last N events at READ time (min-window semantics)
         self._ofi_events = deque()
@@ -1008,16 +1022,40 @@ class MicrostructureMM:
                 self._ofi_update_depth(depth)
             # the normalized signal for the throttle path
             ofi_sig = self._ofi_signal()
-        # BUY-side trigger: adverse OBI (ask-heavy) or adverse OFI (selling flow)
+        # --- QDR SIZE THROTTLE: own-side touch queue being eaten fast at an
+        # UNCHANGED best price => imminent adverse move on that side. Computed
+        # event-to-event (quotes() runs every event), the SAME definition as the
+        # feature builder. Default off (qdr_throttle=False) => qdr_*_trig stay
+        # False and prev-touch is never updated => byte-identical to before.
+        qdr_buy_trig = False
+        qdr_sell_trig = False
+        if self.qdr_throttle:
+            # fraction of the BID queue that vanished since last event at a stable best-bid
+            qdr_bid = ((self._qdr_prev_bq - bq) / self._qdr_prev_bq) \
+                if (self._qdr_prev_bb is not None and bb == self._qdr_prev_bb
+                    and self._qdr_prev_bq > 0 and bq < self._qdr_prev_bq) else 0.0
+            # fraction of the ASK queue that vanished since last event at a stable best-ask
+            qdr_ask = ((self._qdr_prev_aq - aq) / self._qdr_prev_aq) \
+                if (self._qdr_prev_ba is not None and ba == self._qdr_prev_ba
+                    and self._qdr_prev_aq > 0 and aq < self._qdr_prev_aq) else 0.0
+            # bid eaten fast => protect the BUY side; ask eaten fast => protect the SELL side
+            qdr_buy_trig = qdr_bid >= self.qdr_throttle_thresh
+            qdr_sell_trig = qdr_ask >= self.qdr_throttle_thresh
+            # remember THIS touch for the next event's depletion computation
+            self._qdr_prev_bb, self._qdr_prev_bq = bb, bq
+            self._qdr_prev_ba, self._qdr_prev_aq = ba, aq
+        # BUY-side trigger: adverse OBI (ask-heavy), adverse OFI (selling flow), or fast bid depletion
         buy_trig = ((self.obi_throttle
                      and (0.5 - imb) > self.obi_throttle_thresh)
                     or (self.ofi_throttle and ofi_sig is not None
-                        and ofi_sig < -self.ofi_throttle_thresh))
-        # SELL-side trigger: adverse OBI (bid-heavy) or adverse OFI (buying flow)
+                        and ofi_sig < -self.ofi_throttle_thresh)
+                    or qdr_buy_trig)
+        # SELL-side trigger: adverse OBI (bid-heavy), adverse OFI (buying flow), or fast ask depletion
         sell_trig = ((self.obi_throttle
                       and (imb - 0.5) > self.obi_throttle_thresh)
                      or (self.ofi_throttle and ofi_sig is not None
-                         and ofi_sig > self.ofi_throttle_thresh))
+                         and ofi_sig > self.ofi_throttle_thresh)
+                     or qdr_sell_trig)
         # time-box: a fresh trigger (re)arms the hold to now+hold_ms; with
         # hold_ms=0 the hold expires immediately (only the trigger cycle cut)
         if buy_trig:
