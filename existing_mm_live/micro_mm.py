@@ -231,6 +231,11 @@ class MicrostructureMM:
                  # cut. 0.40 is where the diagnostic's toxic depletion mass sits.
                  qdr_throttle=False,
                  qdr_throttle_thresh=0.40,
+                 # POV ACQUISITION CAP: when True, cap the max acquirable |pos| at
+                 # the shares still unwind-able by the close (min(max_inv,
+                 # pov_capacity x pov_cap_mult)). Default off -> byte-identical.
+                 enable_pov_cap=False,
+                 pov_cap_mult=1.0,
                  # time-box (ms of EXCHANGE time): a triggered side stays
                  # throttled this long, then restores. Brackets the 100-500ms
                  # window from the throttle diagnostic. 0 => only the trigger
@@ -297,6 +302,26 @@ class MicrostructureMM:
         self.unwind_profile = unwind_profile
         # participation cap: we never assume more than this share of market volume
         self.unwind_pov = unwind_pov
+        # ---- POV ACQUISITION CAP (new; default off -> byte-identical) ----
+        # master switch for the time-decaying acquisition cap
+        self.enable_pov_cap = enable_pov_cap
+        # pov_cap_mult scales the ACQUISITION cap ONLY. Rationale for a separate
+        # knob (rather than just sweeping unwind_pov):
+        #   * unwind_pov (fixed, currently a hardcoded 0.10 -- an ASSUMED standard
+        #     participation rate, NOT a swept/tuned value) also drives the EXIT
+        #     trigger in _unwind_needed (my_rate = exp_vol * unwind_pov). Changing
+        #     unwind_pov would move WHEN we start liquidating as well as the cap,
+        #     confounding the two effects.
+        #   * pov_cap_mult moves the cap alone, leaving the exit trigger pinned at
+        #     the production unwind_pov. So the cap's effective participation is
+        #     (unwind_pov * pov_cap_mult): mult 0.5 -> ~5%, 1.0 -> 10%, 2.0 -> 20%,
+        #     while the exit keeps firing at the real unwind_pov regardless.
+        #   * mult 1.0 = SZ's original idea (hold exactly one close-out's worth);
+        #     <1 = safety margin against a volume shortfall; >1 = looser, lean on
+        #     the exit unwind to claw back the overflow.
+        # (NOTE: unwind_pov itself is untested -> a separate future sweep, since it
+        #  would deliberately move the exit trigger, unlike this cap-only knob.)
+        self.pov_cap_mult = float(pov_cap_mult)
         # the day's continuous-trading segments [(start_ms, end_ms), ...]; REQUIRED
         # when unwind_profile is set (Friday's Jumu'ah break makes wall-clock time
         # WRONG -- tradeable minutes must be summed over segments)
@@ -539,10 +564,14 @@ class MicrostructureMM:
     #   My Trades/Min   : Shares/Min x POV      (never assume >POV of the tape)
     #   Time Needed     : |inventory| / My Trades/Min
     #   engage unwind  <=> Time Needed >= tradeable minutes left (the "Ramp" cell)
-    def _unwind_needed(self, pos):
-        # tradeable minutes remaining: sum of the overlap of [now, end] with each
-        # continuous segment -- NOT wall clock (Friday's Jumu'ah break must not
-        # count as sellable time)
+    def _expvol_minsleft(self):
+        # SHARED by the exit-side unwind trigger AND the acquisition-side POV cap.
+        # Returns (exp_vol, left_min): exp_vol = the volume-profile-weighted
+        # expected shares/min over the tradeable time remaining (the MIN(I,H)
+        # close-backward back-fill), left_min = tradeable minutes remaining.
+        # exp_vol is None when no tradeable time remains OR the tape is dead.
+        # tradeable minutes remaining: overlap of [now, end] with each continuous
+        # segment -- NOT wall clock (Friday's Jumu'ah break is not sellable time)
         left_ms = 0
         # total tradeable ms this day (for the Middle bucket's total length)
         total_ms = 0
@@ -554,13 +583,11 @@ class MicrostructureMM:
                 left_ms += (e - max(self.now, s))
         # minutes remaining
         left_min = left_ms / 60000.0
-        # nothing tradeable left -> cannot clear passively; engage if holding
+        # nothing tradeable left
         if left_min <= 0.0:
-            return True
-        # bucket TOTALS for this day. 4-bucket profile (2026-08-20): the measured
-        # close ramp starts ~60min out (1.3x/1.4x/1.8x midday), so a PreClose45
-        # zone (minutes 60->15) sits between Middle and Last15. A 3-tuple profile
-        # still works (PreClose45 collapses into Middle -- the old model).
+            return None, left_min
+        # bucket TOTALS for this day. 4-bucket profile: PreClose45 zone (minutes
+        # 60->15) sits between Middle and Last15; a 3-tuple collapses it into Middle.
         total_min = total_ms / 60000.0
         if len(self.unwind_profile) == 4:
             vf, vm, vp, vl = self.unwind_profile
@@ -580,8 +607,17 @@ class MicrostructureMM:
         a_first = max(0.0, left_min - a_last - a_pre - a_mid)
         # ---- weighted-average expected shares/min over the remaining time ----
         exp_vol = (a_first * vf + a_mid * vm + a_pre * vp + a_last * vl) / left_min
-        # a dead tape -> cannot clear passively; engage
+        # a dead tape
         if exp_vol <= 0.0:
+            return None, left_min
+        return exp_vol, left_min
+
+    def _unwind_needed(self, pos):
+        # EXIT trigger (behavior unchanged): engage the unwind when the CURRENT
+        # position can no longer be passively cleared in the time left at our POV.
+        exp_vol, left_min = self._expvol_minsleft()
+        # no tradeable time or dead tape -> cannot clear passively; engage if holding
+        if left_min <= 0.0 or exp_vol is None:
             return True
         # our clearable rate at the participation cap
         my_rate = exp_vol * self.unwind_pov
@@ -589,6 +625,19 @@ class MicrostructureMM:
         mins_needed = abs(pos) / my_rate
         # the sheet's Normal/Ramp decision
         return mins_needed >= left_min
+
+    def _pov_capacity(self):
+        # ACQUISITION cap (new): the MOST inventory (shares) we could still clear
+        # passively by the close at our participation rate over the remaining time:
+        #   capacity = my_rate x minutes_left = exp_vol x unwind_pov x left_min
+        # Identical volume-profile weighting as the exit side, so the cap decays
+        # through the day as the high-volume buckets fall behind. 0 => no capacity.
+        exp_vol, left_min = self._expvol_minsleft()
+        # no tradeable time / dead tape -> no remaining capacity
+        if left_min <= 0.0 or exp_vol is None:
+            return 0.0
+        # shares still clearable before the bell at our POV
+        return exp_vol * self.unwind_pov * left_min
 
     # ---- EOD / LOCK trigger state (one call per quote cycle) ----------------
     def _trigger_state(self, bb, ba, pos):
@@ -1130,6 +1179,18 @@ class MicrostructureMM:
         # spread is too tight for profitable quoting -- during the unwind we are
         # deliberately paying edge to get flat (min_edge is waived on the exit side).
         trig = self._trigger_state(bb, ba, pos)
+        # POV ACQUISITION CAP: the effective inventory ceiling for THIS quote. Off
+        # -> the static max_inv (byte-identical). On -> min(max_inv, capacity),
+        # where capacity is the shares we can still passively unwind by the close;
+        # it shrinks through the day, throttling late-session accumulation at the
+        # source (needs the unwind profile + session segments, same as the exit).
+        eff_max = self.max_inv
+        if self.enable_pov_cap and self.unwind_profile is not None \
+                and self.session_segments is not None:
+            # scale the raw capacity by the sweep multiplier
+            cap = self._pov_capacity() * self.pov_cap_mult
+            # never exceed the static ceiling; the tighter of the two binds
+            eff_max = min(self.max_inv, cap)
         # INVENTORY-EXIT bypass: when we are holding past the exit threshold and
         # the exit skew is active, the exit side is trying to GET FLAT -- the same
         # "getting flat > earning edge" logic as the EOD unwind. So it may post on
@@ -1222,7 +1283,7 @@ class MicrostructureMM:
         out = {}
         # Bid unless: trigger-killed, long at the hard cap, or long past the soft
         # band (past +soft_inv we stop buying so fills can only reduce a long).
-        if (not trig["kill_buy"]) and pos < self.max_inv \
+        if (not trig["kill_buy"]) and pos < eff_max \
                 and (self.soft_inv is None or pos < self.soft_inv):
             # Floor onto the tick grid so rounding never makes us more aggressive.
             px = math.floor((reservation - half_buy) / self.tick) * self.tick
@@ -1284,7 +1345,7 @@ class MicrostructureMM:
             out["BUY"] = (round(px, 2), size_buy)
         # Offer unless: trigger-killed, short at the hard cap, or short past the
         # soft band (past -soft_inv we stop selling so only the bid remains).
-        if (not trig["kill_sell"]) and pos > -self.max_inv \
+        if (not trig["kill_sell"]) and pos > -eff_max \
                 and (self.soft_inv is None or pos > -self.soft_inv):
             # Ceil onto the tick grid (again, never more aggressive).
             px = math.ceil((reservation + half_sell) / self.tick) * self.tick

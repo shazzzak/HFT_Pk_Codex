@@ -91,67 +91,30 @@ OFI_THRESH = [0.20, 0.40]
 # convert 'through' fills into 'at_queue'. Swept only on the OFF config (no
 # crossing with OFI windows). None = the mid baseline (unchanged behavior).
 MICRO_LAMBDA = [None]
-# ---- STAGE 4 THROTTLE AXIS (the ONLY axis this sweep varies) ----
-# QDR SWEEP. 8 configs. thr indexes THROTTLE_MODES; THROTTLE_LABELS is the
-# parallel human label written into every CSV (fixes the old bug where every
-# config collapsed to "OFF"). Each dict is merged AFTER build_micro_params.
-#   NONE      = frozen winner, no size throttle at all (the clean reference).
-#   OBIOFI    = the current production throttle (OBI+OFI, 0.5x/300ms) -> the
-#               +0.852 config; the reference for "does QDR add ON TOP".
-#   QDRonly_* = QDR throttle alone (OBI/OFI off), 3 thresholds around 0.40.
-#   QDRstk_*  = QDR stacked on the OBI+OFI throttle, same 3 thresholds.
-# All share the frozen 0.5x clip / 300ms hold so only the QDR trigger varies.
+# ---- POV ACQUISITION-CAP SWEEP (does capping late inventory by unwind capacity help?) ----
+# Base = current production: OBI throttle (0.5x/300ms), OFI OFF. When the cap is
+# on, max acquirable |pos| = min(max_inv, unwind_capacity x mult); mult scales how
+# many unwind-capacities of inventory you allow to build. NONE = no-throttle anchor.
+_POV_MULT = [0.5, 1.0, 1.5, 2.0]
+_OBI = dict(obi_throttle=True, ofi_throttle=False, obi_throttle_thresh=0.15,
+            throttle_frac=0.5, throttle_hold_ms=300.0, qdr_throttle=False)
 THROTTLE_MODES = [
-    # NONE -- no throttle (byte-identical to the frozen winner)
-    {"obi_throttle": False, "ofi_throttle": False, "qdr_throttle": False},
-    # OBIOFI -- the current production throttle (the +0.852 winner)
-    {"obi_throttle": True, "ofi_throttle": True,
-     "throttle_frac": 0.5,
-     "obi_throttle_thresh": 0.15, "ofi_throttle_thresh": 0.30,
-     "throttle_hold_ms": 300.0, "qdr_throttle": False},
-    # QDR alone, threshold 0.30
-    {"obi_throttle": False, "ofi_throttle": False,
-     "qdr_throttle": True, "qdr_throttle_thresh": 0.30,
-     "throttle_frac": 0.5, "throttle_hold_ms": 300.0},
-    # QDR alone, threshold 0.40 (the diagnostic's active level)
-    {"obi_throttle": False, "ofi_throttle": False,
-     "qdr_throttle": True, "qdr_throttle_thresh": 0.40,
-     "throttle_frac": 0.5, "throttle_hold_ms": 300.0},
-    # QDR alone, threshold 0.50
-    {"obi_throttle": False, "ofi_throttle": False,
-     "qdr_throttle": True, "qdr_throttle_thresh": 0.50,
-     "throttle_frac": 0.5, "throttle_hold_ms": 300.0},
-    # QDR stacked on OBI+OFI, threshold 0.30
-    {"obi_throttle": True, "ofi_throttle": True,
-     "obi_throttle_thresh": 0.15, "ofi_throttle_thresh": 0.30,
-     "qdr_throttle": True, "qdr_throttle_thresh": 0.30,
-     "throttle_frac": 0.5, "throttle_hold_ms": 300.0},
-    # QDR stacked on OBI+OFI, threshold 0.40
-    {"obi_throttle": True, "ofi_throttle": True,
-     "obi_throttle_thresh": 0.15, "ofi_throttle_thresh": 0.30,
-     "qdr_throttle": True, "qdr_throttle_thresh": 0.40,
-     "throttle_frac": 0.5, "throttle_hold_ms": 300.0},
-    # QDR stacked on OBI+OFI, threshold 0.50
-    {"obi_throttle": True, "ofi_throttle": True,
-     "obi_throttle_thresh": 0.15, "ofi_throttle_thresh": 0.30,
-     "qdr_throttle": True, "qdr_throttle_thresh": 0.50,
-     "throttle_frac": 0.5, "throttle_hold_ms": 300.0},
+    {"obi_throttle": False, "ofi_throttle": False, "qdr_throttle": False,
+     "enable_pov_cap": False},
+    dict(_OBI, enable_pov_cap=False),
 ]
-# Parallel labels (one per THROTTLE_MODES entry, same order) -> written to CSVs.
-THROTTLE_LABELS = [
-    "NONE", "OBIOFI",
-    "QDRonly_t30", "QDRonly_t40", "QDRonly_t50",
-    "QDRstk_t30", "QDRstk_t40", "QDRstk_t50",
-]
+THROTTLE_LABELS = ["NONE", "OBI"]
+for _m in _POV_MULT:
+    THROTTLE_MODES.append(dict(_OBI, enable_pov_cap=True, pov_cap_mult=_m))
+    THROTTLE_LABELS.append(f"OBI+POVm{_m:g}")
 # Correct config label for the printed summaries (thr indexes THROTTLE_MODES).
 def _cfg_lab(thr):
     return THROTTLE_LABELS[thr]
-# Correct threshold column for the printed summaries: the QDR threshold when the
-# config uses QDR, else "-" (NONE / OBIOFI have no QDR threshold to show).
+# Threshold column: the POV capacity multiplier when the cap is on, else "-".
 def _cfg_thr(thr):
     m = THROTTLE_MODES[thr]
-    return f"{m['qdr_throttle_thresh']:.2f}" if m.get("qdr_throttle") else "-"
-# inventory threshold (lots) beyond which the tick-exit engages
+    return f"m{m['pov_cap_mult']:g}" if m.get("enable_pov_cap") else "-"
+
 EXIT_INV_THRESHOLD = 1.0
 # OBI-defensive engage threshold (|imb-0.5|) and widen ticks
 OBI_DEF_THRESH = 0.15
@@ -163,7 +126,7 @@ JUMP_K = 4.0
 # not 4 hours. Set to None for the FULL ~207-day run ONLY after the canary's
 # anchor reads 0 on all 9 configs and preflight_coverage.py shows all names OK.
 # (Hard lesson: a multi-hour run was burned on an unverified sweep.)
-SMOKE_DAYS = None
+SMOKE_DAYS = 60
 # workers
 WORKERS = 9
 # -----------------------------------------------------------------------------
@@ -585,7 +548,7 @@ def main():
     # restart. The journal is the finest grain; the polished CSVs are still built
     # from the in-memory aggregation at the end (unchanged). File is fixed-named
     # (no stamp) so a resume finds the SAME journal.
-    ckpt_path = RESULTS / "throttle_qdr_sweep_CKPT.jsonl"
+    ckpt_path = RESULTS / "throttle_pov_sweep_CKPT.jsonl"
     # a work item's identity for resume = (date, sym, thr) -- the only varying
     # axes here (everything else is a singleton). Load any already-done keys.
     done_keys = set()
@@ -615,7 +578,7 @@ def main():
     # open the journal in APPEND mode for this session (line-buffered so every
     # write hits disk promptly; we also flush explicitly per cell)
     ckpt_fh = open(ckpt_path, "a", buffering=1)
-    print(f"\nSTAGE 4 -- OBI+OFI size-throttle sweep (winner frozen "
+    print(f"\nPOV CAP -- OBI throttle + POV acquisition-cap sweep (winner frozen "
           f"et1/obi+/tol0/mid, OFI-defensive off; framing #2 = throttle STACKS "
           f"on obi_defensive): OFF vs ON = {len(configs)} configs",
           flush=True)
@@ -966,9 +929,8 @@ def main():
                      "tol_ticks": tl,
                      # STAGE 4: the config identity for THIS sweep
                      "throttle": THROTTLE_LABELS[thr],
-                     "ofi_window": ("OFF" if ofw is None
-                                    else f"min{ofw[0]}ev{ofw[1]:.0f}s"),
-                     "ofi_thresh": (float("nan") if ofw is None else oth),
+                     "ofi_window": _cfg_lab(thr),
+                     "ofi_thresh": _cfg_thr(thr),
                      "net_bps": (1e4 * net / on) if on > 0 else np.nan,
                      # TOTAL P&L in PKR: the measured net (== engine P&L, since
                      # reconciliation is exact) and the engine's own figure as a
@@ -979,7 +941,7 @@ def main():
                      "median_hold_s": (np.median(allhold) / 1000.0
                                        if allhold else np.nan),
                      "trades": sum(a[b]["trades"] for b in H.BUCKETS)})
-    out = RESULTS / f"throttle_qdr_sweep_{stamp}.csv"
+    out = RESULTS / f"throttle_pov_sweep_{stamp}.csv"
     pd.DataFrame(rows).to_csv(out, index=False)
     print(f"\nwrote {out}")
 
@@ -1003,9 +965,8 @@ def main():
     for (et, od, um, tl, ofw, oth, mlam, thr) in configs:
         key = (et, od, um, tl, ofw, oth, mlam, thr)
         # config labels
-        wlab = ((f"OFF lam{mlam:+.1f}" if mlam is not None else "OFF")
-                if ofw is None else f"min{ofw[0]}ev{ofw[1]:.0f}s")
-        tlab = (float("nan") if ofw is None else oth)
+        wlab = _cfg_lab(thr)
+        tlab = _cfg_thr(thr)
         # portfolio per-day bps for this config (for the ALL row + diff)
         port = _port_day_bps(key)
         # every day this config produced
@@ -1042,7 +1003,7 @@ def main():
                              for b in H.BUCKETS if b in daily_bkt[key][day]),
                 "off_minus_this_bps": diff})
     # write the granular daily CSV
-    dout = RESULTS / f"throttle_qdr_sweep_DAILY_{stamp}.csv"
+    dout = RESULTS / f"throttle_pov_sweep_DAILY_{stamp}.csv"
     pd.DataFrame(drows).to_csv(dout, index=False)
     print(f"wrote {dout}  ({len(drows)} rows: per config x day x bucket + ALL)")
 
@@ -1055,9 +1016,8 @@ def main():
     nrows = []
     for (et, od, um, tl, ofw, oth, mlam, thr) in configs:
         key = (et, od, um, tl, ofw, oth, mlam, thr)
-        wlab = ((f"OFF lam{mlam:+.1f}" if mlam is not None else "OFF")
-                if ofw is None else f"min{ofw[0]}ev{ofw[1]:.0f}s")
-        tlab = (float("nan") if ofw is None else oth)
+        wlab = _cfg_lab(thr)
+        tlab = _cfg_thr(thr)
         for (day, sym, b), acc in name_bkt[key].items():
             net_pkr, cap_pkr, mko_pkr, liq_pkr, fee_pkr, on, fills = acc
             # bps helper for this row
@@ -1074,7 +1034,7 @@ def main():
                 # and markout in bps (the adverse-selection read, per name)
                 "markout_bps": _b(mko_pkr),
                 "opened_notional": on, "fills": fills})
-    nout = RESULTS / f"throttle_qdr_sweep_PERNAME_{stamp}.csv"
+    nout = RESULTS / f"throttle_pov_sweep_PERNAME_{stamp}.csv"
     pd.DataFrame(nrows).to_csv(nout, index=False)
     print(f"wrote {nout}  ({len(nrows)} rows: per config x day x name x bucket)")
 

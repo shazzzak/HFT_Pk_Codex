@@ -1,0 +1,274 @@
+[12:06:27] pre-pass: calibration + trailing median trade size
+  pre-pass 50/207  0m12s
+  pre-pass 100/207  0m23s
+  pre-pass 150/207  0m35s
+  pre-pass 200/207  0m46s
+  pre-pass 207/207  0m48s
+[12:07:15] [inv] 38 names x 30 dates (sampled), 9 workers
+[12:10:10]   date 1/30 done  (38 sym-days, 2.9 min)
+[12:10:23]   date 2/30 done  (60 sym-days, 3.1 min)
+[12:10:32]   date 3/30 done  (98 sym-days, 3.3 min)
+[12:10:54]   date 4/30 done  (136 sym-days, 3.6 min)
+[12:10:58]   date 5/30 done  (174 sym-days, 3.7 min)
+[12:11:06]   date 6/30 done  (212 sym-days, 3.8 min)
+[12:11:09]   date 7/30 done  (250 sym-days, 3.9 min)
+[12:11:35]   date 8/30 done  (288 sym-days, 4.3 min)
+[12:11:54]   date 9/30 done  (326 sym-days, 4.6 min)
+[12:13:51]   date 10/30 done  (364 sym-days, 6.6 min)
+[12:14:10]   date 11/30 done  (402 sym-days, 6.9 min)
+[12:14:22]   date 12/30 done  (440 sym-days, 7.1 min)
+[12:14:59]   date 13/30 done  (478 sym-days, 7.7 min)
+[12:15:34]   date 14/30 done  (516 sym-days, 8.3 min)
+[12:15:35]   date 15/30 done  (554 sym-days, 8.3 min)
+[12:15:47]   date 16/30 done  (592 sym-days, 8.5 min)
+[12:15:59]   date 17/30 done  (630 sym-days, 8.7 min)
+[12:16:56]   date 18/30 done  (668 sym-days, 9.7 min)
+[12:17:37]   date 19/30 done  (706 sym-days, 10.4 min)
+[12:17:58]   date 20/30 done  (744 sym-days, 10.7 min)
+[12:17:59]   date 21/30 done  (782 sym-days, 10.7 min)
+[12:18:10]   date 22/30 done  (820 sym-days, 10.9 min)
+[12:18:46]   date 23/30 done  (858 sym-days, 11.5 min)
+[12:18:49]   date 24/30 done  (896 sym-days, 11.6 min)
+[12:19:36]   date 25/30 done  (934 sym-days, 12.3 min)
+[12:20:13]   date 26/30 done  (972 sym-days, 13.0 min)
+[12:20:17]   date 27/30 done  (1010 sym-days, 13.0 min)
+[12:20:23]   date 28/30 done  (1048 sym-days, 13.1 min)
+[12:20:30]   date 29/30 done  (1086 sym-days, 13.3 min)
+[12:21:29]   date 30/30 done  (1124 sym-days, 14.2 min)
+[12:21:29] ===== INVENTORY PROFILE (pooled over symbol-days) =====
+[12:21:29]   peak |pos| (clips):     median 2.34  p90 3.49  max 10.96
+[12:21:29]   soft_inv = 3 clips, max_inv = 10 clips
+[12:21:29]   frac of day past soft_inv:  mean 0.1%
+[12:21:29]   frac of day pinned at ceiling: mean 0.00%
+[12:21:29]   EOD |pos| (clips):      median 0.52  p90 0.93
+[12:21:29]   days ending net SHORT:  39.9%   (mean EOD signed clips +0.14)
+[12:21:29] [inv] outputs -> /Users/shazzak/Capital Stake - Results/diagnostics
+pre-pass: calibration + trailing median trade size
+  pre-pass 50/207  0m11s
+  pre-pass 100/207  0m23s
+  pre-pass 150/207  0m34s
+  pre-pass 200/207  0m45s
+  pre-pass 207/207  0m47s
+  13680 cells to run this session (13680 total, 0 already journaled).
+
+SOFT_INV -- soft-inventory band sweep (OBI throttle on) (winner frozen et1/obi+/tol0/mid, OFI-defensive off; framing #2 = throttle STACKS on obi_defensive): OFF vs ON = 6 configs
+  x 38 names x 60 days = 13680 cells
+  workers: 9
+
+  200/13680  2m29s  ETA 168m22s
+  400/13680  4m20s  ETA 144m11s
+  600/13680  6m06s  ETA 133m10s
+  800/13680  8m03s  ETA 129m40s
+  1000/13680  10m13s  ETA 129m33s
+  1200/13680  12m39s  ETA 131m40s
+  1400/13680  14m48s  ETA 129m51s
+  1600/13680  16m30s  ETA 124m36s
+  1800/13680  18m34s  ETA 122m34s
+  2000/13680  20m41s  ETA 120m49s
+  2200/13680  22m58s  ETA 119m50s
+  2400/13680  25m10s  ETA 118m20s
+  2600/13680  27m34s  ETA 117m31s
+  2800/13680  30m09s  ETA 117m11s
+  3000/13680  32m23s  ETA 115m20s
+  3200/13680  34m46s  ETA 113m51s
+  3400/13680  37m22s  ETA 113m01s
+  3600/13680  39m59s  ETA 111m59s
+  3800/13680  42m19s  ETA 110m03s
+  4000/13680  44m43s  ETA 108m14s
+  4200/13680  47m00s  ETA 106m06s
+  4400/13680  49m33s  ETA 104m31s
+  4600/13680  51m50s  ETA 102m20s
+  4800/13680  54m33s  ETA 100m56s
+  5000/13680  57m07s  ETA 99m10s
+  5200/13680  59m43s  ETA 97m23s
+  5400/13680  61m53s  ETA 94m54s
+  5600/13680  64m14s  ETA 92m40s
+  5800/13680  66m15s  ETA 90m00s
+  6000/13680  68m37s  ETA 87m49s
+  6200/13680  70m52s  ETA 85m30s
+  6400/13680  73m09s  ETA 83m13s
+  6600/13680  75m35s  ETA 81m05s
+  6800/13680  77m40s  ETA 78m35s
+  7000/13680  79m27s  ETA 75m49s
+  7200/13680  81m32s  ETA 73m23s
+  7400/13680  83m25s  ETA 70m47s
+  7600/13680  85m52s  ETA 68m41s
+  7800/13680  87m46s  ETA 66m09s
+  8000/13680  89m52s  ETA 63m48s
+  8200/13680  92m04s  ETA 61m31s
+  8400/13680  94m10s  ETA 59m11s
+  8600/13680  96m18s  ETA 56m53s
+  8800/13680  98m25s  ETA 54m34s
+  9000/13680  100m17s  ETA 52m09s
+  9200/13680  102m19s  ETA 49m49s
+  9400/13680  104m16s  ETA 47m28s
+  9600/13680  106m18s  ETA 45m10s
+  9800/13680  108m18s  ETA 42m52s
+  10000/13680  110m15s  ETA 40m34s
+  10200/13680  112m06s  ETA 38m15s
+  10400/13680  114m05s  ETA 35m59s
+  10600/13680  115m58s  ETA 33m41s
+  10800/13680  118m04s  ETA 31m29s
+  11000/13680  120m15s  ETA 29m17s
+  11200/13680  122m06s  ETA 27m02s
+  11400/13680  124m02s  ETA 24m48s
+  11600/13680  125m51s  ETA 22m34s
+  11800/13680  127m26s  ETA 20m18s
+  12000/13680  129m17s  ETA 18m06s
+  12200/13680  130m57s  ETA 15m53s
+  12400/13680  132m48s  ETA 13m42s
+  12600/13680  135m15s  ETA 11m35s
+  12800/13680  138m12s  ETA 9m30s
+  13000/13680  140m39s  ETA 7m21s
+  13200/13680  142m55s  ETA 5m11s
+  13400/13680  145m25s  ETA 3m02s
+  13600/13680  148m06s  ETA 0m52s
+  13680/13680  149m14s  ETA 0m00s
+
+  checkpoint complete -> soft_inv_sweep_CKPT.jsonl.done
+
+====================================================================================
+### 2D SKEW SWEEP DONE: 149m14s for 13680 cells ###
+====================================================================================
+
+=== SUMMARY: OFI-defensive configs (winner frozen: et1/obi+/tol0) ===
+    ofi_window  thresh   net_bps       net_PKR
+         soft3      3x     2.180       896,778
+         soft1      1x     2.175       849,975
+         soft2      2x     2.164       884,725
+         soft5      5x     2.159       888,740
+         soft8      8x     2.171       893,903
+        soft10     10x     2.171       893,903
+
+=== DAY-AS-UNIT net_bps: mean +/- SE (each day = one observation) ===
+    ofi_window  thresh  n_days  mean_bps      se
+         soft3      3x      60     2.107   0.323
+         soft1      1x      60     2.092   0.331
+         soft2      2x      60     2.091   0.317
+         soft5      5x      60     2.090   0.322
+         soft8      8x      60     2.102   0.324
+        soft10     10x      60     2.102   0.324
+
+=== control(soft3) - config (PAIRED by day): positive => current wins ===
+        config  thresh  n_pair    d_bps      se       t
+         soft1      1x      60    0.015   0.090    0.17
+         soft2      2x      60    0.016   0.047    0.34
+         soft5      5x      60    0.018   0.034    0.52
+         soft8      8x      60    0.005   0.035    0.15
+        soft10     10x      60    0.005   0.035    0.15
+  (|t| >~ 2 => the gap vs NONE is beyond day-to-day noise)
+
+=== RECONCILIATION ANCHOR: MEASURED decomposition vs engine P&L ===
+    ofi_window  thresh     measured_net       engine_pnl   unexplained     pct   ok?
+         soft3      3x          896,778          896,778             0    0.0%    OK
+         soft1      1x          849,975          849,975             0    0.0%    OK
+         soft2      2x          884,725          884,725             0    0.0%    OK
+         soft5      5x          888,740          888,740             0    0.0%    OK
+         soft8      8x          893,903          893,903             0    0.0%    OK
+        soft10     10x          893,903          893,903             0    0.0%    OK
+
+====================================================================================
+CONFIG: et=1 obi=True tol=0.0   throttle=soft3 thresh=3x
+====================================================================================
+bucket       cap_bps  mko_bps  jmp_bps  dif_bps  fee_bps  liq_bps   unexpl  net_bps     net_pkr  med_hld mean_hld med_tks_mid  thr%   trades   sh/trd
+first15        6.234   -1.133    0.137   -1.207   -1.554   -0.451   -0.000    3.096     136,352     47.5    330.8        4.00    81   21,129      594
+middle         7.388   -2.773    0.033   -2.860   -1.554   -0.327   -0.000    2.734     764,748    184.7    765.3        6.00    76  149,679      456
+preclose45     7.120   -4.810    0.050   -5.067   -1.553   -1.379   -0.000   -0.622     -40,567    169.3    387.6        5.50    73   34,071      457
+last15         5.240   -1.206    0.061   -0.791   -1.554   -0.853   -0.000    1.627      36,245    131.1    210.0        6.00    75   11,932      468
+
+bucket        raw_obi5  signed_obi5   buy_obi5  sell_obi5  (signed<0 = book against us)
+first15         0.0078      -0.0126    -0.0050     0.0199
+middle         -0.0063      -0.0074    -0.0141     0.0011
+preclose45     -0.0461      -0.0032    -0.0491    -0.0432
+last15         -0.0398      -0.0024    -0.0423    -0.0372
+
+  daily markout (n=60): mean -19,439  median -17,872  t=-9.57 p=1.29e-13  Wilcoxon p=1.83e-10
+
+====================================================================================
+CONFIG: et=1 obi=True tol=0.0   throttle=soft1 thresh=1x
+====================================================================================
+bucket       cap_bps  mko_bps  jmp_bps  dif_bps  fee_bps  liq_bps   unexpl  net_bps     net_pkr  med_hld mean_hld med_tks_mid  thr%   trades   sh/trd
+first15        6.261   -0.953    0.139   -1.026   -1.554   -0.433   -0.000    3.321     144,525     47.3    333.5        4.00    81   20,789      592
+middle         7.316   -2.624    0.024   -2.703   -1.554   -0.346   -0.000    2.792     742,571    190.7    784.6        6.00    75  142,197      456
+preclose45     6.838   -4.613    0.012   -4.912   -1.553   -1.677   -0.000   -1.004     -61,403    172.6    397.5        5.50    71   31,506      463
+last15         5.037   -1.172    0.049   -0.789   -1.554   -1.107   -0.000    1.204      24,281    138.9    214.1        5.50    74   10,815      479
+
+bucket        raw_obi5  signed_obi5   buy_obi5  sell_obi5  (signed<0 = book against us)
+first15         0.0093      -0.0114    -0.0021     0.0202
+middle         -0.0071      -0.0094    -0.0169     0.0023
+preclose45     -0.0452      -0.0076    -0.0525    -0.0378
+last15         -0.0425      -0.0098    -0.0523    -0.0327
+
+  daily markout (n=60): mean -17,419  median -15,966  t=-9.06 p=9e-13  Wilcoxon p=2.68e-10
+
+====================================================================================
+CONFIG: et=1 obi=True tol=0.0   throttle=soft2 thresh=2x
+====================================================================================
+bucket       cap_bps  mko_bps  jmp_bps  dif_bps  fee_bps  liq_bps   unexpl  net_bps     net_pkr  med_hld mean_hld med_tks_mid  thr%   trades   sh/trd
+first15        6.266   -1.231    0.132   -1.270   -1.554   -0.465   -0.000    3.016     132,724     47.7    333.9        4.00    81   21,093      594
+middle         7.373   -2.706    0.030   -2.801   -1.554   -0.382   -0.000    2.731     759,409    184.8    765.7        6.00    76  148,841      456
+preclose45     7.029   -4.874    0.039   -5.051   -1.553   -1.244   -0.000   -0.643     -41,539    165.8    388.1        5.50    73   33,707      458
+last15         5.227   -1.184    0.060   -0.824   -1.554   -0.937   -0.000    1.551      34,131    129.3    210.3        6.00    75   11,773      469
+
+bucket        raw_obi5  signed_obi5   buy_obi5  sell_obi5  (signed<0 = book against us)
+first15         0.0083      -0.0130    -0.0048     0.0208
+middle         -0.0057      -0.0078    -0.0139     0.0021
+preclose45     -0.0448      -0.0044    -0.0489    -0.0407
+last15         -0.0441      -0.0016    -0.0458    -0.0423
+
+  daily markout (n=60): mean -19,131  median -17,249  t=-9.82 p=5.05e-14  Wilcoxon p=1.44e-10
+
+====================================================================================
+CONFIG: et=1 obi=True tol=0.0   throttle=soft5 thresh=5x
+====================================================================================
+bucket       cap_bps  mko_bps  jmp_bps  dif_bps  fee_bps  liq_bps   unexpl  net_bps     net_pkr  med_hld mean_hld med_tks_mid  thr%   trades   sh/trd
+first15        6.232   -1.135    0.137   -1.209   -1.554   -0.451   -0.000    3.093     136,196     47.5    330.9        4.00    81   21,128      594
+middle         7.396   -2.801    0.033   -2.891   -1.554   -0.328   -0.000    2.713     759,717    184.9    765.4        6.00    76  149,824      456
+preclose45     7.106   -4.846    0.047   -5.076   -1.553   -1.342   -0.000   -0.634     -41,440    168.4    388.4        5.50    73   34,167      457
+last15         5.235   -1.255    0.060   -0.849   -1.554   -0.887   -0.000    1.539      34,267    131.2    210.0        5.50    76   11,965      467
+
+bucket        raw_obi5  signed_obi5   buy_obi5  sell_obi5  (signed<0 = book against us)
+first15         0.0078      -0.0127    -0.0050     0.0200
+middle         -0.0060      -0.0075    -0.0139     0.0014
+preclose45     -0.0463      -0.0031    -0.0491    -0.0435
+last15         -0.0400      -0.0020    -0.0421    -0.0379
+
+  daily markout (n=60): mean -19,647  median -17,676  t=-9.72 p=7.35e-14  Wilcoxon p=1.74e-10
+
+====================================================================================
+CONFIG: et=1 obi=True tol=0.0   throttle=soft8 thresh=8x
+====================================================================================
+bucket       cap_bps  mko_bps  jmp_bps  dif_bps  fee_bps  liq_bps   unexpl  net_bps     net_pkr  med_hld mean_hld med_tks_mid  thr%   trades   sh/trd
+first15        6.232   -1.135    0.137   -1.209   -1.554   -0.451   -0.000    3.093     136,196     47.5    330.9        4.00    81   21,128      594
+middle         7.399   -2.788    0.033   -2.878   -1.554   -0.328   -0.000    2.729     764,377    184.9    765.4        6.00    76  149,837      456
+preclose45     7.109   -4.837    0.047   -5.070   -1.553   -1.346   -0.000   -0.627     -40,975    168.6    388.4        5.50    73   34,177      457
+last15         5.236   -1.254    0.060   -0.848   -1.554   -0.887   -0.000    1.541      34,305    131.2    210.0        5.50    76   11,965      467
+
+bucket        raw_obi5  signed_obi5   buy_obi5  sell_obi5  (signed<0 = book against us)
+first15         0.0078      -0.0127    -0.0050     0.0200
+middle         -0.0060      -0.0075    -0.0139     0.0014
+preclose45     -0.0464      -0.0029    -0.0491    -0.0437
+last15         -0.0400      -0.0020    -0.0422    -0.0379
+
+  daily markout (n=60): mean -19,581  median -17,676  t=-9.68 p=8.59e-14  Wilcoxon p=1.92e-10
+
+====================================================================================
+CONFIG: et=1 obi=True tol=0.0   throttle=soft10 thresh=10x
+====================================================================================
+bucket       cap_bps  mko_bps  jmp_bps  dif_bps  fee_bps  liq_bps   unexpl  net_bps     net_pkr  med_hld mean_hld med_tks_mid  thr%   trades   sh/trd
+first15        6.232   -1.135    0.137   -1.209   -1.554   -0.451   -0.000    3.093     136,196     47.5    330.9        4.00    81   21,128      594
+middle         7.399   -2.788    0.033   -2.878   -1.554   -0.328   -0.000    2.729     764,377    184.9    765.4        6.00    76  149,837      456
+preclose45     7.109   -4.837    0.047   -5.070   -1.553   -1.346   -0.000   -0.627     -40,975    168.6    388.4        5.50    73   34,177      457
+last15         5.236   -1.254    0.060   -0.848   -1.554   -0.887   -0.000    1.541      34,305    131.2    210.0        5.50    76   11,965      467
+
+bucket        raw_obi5  signed_obi5   buy_obi5  sell_obi5  (signed<0 = book against us)
+first15         0.0078      -0.0127    -0.0050     0.0200
+middle         -0.0060      -0.0075    -0.0139     0.0014
+preclose45     -0.0464      -0.0029    -0.0491    -0.0437
+last15         -0.0400      -0.0020    -0.0422    -0.0379
+
+  daily markout (n=60): mean -19,581  median -17,676  t=-9.68 p=8.59e-14  Wilcoxon p=1.92e-10
+
+wrote /Users/shazzak/Capital Stake - Results/soft_inv_sweep_20260902_1221.csv
+wrote /Users/shazzak/Capital Stake - Results/soft_inv_sweep_DAILY_20260902_1221.csv  (1800 rows: per config x day x bucket + ALL)
+wrote /Users/shazzak/Capital Stake - Results/soft_inv_sweep_PERNAME_20260902_1221.csv  (54336 rows: per config x day x name x bucket)
