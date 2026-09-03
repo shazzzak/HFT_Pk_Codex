@@ -42,7 +42,7 @@ def _ts():
 OUT_DIR = Path("/Users/shazzak/Capital Stake - Results/diagnostics")
 # parallelism (match the sweeps) and day sample (a profile needs ~30 days, not 197).
 WORKERS = 9
-MAX_DAYS = 60
+MAX_DAYS = 30
 # markout horizons in SECONDS, 1s out past the ~765s middle-bucket mean hold.
 HORIZONS_S = [1, 5, 15, 30, 60, 120, 240, 600, 1200]
 # "at the ceiling" = within 5% of max_inv (matches time_at_inventory_limit).
@@ -55,6 +55,19 @@ DEEP = {"OGDC", "PSO", "HUBC", "FFC", "PPL", "UBL", "NBP", "MEBL"}
 # ===========================================================================
 # CORE: turn a (t, pos) path into inventory-profile stats (time-weighted)
 # ===========================================================================
+def _bucket_of(t, t0, t1):
+    # the four session buckets by TIME (what the sweeps' decomp uses), not the
+    # engine's current_bucket field (which only ever labels middle/last15).
+    FIRST = 15 * 60 * 1000; PRE = 45 * 60 * 1000; LAST = 15 * 60 * 1000
+    if t <= t0 + FIRST:
+        return "first15"
+    if t >= t1 - LAST:
+        return "last15"
+    if t >= t1 - PRE:
+        return "preclose45"
+    return "middle"
+
+
 def markout_by_horizon(fills, eq_t, eq_mid, horizons_s):
     # fills: DataFrame with t (ms), side ('BUY'/'SELL'), bucket. eq_t/eq_mid: sorted mid path.
     # Returns DataFrame rows (bucket, horizon_s, markout_bps) per fill x horizon.
@@ -130,13 +143,18 @@ def _pos_path_for(R, H, calib, date, sym, dsets):
         return None
     # --- fills + the mid path ---
     fills = dr.fills if isinstance(dr.fills, pd.DataFrame) else pd.DataFrame(list(dr.fills))
-    if fills is None or len(fills) == 0 or not {"t", "side", "bucket"}.issubset(fills.columns):
+    if fills is None or len(fills) == 0 or not {"t", "side"}.issubset(fills.columns):
         return None
     eq = pd.DataFrame(dr.equity) if len(dr.equity) else pd.DataFrame()
     if not len(eq) or "mid" not in eq.columns or "t" not in eq.columns:
         return None
     eq = eq.sort_values("t")
-    return dict(fills=fills, eq_t=eq["t"].to_numpy(dtype=float), eq_mid=eq["mid"].to_numpy(dtype=float))
+    # session bounds from the DayResult -> the same (t0,t1) the sweeps bucket against
+    sess = getattr(dr, "session", None)
+    if sess is None:
+        sess = (float(eq["t"].min()), float(eq["t"].max()))
+    return dict(fills=fills, eq_t=eq["t"].to_numpy(dtype=float),
+                eq_mid=eq["mid"].to_numpy(dtype=float), session=(float(sess[0]), float(sess[1])))
 
 
 # worker globals (set once per process by the Pool initializer)
@@ -169,7 +187,11 @@ def _work_date(date):
             continue
         if pp is None:
             continue
-        mk = markout_by_horizon(pp["fills"], pp["eq_t"], pp["eq_mid"], HORIZONS_S)
+        # OVERWRITE the (unreliable) engine bucket with the time-based one
+        t0, t1 = pp["session"]
+        f = pp["fills"].copy()
+        f["bucket"] = [_bucket_of(float(tt), t0, t1) for tt in f["t"].to_numpy()]
+        mk = markout_by_horizon(f, pp["eq_t"], pp["eq_mid"], HORIZONS_S)
         if mk.empty:
             continue
         # per (bucket, horizon): fill-mean markout + count (a day-as-unit value)
@@ -213,8 +235,10 @@ def run_real(out_dir=OUT_DIR, symbols=None, workers=WORKERS, max_days=MAX_DAYS):
             rows.extend(res)
             done += 1
             # per-date heartbeat (frequent enough to never look hung)
+            el = (time.perf_counter() - t0) / 60.0
+            eta = el / done * (len(run_dates) - done)
             print(_ts() + f"  date {done}/{len(run_dates)} done  "
-                  f"({len(rows)} sym-days, {(time.perf_counter()-t0)/60:.1f} min)", flush=True)
+                  f"({len(rows)} sym-days, {el:.1f} min elapsed, ETA {eta:.1f} min)", flush=True)
     if not rows:
         print(_ts() + "no runnable symbol-days.", flush=True)
         return

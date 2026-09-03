@@ -236,8 +236,10 @@ def run_real(out_dir=OUT_DIR, symbols=None, workers=WORKERS, max_days=MAX_DAYS):
             rows.extend(res)
             done += 1
             # per-date heartbeat (frequent enough to never look hung)
+            el = (time.perf_counter() - t0) / 60.0
+            eta = el / done * (len(run_dates) - done)
             print(_ts() + f"  date {done}/{len(run_dates)} done  "
-                  f"({len(rows)} sym-days, {(time.perf_counter()-t0)/60:.1f} min)", flush=True)
+                  f"({len(rows)} sym-days, {el:.1f} min elapsed, ETA {eta:.1f} min)", flush=True)
     if not rows:
         print(_ts() + "no runnable symbol-days.", flush=True)
         return

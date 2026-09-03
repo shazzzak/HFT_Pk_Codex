@@ -1,0 +1,268 @@
+pre-pass: calibration + trailing median trade size
+  pre-pass 50/207  0m13s
+  pre-pass 100/207  0m25s
+  pre-pass 150/207  0m37s
+  pre-pass 200/207  0m48s
+  pre-pass 207/207  0m50s
+  29944 cells to run this session (29944 total, 0 already journaled).
+
+FLOW -- aggressor-flow throttle P&L sweep (winner frozen et1/obi+/tol0/mid, OFI-defensive off; framing #2 = throttle STACKS on obi_defensive): OFF vs ON = 4 configs
+  x 38 names x 197 days = 29944 cells
+  workers: 9
+
+  200/29944  2m47s  ETA 414m23s
+  400/29944  4m46s  ETA 352m37s
+  600/29944  6m43s  ETA 329m14s
+  800/29944  9m31s  ETA 346m47s
+  1000/29944  11m38s  ETA 337m09s
+  1200/29944  13m44s  ETA 329m15s
+  1400/29944  16m06s  ETA 328m21s
+  1600/29944  18m15s  ETA 323m19s
+  1800/29944  20m36s  ETA 322m20s
+  2000/29944  23m06s  ETA 322m56s
+  2200/29944  25m38s  ETA 323m17s
+  2400/29944  28m09s  ETA 323m06s
+  2600/29944  30m29s  ETA 320m43s
+  2800/29944  32m50s  ETA 318m21s
+  3000/29944  35m13s  ETA 316m21s
+  3200/29944  37m54s  ETA 316m49s
+  3400/29944  40m31s  ETA 316m21s
+  3600/29944  42m46s  ETA 312m59s
+  3800/29944  45m01s  ETA 309m48s
+  4000/29944  47m14s  ETA 306m26s
+  4200/29944  49m36s  ETA 304m03s
+  4400/29944  52m00s  ETA 301m55s
+  4600/29944  54m02s  ETA 297m46s
+  4800/29944  55m59s  ETA 293m16s
+  5000/29944  58m01s  ETA 289m29s
+  5200/29944  60m15s  ETA 286m42s
+  5400/29944  62m22s  ETA 283m31s
+  5600/29944  64m29s  ETA 280m21s
+  5800/29944  66m33s  ETA 277m03s
+  6000/29944  68m37s  ETA 273m51s
+  6200/29944  70m32s  ETA 270m09s
+  6400/29944  72m35s  ETA 267m01s
+  6600/29944  74m42s  ETA 264m13s
+  6800/29944  76m37s  ETA 260m48s
+  7000/29944  78m28s  ETA 257m14s
+  7200/29944  80m30s  ETA 254m20s
+  7400/29944  82m38s  ETA 251m45s
+  7600/29944  84m28s  ETA 248m22s
+  7800/29944  86m15s  ETA 244m53s
+  8000/29944  88m08s  ETA 241m45s
+  8200/29944  89m49s  ETA 238m10s
+  8400/29944  91m47s  ETA 235m26s
+  8600/29944  93m47s  ETA 232m47s
+  8800/29944  95m53s  ETA 230m24s
+  9000/29944  98m01s  ETA 228m07s
+  9200/29944  100m05s  ETA 225m41s
+  9400/29944  102m43s  ETA 224m30s
+  9600/29944  104m55s  ETA 222m20s
+  9800/29944  107m06s  ETA 220m09s
+  10000/29944  109m19s  ETA 218m01s
+  10200/29944  111m46s  ETA 216m21s
+  10400/29944  114m26s  ETA 215m04s
+  10600/29944  116m53s  ETA 213m18s
+  10800/29944  118m54s  ETA 210m47s
+  11000/29944  120m56s  ETA 208m16s
+  11200/29944  122m59s  ETA 205m50s
+  11400/29944  125m08s  ETA 203m33s
+  11600/29944  127m31s  ETA 201m39s
+  11800/29944  130m00s  ETA 199m53s
+  12000/29944  132m36s  ETA 198m18s
+  12200/29944  135m36s  ETA 197m14s
+  12400/29944  138m43s  ETA 196m16s
+  12600/29944  141m48s  ETA 195m11s
+  12800/29944  144m29s  ETA 193m32s
+  13000/29944  147m18s  ETA 192m00s
+  13200/29944  150m10s  ETA 190m30s
+  13400/29944  152m42s  ETA 188m32s
+  13600/29944  155m26s  ETA 186m48s
+  13800/29944  158m13s  ETA 185m05s
+  14000/29944  160m53s  ETA 183m14s
+  14200/29944  163m19s  ETA 181m05s
+  14400/29944  165m58s  ETA 179m09s
+  14600/29944  168m16s  ETA 176m50s
+  14800/29944  171m11s  ETA 175m10s
+  15000/29944  173m54s  ETA 173m15s
+  15200/29944  176m20s  ETA 171m02s
+  15400/29944  178m50s  ETA 168m53s
+  15600/29944  181m37s  ETA 166m59s
+  15800/29944  184m24s  ETA 165m04s
+  16000/29944  186m40s  ETA 162m41s
+  16200/29944  188m58s  ETA 160m19s
+  16400/29944  191m15s  ETA 157m56s
+  16600/29944  193m57s  ETA 155m55s
+  16800/29944  196m29s  ETA 153m44s
+  17000/29944  198m21s  ETA 151m02s
+  17200/29944  199m59s  ETA 148m11s
+  17400/29944  202m14s  ETA 145m48s
+  17600/29944  204m08s  ETA 143m10s
+  17800/29944  206m01s  ETA 140m33s
+  18000/29944  207m50s  ETA 137m54s
+  18200/29944  209m53s  ETA 135m26s
+  18400/29944  211m41s  ETA 132m48s
+  18600/29944  213m42s  ETA 130m20s
+  18800/29944  215m22s  ETA 127m40s
+  19000/29944  216m51s  ETA 124m54s
+  19200/29944  218m57s  ETA 122m31s
+  19400/29944  220m30s  ETA 119m50s
+  19600/29944  222m05s  ETA 117m12s
+  19800/29944  223m47s  ETA 114m39s
+  20000/29944  225m10s  ETA 111m57s
+  20200/29944  226m49s  ETA 109m24s
+  20400/29944  229m07s  ETA 107m11s
+  20600/29944  230m53s  ETA 104m43s
+  20800/29944  232m54s  ETA 102m23s
+  21000/29944  235m02s  ETA 100m06s
+  21200/29944  237m32s  ETA 97m58s
+  21400/29944  239m08s  ETA 95m28s
+  21600/29944  241m27s  ETA 93m16s
+  21800/29944  243m29s  ETA 90m57s
+  22000/29944  246m01s  ETA 88m50s
+  22200/29944  248m17s  ETA 86m36s
+  22400/29944  250m56s  ETA 84m30s
+  22600/29944  253m36s  ETA 82m24s
+  22800/29944  255m59s  ETA 80m12s
+  23000/29944  258m23s  ETA 78m00s
+  23200/29944  261m37s  ETA 76m03s
+  23400/29944  263m55s  ETA 73m48s
+  23600/29944  266m36s  ETA 71m40s
+  23800/29944  268m57s  ETA 69m25s
+  24000/29944  270m54s  ETA 67m05s
+  24200/29944  273m31s  ETA 64m55s
+  24400/29944  276m05s  ETA 62m43s
+  24600/29944  278m07s  ETA 60m25s
+  24800/29944  280m47s  ETA 58m14s
+  25000/29944  283m40s  ETA 56m05s
+  25200/29944  285m51s  ETA 53m48s
+  25400/29944  287m55s  ETA 51m30s
+  25600/29944  289m54s  ETA 49m11s
+  25800/29944  291m50s  ETA 46m52s
+  26000/29944  293m53s  ETA 44m34s
+  26200/29944  295m44s  ETA 42m15s
+  26400/29944  297m39s  ETA 39m57s
+  26600/29944  299m27s  ETA 37m38s
+  26800/29944  301m57s  ETA 35m25s
+  27000/29944  305m08s  ETA 33m16s
+  27200/29944  307m40s  ETA 31m02s
+  27400/29944  309m46s  ETA 28m45s
+  27600/29944  311m37s  ETA 26m27s
+  27800/29944  313m38s  ETA 24m11s
+  28000/29944  315m29s  ETA 21m54s
+  28200/29944  317m16s  ETA 19m37s
+  28400/29944  319m19s  ETA 17m21s
+  28600/29944  322m20s  ETA 15m08s
+  28800/29944  325m14s  ETA 12m55s
+  29000/29944  327m53s  ETA 10m40s
+  29200/29944  330m26s  ETA 8m25s
+  29400/29944  332m23s  ETA 6m09s
+  29600/29944  334m36s  ETA 3m53s
+  29800/29944  336m58s  ETA 1m37s
+  29944/29944  338m25s  ETA 0m00s
+
+  checkpoint complete -> flow_throttle_sweep_CKPT.jsonl.done
+
+====================================================================================
+### 2D SKEW SWEEP DONE: 338m25s for 29944 cells ###
+====================================================================================
+
+=== SUMMARY: OFI-defensive configs (winner frozen: et1/obi+/tol0) ===
+    ofi_window  thresh   net_bps       net_PKR
+          NONE       -     1.703     2,545,765
+           OBI       -     2.386     2,767,978
+   FLOWonly_n2      n2     1.703     2,538,697
+   OBI+FLOW_n2      n2     2.351     2,721,208
+
+=== DAY-AS-UNIT net_bps: mean +/- SE (each day = one observation) ===
+    ofi_window  thresh  n_days  mean_bps      se
+          NONE       -     197     1.899   0.196
+           OBI       -     197     2.560   0.205
+   FLOWonly_n2      n2     197     1.894   0.195
+   OBI+FLOW_n2      n2     197     2.522   0.205
+
+=== control(OBI) - config (PAIRED by day): positive => current OBI wins ===
+        config  thresh  n_pair    d_bps      se       t
+           OBI       -     197   -0.661   0.087   -7.64
+   FLOWonly_n2      n2     197    0.005   0.027    0.19
+   OBI+FLOW_n2      n2     197   -0.624   0.086   -7.25
+  (|t| >~ 2 => the gap vs NONE is beyond day-to-day noise)
+
+=== RECONCILIATION ANCHOR: MEASURED decomposition vs engine P&L ===
+    ofi_window  thresh     measured_net       engine_pnl   unexplained     pct   ok?
+          NONE       -        2,545,765        2,545,765             0    0.0%    OK
+           OBI       -        2,767,978        2,767,978             0    0.0%    OK
+   FLOWonly_n2      n2        2,538,697        2,538,697             0    0.0%    OK
+   OBI+FLOW_n2      n2        2,721,208        2,721,208             0    0.0%    OK
+
+====================================================================================
+CONFIG: et=1 obi=True tol=0.0   throttle=NONE thresh=-
+====================================================================================
+bucket       cap_bps  mko_bps  jmp_bps  dif_bps  fee_bps  liq_bps   unexpl  net_bps     net_pkr  med_hld mean_hld med_tks_mid  thr%   trades   sh/trd
+first15        4.495   -2.011    0.089   -1.926   -1.554   -0.333   -0.000    0.598     100,840     33.3    251.4        4.50    85   84,489      468
+middle         7.468   -3.167    0.020   -3.212   -1.554   -0.202   -0.000    2.545   2,526,245    145.6    606.8        7.00    79  565,225      392
+preclose45     7.058   -4.935    0.006   -5.113   -1.553   -0.871   -0.000   -0.302     -74,604    123.8    314.3        6.00    77  137,751      400
+last15         5.497   -2.975    0.019   -2.502   -1.554   -1.047   -0.000   -0.078      -6,716     94.1    176.2        5.50    79   47,802      406
+
+bucket        raw_obi5  signed_obi5   buy_obi5  sell_obi5  (signed<0 = book against us)
+first15         0.0010      -0.0111    -0.0104     0.0118
+middle         -0.0328      -0.0053    -0.0395    -0.0265
+preclose45     -0.0680      -0.0067    -0.0759    -0.0604
+last15         -0.0662      -0.0059    -0.0740    -0.0589
+
+  daily markout (n=197): mean -25,183  median -19,946  t=-14.27 p=3.8e-32  Wilcoxon p=1.81e-31
+
+====================================================================================
+CONFIG: et=1 obi=True tol=0.0   throttle=OBI thresh=-
+====================================================================================
+bucket       cap_bps  mko_bps  jmp_bps  dif_bps  fee_bps  liq_bps   unexpl  net_bps     net_pkr  med_hld mean_hld med_tks_mid  thr%   trades   sh/trd
+first15        5.922   -1.568    0.077   -1.425   -1.554   -0.275   -0.000    2.525     334,331     45.1    307.9        5.50    84   75,575      405
+middle         7.882   -2.949    0.032   -3.004   -1.554   -0.192   -0.000    3.187   2,462,481    186.5    722.1        7.00    77  498,131      352
+preclose45     7.150   -4.701    0.020   -5.053   -1.553   -1.031   -0.000   -0.135     -25,658    161.8    372.5        6.00    74  119,439      362
+last15         5.122   -2.439    0.027   -2.053   -1.554   -1.177   -0.000   -0.049      -3,176    128.7    207.8        5.50    76   40,993      363
+
+bucket        raw_obi5  signed_obi5   buy_obi5  sell_obi5  (signed<0 = book against us)
+first15         0.0037      -0.0179    -0.0147     0.0209
+middle         -0.0278      -0.0132    -0.0419    -0.0143
+preclose45     -0.0618      -0.0174    -0.0782    -0.0449
+last15         -0.0588      -0.0153    -0.0737    -0.0438
+
+  daily markout (n=197): mean -17,958  median -13,698  t=-12.40 p=1.89e-26  Wilcoxon p=3.88e-27
+
+====================================================================================
+CONFIG: et=1 obi=True tol=0.0   throttle=FLOWonly_n2 thresh=n2
+====================================================================================
+bucket       cap_bps  mko_bps  jmp_bps  dif_bps  fee_bps  liq_bps   unexpl  net_bps     net_pkr  med_hld mean_hld med_tks_mid  thr%   trades   sh/trd
+first15        4.509   -2.101    0.079   -2.012   -1.554   -0.324   -0.000    0.530      87,880     34.0    255.2        4.50    85   83,770      462
+middle         7.485   -3.180    0.020   -3.222   -1.554   -0.189   -0.000    2.562   2,540,130    145.7    607.9        7.00    79  564,939      391
+preclose45     7.032   -4.939    0.012   -5.116   -1.553   -0.862   -0.000   -0.323     -79,986    123.7    313.9        6.00    77  137,727      400
+last15         5.507   -2.956    0.019   -2.545   -1.554   -1.105   -0.000   -0.108      -9,327     94.2    176.3        5.50    79   47,809      404
+
+bucket        raw_obi5  signed_obi5   buy_obi5  sell_obi5  (signed<0 = book against us)
+first15         0.0015      -0.0108    -0.0096     0.0119
+middle         -0.0325      -0.0052    -0.0390    -0.0264
+preclose45     -0.0685      -0.0065    -0.0761    -0.0611
+last15         -0.0664      -0.0063    -0.0745    -0.0587
+
+  daily markout (n=197): mean -25,263  median -19,739  t=-14.32 p=2.66e-32  Wilcoxon p=1.33e-31
+
+====================================================================================
+CONFIG: et=1 obi=True tol=0.0   throttle=OBI+FLOW_n2 thresh=n2
+====================================================================================
+bucket       cap_bps  mko_bps  jmp_bps  dif_bps  fee_bps  liq_bps   unexpl  net_bps     net_pkr  med_hld mean_hld med_tks_mid  thr%   trades   sh/trd
+first15        5.927   -1.538    0.082   -1.382   -1.554   -0.303   -0.000    2.531     331,358     45.5    309.1        5.50    84   75,247      402
+middle         7.889   -2.997    0.031   -3.054   -1.554   -0.202   -0.000    3.137   2,421,364    186.9    722.6        7.00    77  497,871      352
+preclose45     7.117   -4.705    0.020   -5.064   -1.553   -0.996   -0.000   -0.137     -25,952    161.5    372.3        6.00    74  119,455      362
+last15         5.169   -2.432    0.025   -2.042   -1.554   -1.268   -0.000   -0.085      -5,561    128.9    207.8        5.50    76   40,920      363
+
+bucket        raw_obi5  signed_obi5   buy_obi5  sell_obi5  (signed<0 = book against us)
+first15         0.0039      -0.0178    -0.0143     0.0210
+middle         -0.0278      -0.0132    -0.0419    -0.0143
+preclose45     -0.0619      -0.0177    -0.0786    -0.0447
+last15         -0.0584      -0.0156    -0.0736    -0.0430
+
+  daily markout (n=197): mean -18,098  median -13,550  t=-12.47 p=1.14e-26  Wilcoxon p=4.15e-27
+
+wrote /Users/shazzak/Capital Stake - Results/flow_throttle_sweep_20260903_1239.csv
+wrote /Users/shazzak/Capital Stake - Results/flow_throttle_sweep_DAILY_20260903_1239.csv  (3940 rows: per config x day x bucket + ALL)
+wrote /Users/shazzak/Capital Stake - Results/flow_throttle_sweep_PERNAME_20260903_1239.csv  (119520 rows: per config x day x name x bucket)

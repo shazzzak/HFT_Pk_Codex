@@ -1,0 +1,168 @@
+pre-pass: calibration + trailing median trade size
+  pre-pass 50/207  0m12s
+  pre-pass 100/207  0m24s
+  pre-pass 150/207  0m36s
+  pre-pass 200/207  0m47s
+  pre-pass 207/207  0m49s
+  5700 cells to run this session (5700 total, 0 already journaled).
+
+CLIP-SIZE -- capacity sweep (does the edge scale with quote size?) (winner frozen et1/obi+/tol0/mid, OFI-defensive off; framing #2 = throttle STACKS on obi_defensive): OFF vs ON = 5 configs
+  x 38 names x 30 days = 5700 cells
+  workers: 9
+
+  200/5700  2m40s  ETA 73m23s
+  400/5700  4m46s  ETA 63m13s
+  600/5700  6m50s  ETA 58m07s
+  800/5700  9m05s  ETA 55m40s
+  1000/5700  11m38s  ETA 54m45s
+  1200/5700  13m54s  ETA 52m09s
+  1400/5700  15m45s  ETA 48m22s
+  1600/5700  18m01s  ETA 46m12s
+  1800/5700  20m26s  ETA 44m17s
+  2000/5700  22m52s  ETA 42m19s
+  2200/5700  25m13s  ETA 40m07s
+  2400/5700  27m49s  ETA 38m15s
+  2600/5700  30m36s  ETA 36m30s
+  2800/5700  33m12s  ETA 34m23s
+  3000/5700  35m53s  ETA 32m18s
+  3200/5700  38m26s  ETA 30m02s
+  3400/5700  40m51s  ETA 27m38s
+  3600/5700  43m16s  ETA 25m14s
+  3800/5700  45m38s  ETA 22m49s
+  4000/5700  48m29s  ETA 20m36s
+  4200/5700  51m04s  ETA 18m14s
+  4400/5700  53m31s  ETA 15m48s
+  4600/5700  55m49s  ETA 13m20s
+  4800/5700  58m10s  ETA 10m54s
+  5000/5700  60m22s  ETA 8m27s
+  5200/5700  62m41s  ETA 6m01s
+  5400/5700  65m01s  ETA 3m36s
+  5600/5700  67m13s  ETA 1m12s
+  5700/5700  68m32s  ETA 0m00s
+
+  checkpoint complete -> clip_size_sweep_CKPT.jsonl.done
+
+====================================================================================
+### 2D SKEW SWEEP DONE: 68m32s for 5700 cells ###
+====================================================================================
+
+=== SUMMARY: OFI-defensive configs (winner frozen: et1/obi+/tol0) ===
+    ofi_window  thresh   net_bps       net_PKR
+        clip3x      3x     2.937       684,631
+        clip2x      2x     3.496       580,967
+        clip4x      4x     2.081       612,797
+        clip5x      5x     1.934       680,691
+        clip6x      6x     1.140       462,555
+
+=== DAY-AS-UNIT net_bps: mean +/- SE (each day = one observation) ===
+    ofi_window  thresh  n_days  mean_bps      se
+        clip3x      3x      30     2.935   0.389
+        clip2x      2x      30     3.403   0.367
+        clip4x      4x      30     1.987   0.464
+        clip5x      5x      30     1.774   0.496
+        clip6x      6x      30     1.069   0.489
+
+=== control(clip3x=current) - config (PAIRED by day): positive => current wins ===
+        config  thresh  n_pair    d_bps      se       t
+        clip2x      2x      30   -0.468   0.195   -2.40
+        clip4x      4x      30    0.948   0.175    5.42
+        clip5x      5x      30    1.160   0.202    5.76
+        clip6x      6x      30    1.866   0.201    9.29
+  (|t| >~ 2 => the gap vs NONE is beyond day-to-day noise)
+
+=== RECONCILIATION ANCHOR: MEASURED decomposition vs engine P&L ===
+    ofi_window  thresh     measured_net       engine_pnl   unexplained     pct   ok?
+        clip3x      3x          684,631          684,631             0    0.0%    OK
+        clip2x      2x          580,967          580,967             0    0.0%    OK
+        clip4x      4x          612,797          612,797             0    0.0%    OK
+        clip5x      5x          680,691          680,691             0    0.0%    OK
+        clip6x      6x          462,555          462,555             0    0.0%    OK
+
+====================================================================================
+CONFIG: et=1 obi=True tol=0.0   throttle=clip3x thresh=3x
+====================================================================================
+bucket       cap_bps  mko_bps  jmp_bps  dif_bps  fee_bps  liq_bps   unexpl  net_bps     net_pkr  med_hld mean_hld med_tks_mid  thr%   trades   sh/trd
+first15        6.266   -1.731    0.124   -1.794   -1.554   -0.438   -0.000    2.543      65,364     42.3    292.2        3.50    82   11,840      649
+middle         7.533   -1.818    0.030   -1.904   -1.554   -0.460   -0.000    3.701     587,582    173.2    707.1        7.00    76   80,101      469
+preclose45     7.083   -3.638    0.033   -4.013   -1.553   -1.960   -0.000   -0.068      -2,471    165.8    383.3        6.50    73   18,095      456
+last15         5.741   -0.462    0.065   -0.402   -1.554   -0.932   -0.000    2.793      34,156    137.0    211.7        6.50    75    6,392      474
+
+bucket        raw_obi5  signed_obi5   buy_obi5  sell_obi5  (signed<0 = book against us)
+first15        -0.0203      -0.0069    -0.0277    -0.0131
+middle         -0.0204       0.0005    -0.0205    -0.0204
+preclose45     -0.0663      -0.0012    -0.0664    -0.0661
+last15         -0.0447      -0.0002    -0.0445    -0.0449
+
+  daily markout (n=30): mean -15,707  median -13,562  t=-5.16 p=1.64e-05  Wilcoxon p=1.06e-05
+
+====================================================================================
+CONFIG: et=1 obi=True tol=0.0   throttle=clip2x thresh=2x
+====================================================================================
+bucket       cap_bps  mko_bps  jmp_bps  dif_bps  fee_bps  liq_bps   unexpl  net_bps     net_pkr  med_hld mean_hld med_tks_mid  thr%   trades   sh/trd
+first15        6.463   -2.506    0.087   -2.557   -1.554   -0.556   -0.000    1.847      34,207     39.1    287.0        3.50    81   11,090      494
+middle         7.728   -1.376    0.039   -1.461   -1.554   -0.423   -0.000    4.375     496,642    157.1    668.3        7.00    75   74,147      358
+preclose45     7.137   -3.227   -0.018   -3.398   -1.553   -1.463   -0.000    0.895      23,004    149.2    366.4        6.50    71   16,445      352
+last15         6.247   -1.019    0.107   -0.431   -1.554   -0.469   -0.000    3.205      27,113    123.7    202.3        6.50    75    5,808      359
+
+bucket        raw_obi5  signed_obi5   buy_obi5  sell_obi5  (signed<0 = book against us)
+first15        -0.0197      -0.0082    -0.0283    -0.0114
+middle         -0.0200       0.0006    -0.0199    -0.0200
+preclose45     -0.0591      -0.0024    -0.0608    -0.0573
+last15         -0.0479       0.0065    -0.0411    -0.0549
+
+  daily markout (n=30): mean -9,808  median -8,054  t=-5.15 p=1.66e-05  Wilcoxon p=2.76e-06
+
+====================================================================================
+CONFIG: et=1 obi=True tol=0.0   throttle=clip4x thresh=4x
+====================================================================================
+bucket       cap_bps  mko_bps  jmp_bps  dif_bps  fee_bps  liq_bps   unexpl  net_bps     net_pkr  med_hld mean_hld med_tks_mid  thr%   trades   sh/trd
+first15        6.111   -1.550    0.154   -1.747   -1.553   -0.924   -0.000    2.084      67,523     47.3    314.6        3.50    83   12,415      785
+middle         7.303   -2.454    0.016   -2.523   -1.554   -0.537   -0.000    2.759     551,179    190.5    741.1        6.50    77   84,441      567
+preclose45     6.902   -3.932    0.023   -4.143   -1.553   -1.756   -0.000   -0.339     -15,730    176.7    393.9        6.50    74   19,219      551
+last15         5.342   -1.491    0.062   -1.244   -1.554   -1.673   -0.000    0.624       9,824    149.7    218.4        6.00    76    6,800      571
+
+bucket        raw_obi5  signed_obi5   buy_obi5  sell_obi5  (signed<0 = book against us)
+first15        -0.0194      -0.0107    -0.0306    -0.0085
+middle         -0.0216       0.0005    -0.0216    -0.0215
+preclose45     -0.0638      -0.0018    -0.0646    -0.0631
+last15         -0.0503       0.0035    -0.0465    -0.0543
+
+  daily markout (n=30): mean -24,888  median -19,937  t=-6.40 p=5.3e-07  Wilcoxon p=3.54e-08
+
+====================================================================================
+CONFIG: et=1 obi=True tol=0.0   throttle=clip5x thresh=5x
+====================================================================================
+bucket       cap_bps  mko_bps  jmp_bps  dif_bps  fee_bps  liq_bps   unexpl  net_bps     net_pkr  med_hld mean_hld med_tks_mid  thr%   trades   sh/trd
+first15        6.124   -1.547    0.113   -1.706   -1.553   -0.980   -0.000    2.045      78,319     51.0    317.5        3.50    83   12,921      901
+middle         7.251   -2.449    0.007   -2.506   -1.554   -0.436   -0.000    2.811     670,028    203.5    774.9        6.50    77   88,870      645
+preclose45     6.723   -4.282    0.029   -4.639   -1.553   -2.051   -0.000   -1.162     -65,338    186.5    404.8        6.00    75   20,445      628
+last15         5.217   -1.613    0.028   -1.702   -1.554   -2.172   -0.000   -0.122      -2,318    152.4    223.0        6.00    77    7,160      654
+
+bucket        raw_obi5  signed_obi5   buy_obi5  sell_obi5  (signed<0 = book against us)
+first15        -0.0173      -0.0137    -0.0314    -0.0036
+middle         -0.0228       0.0018    -0.0216    -0.0240
+preclose45     -0.0603      -0.0070    -0.0662    -0.0542
+last15         -0.0559       0.0073    -0.0485    -0.0633
+
+  daily markout (n=30): mean -30,483  median -22,910  t=-6.28 p=7.43e-07  Wilcoxon p=1.02e-07
+
+====================================================================================
+CONFIG: et=1 obi=True tol=0.0   throttle=clip6x thresh=6x
+====================================================================================
+bucket       cap_bps  mko_bps  jmp_bps  dif_bps  fee_bps  liq_bps   unexpl  net_bps     net_pkr  med_hld mean_hld med_tks_mid  thr%   trades   sh/trd
+first15        6.282   -2.290    0.139   -2.486   -1.553   -0.932   -0.000    1.506      66,288     54.1    332.5        3.50    83   13,398      997
+middle         7.074   -3.031    0.006   -3.110   -1.554   -0.500   -0.000    1.990     546,419    218.0    818.0        6.50    78   92,705      715
+preclose45     6.455   -4.442    0.024   -4.882   -1.552   -2.535   -0.000   -2.075    -135,208    203.9    424.2        6.00    75   21,480      693
+last15         4.517   -1.584    0.064   -1.633   -1.554   -2.054   -0.000   -0.674     -14,944    157.1    227.0        5.50    77    7,490      730
+
+bucket        raw_obi5  signed_obi5   buy_obi5  sell_obi5  (signed<0 = book against us)
+first15        -0.0216      -0.0141    -0.0362    -0.0074
+middle         -0.0215       0.0031    -0.0191    -0.0239
+preclose45     -0.0630      -0.0037    -0.0658    -0.0601
+last15         -0.0548       0.0028    -0.0517    -0.0579
+
+  daily markout (n=30): mean -41,918  median -33,544  t=-6.54 p=3.7e-07  Wilcoxon p=4.66e-08
+
+wrote /Users/shazzak/Capital Stake - Results/clip_size_sweep_20260903_1838.csv
+wrote /Users/shazzak/Capital Stake - Results/clip_size_sweep_DAILY_20260903_1838.csv  (750 rows: per config x day x bucket + ALL)
+wrote /Users/shazzak/Capital Stake - Results/clip_size_sweep_PERNAME_20260903_1838.csv  (22480 rows: per config x day x name x bucket)

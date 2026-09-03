@@ -179,6 +179,12 @@ class MicrostructureMM:
                  exit_ticks_inside=0,
                  # inventory threshold (in LOTS) beyond which the tick-exit engages
                  exit_inv_threshold=1.0,
+                 # --- AGE-AWARE EXIT (default off): once the current net position
+                 # has been HELD longer than age_exit_ms, engage the exit skew even
+                 # if below exit_inv_threshold. FIFO showed round trips >15min turn
+                 # toxic (realized <0), so push aged inventory out. Uses exit_ticks_inside.
+                 enable_age_exit=False,
+                 age_exit_ms=900000.0,   # 15 minutes
                  # --- OBI-DEFENSIVE SKEW SWEEP (default OFF = current behavior) ---
                  # When True, suppress (widen) the side the book leans AGAINST, so
                  # we stop resting in front of predictable flow. imb>0.5 = bid-heavy
@@ -231,6 +237,14 @@ class MicrostructureMM:
                  # cut. 0.40 is where the diagnostic's toxic depletion mass sits.
                  qdr_throttle=False,
                  qdr_throttle_thresh=0.40,
+                 # AGGRESSOR-FLOW THROTTLE (default off): pull the EXPOSED side when
+                 # time-decayed, volume-weighted signed trade flow is N trailing-std
+                 # one-sided. Gate found: momentum, ~15s half-life strongest, adds
+                 # on top of OBI. Reuses throttle_frac + throttle_hold_ms.
+                 flow_throttle=False,
+                 flow_hl_s=15.0,          # EMA half-life of the flow signal (seconds)
+                 flow_thresh_n=2.0,       # fire at |z| >= this many trailing std
+                 flow_std_hl_s=300.0,     # trailing-std half-life (seconds) for z
                  # POV ACQUISITION CAP: when True, cap the max acquirable |pos| at
                  # the shares still unwind-able by the close (min(max_inv,
                  # pov_capacity x pov_cap_mult)). Default off -> byte-identical.
@@ -361,6 +375,11 @@ class MicrostructureMM:
         self.exit_ticks_inside = exit_ticks_inside
         # inventory threshold (lots) beyond which the tick-exit engages
         self.exit_inv_threshold = exit_inv_threshold
+        # --- AGE-AWARE EXIT state (default off -> byte-identical) ---
+        self.enable_age_exit = enable_age_exit
+        self.age_exit_ms = float(age_exit_ms)
+        self._pos_since_ts = None   # ts (ms) the current net position was established
+        self._pos_prev_sign = 0     # sign of pos last quote (to detect flips/flatten)
         # --- OBI-defensive skew (sweep axis 2; False = current behavior) ---
         # master toggle
         self.obi_defensive = obi_defensive
@@ -404,6 +423,17 @@ class MicrostructureMM:
         self._qdr_prev_bq = 0.0
         self._qdr_prev_ba = None
         self._qdr_prev_aq = 0.0
+        # --- AGGRESSOR-FLOW THROTTLE state (default off -> byte-identical) ---
+        self.flow_throttle = flow_throttle
+        self.flow_hl_s = float(flow_hl_s)
+        self.flow_thresh_n = float(flow_thresh_n)
+        self.flow_std_hl_s = float(flow_std_hl_s)
+        self._flow_s = 0.0        # time-decayed signed shares (buy +, sell -)
+        self._flow_a = 0.0        # time-decayed absolute shares
+        self._flow_last = None    # last trade ts (ms) for the decay clock
+        self._flow_sig = 0.0      # current signal = signed/abs in [-1,+1]
+        self._flow_var = 0.0      # trailing EWMA variance of the signal (for z)
+        self._flow_n = 0          # warmup counter (don't fire until enough trades)
         # trailing (ts_ms, ofi_increment) events; evicted by the time cap on
         # update, capped to the last N events at READ time (min-window semantics)
         self._ofi_events = deque()
@@ -525,6 +555,25 @@ class MicrostructureMM:
                 self.flow.append(float(obj.qty) * (1.0 if side == "BUY" else -1.0))
                 # Reset the quiet clock.
                 self.last_trade_ms = ts_exch
+                # AGGRESSOR-FLOW THROTTLE: maintain a TIME-decayed, volume-weighted
+                # signed-flow signal + its trailing variance. Guarded -> when off
+                # no state changes (byte-identical).
+                if self.flow_throttle:
+                    q = float(obj.qty)
+                    sv = q if side == "BUY" else -q
+                    if self._flow_last is not None:
+                        dt = ts_exch - self._flow_last
+                        gf = 2.0 ** (-dt / (self.flow_hl_s * 1000.0))
+                        self._flow_s *= gf
+                        self._flow_a *= gf
+                        gv = 2.0 ** (-dt / (self.flow_std_hl_s * 1000.0))
+                        # trail the variance of the signal (using the pre-trade value)
+                        self._flow_var = gv * self._flow_var + (1.0 - gv) * (self._flow_sig ** 2)
+                    self._flow_s += sv
+                    self._flow_a += q
+                    self._flow_last = ts_exch
+                    self._flow_sig = (self._flow_s / self._flow_a) if self._flow_a > 1e-9 else 0.0
+                    self._flow_n += 1
 
     # ---- derived microstructure quantities ---------------------------------
     def _toxicity(self):
@@ -1093,18 +1142,29 @@ class MicrostructureMM:
             # remember THIS touch for the next event's depletion computation
             self._qdr_prev_bb, self._qdr_prev_bq = bb, bq
             self._qdr_prev_ba, self._qdr_prev_aq = ba, aq
-        # BUY-side trigger: adverse OBI (ask-heavy), adverse OFI (selling flow), or fast bid depletion
+        # AGGRESSOR-FLOW trigger: z = signal / trailing-std. z>0 = net aggressive
+        # BUYING (up pressure) -> protect the SELL side; z<0 -> protect the BUY
+        # side. Off / not-warmed-up -> both False (byte-identical).
+        flow_buy_trig = False
+        flow_sell_trig = False
+        if self.flow_throttle and self._flow_n >= 50 and self._flow_var > 1e-12:
+            flow_z = self._flow_sig / (self._flow_var ** 0.5)
+            flow_sell_trig = flow_z >= self.flow_thresh_n
+            flow_buy_trig = flow_z <= -self.flow_thresh_n
+        # BUY-side trigger: adverse OBI (ask-heavy), adverse OFI (selling flow), fast bid depletion, or aggressive selling
         buy_trig = ((self.obi_throttle
                      and (0.5 - imb) > self.obi_throttle_thresh)
                     or (self.ofi_throttle and ofi_sig is not None
                         and ofi_sig < -self.ofi_throttle_thresh)
-                    or qdr_buy_trig)
-        # SELL-side trigger: adverse OBI (bid-heavy), adverse OFI (buying flow), or fast ask depletion
+                    or qdr_buy_trig
+                    or flow_buy_trig)
+        # SELL-side trigger: adverse OBI (bid-heavy), adverse OFI (buying flow), fast ask depletion, or aggressive buying
         sell_trig = ((self.obi_throttle
                       and (imb - 0.5) > self.obi_throttle_thresh)
                      or (self.ofi_throttle and ofi_sig is not None
                          and ofi_sig > self.ofi_throttle_thresh)
-                     or qdr_sell_trig)
+                     or qdr_sell_trig
+                     or flow_sell_trig)
         # time-box: a fresh trigger (re)arms the hold to now+hold_ms; with
         # hold_ms=0 the hold expires immediately (only the trigger cycle cut)
         if buy_trig:
@@ -1191,6 +1251,19 @@ class MicrostructureMM:
             cap = self._pov_capacity() * self.pov_cap_mult
             # never exceed the static ceiling; the tighter of the two binds
             eff_max = min(self.max_inv, cap)
+        # AGE-AWARE EXIT: track how long the current net position has been held;
+        # once past age_exit_ms, engage the exit skew regardless of size. Off ->
+        # age_exit_now stays False and no state changes (byte-identical).
+        age_exit_now = False
+        if self.enable_age_exit:
+            psign = 0 if abs(pos) < 1e-9 else (1 if pos > 0 else -1)
+            if psign == 0:
+                self._pos_since_ts = None
+            elif self._pos_since_ts is None or psign != self._pos_prev_sign:
+                self._pos_since_ts = self.now
+            self._pos_prev_sign = psign
+            age_exit_now = (self._pos_since_ts is not None
+                            and (self.now - self._pos_since_ts) >= self.age_exit_ms)
         # INVENTORY-EXIT bypass: when we are holding past the exit threshold and
         # the exit skew is active, the exit side is trying to GET FLAT -- the same
         # "getting flat > earning edge" logic as the EOD unwind. So it may post on
@@ -1198,7 +1271,7 @@ class MicrostructureMM:
         # (never below fee-solvency). When FLAT (skew inactive) the gate applies
         # normally: no inventory to exit -> quotes must be fully viable.
         holding_exit = (self.exit_ticks_inside > 0
-                        and abs(pos_lots) >= self.exit_inv_threshold)
+                        and (abs(pos_lots) >= self.exit_inv_threshold or age_exit_now))
         # If holding_exit is bypassing the gate on a tight book, we must post ONLY
         # the exit side -- never ADD inventory on an unviable book. Suppress the
         # adding side (long -> BUY adds; short -> SELL adds). This mirrors the
@@ -1299,7 +1372,7 @@ class MicrostructureMM:
             # engine's post-only clip below then governs it exactly as it governs
             # the base quote -- one gate, applied last. N=0 -> no change.
             if (self.exit_ticks_inside > 0 and pos < 0
-                    and -pos_lots >= self.exit_inv_threshold):
+                    and (-pos_lots >= self.exit_inv_threshold or age_exit_now)):
                 # improve our bid N ticks above the best bid
                 improved = bb + self.exit_ticks_inside * self.tick
                 # OPTION B fee floor: the exit skew may spend the min_edge cushion
@@ -1359,7 +1432,7 @@ class MicrostructureMM:
             # any venue's tick). Sets the DESIRED price; the engine's post-only
             # clip below governs it exactly as it governs the base quote. N=0 -> no change.
             if (self.exit_ticks_inside > 0 and pos > 0
-                    and pos_lots >= self.exit_inv_threshold):
+                    and (pos_lots >= self.exit_inv_threshold or age_exit_now)):
                 # improve our ask N ticks below the best ask
                 improved = ba - self.exit_ticks_inside * self.tick
                 # OPTION B raw-fee floor: the exit skew may spend the min_edge
