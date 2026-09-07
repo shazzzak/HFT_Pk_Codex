@@ -24,3 +24,6 @@ questdb==4.1.0
 psycopg2-binary==2.9.12
 duckdb==1.5.5
 scipy-stubs==1.17.1.5
+pantab==5.3.0
+tableauhyperapi==0.0.26479
+
