@@ -41,7 +41,8 @@ signal.signal(signal.SIGINT, signal_handler)
 
 
 def detect_date_column(df_sample):
-    """Detect columns with date-like names and values."""
+    """Detect columns with date-like names and values (English or Turkish)."""
+    # Expanded to cover both English and Turkish keywords
     date_indicators = [
         'date', 'time', 'transact', 'timestamp', 'created', 'updated', 'datetime', 'dt', 'trade', 'settle',
         'tarih', 'zaman', 'islem', 'giris', 'degistirilme', 'guncelleme', 'takas', 'saat'
@@ -59,13 +60,25 @@ def detect_date_column(df_sample):
     return candidates
 
 
+def is_likely_header_line(line, delimiter):
+    """Heuristic: a header line has many alphabetic tokens and few digits."""
+    if not line.strip():
+        return False
+    parts = line.split(delimiter)
+    if len(parts) < 2:
+        return False
+    digit_parts = sum(1 for p in parts if any(c.isdigit() for c in p))
+    if digit_parts > len(parts) * 0.5:
+        return False
+    alpha_parts = sum(1 for p in parts if any(c.isalpha() for c in p) and not any(c.isdigit() for c in p))
+    return alpha_parts > len(parts) * 0.5
+
+
 def determine_date_format(df, date_col, target_date):
     """
-    Detect the date format from sample values, then return a filter expression
-    that compares the parsed date to the target date.
+    Detect the date format from sample values, return a filter expression.
     Invalid values (e.g., "DATE") become null and are ignored.
     """
-    # Get non-null, non-empty sample values, but skip the literal "DATE"
     sample = df.select(pl.col(date_col)).filter(
         (pl.col(date_col).is_not_null()) & (pl.col(date_col) != "") & (pl.col(date_col) != "DATE")
     ).head(1000)
@@ -76,7 +89,6 @@ def determine_date_format(df, date_col, target_date):
     vals = sample[date_col].to_list()
     vals_str = [str(v) for v in vals if v is not None]
 
-    # Try common datetime formats
     formats_to_try = [
         ("%Y-%m-%d", "YYYY-MM-DD"),
         ("%Y/%m/%d", "YYYY/MM/DD"),
@@ -106,7 +118,7 @@ def determine_date_format(df, date_col, target_date):
                 break
 
     if best_format is None:
-        # Fallback: try string contains of target date in various formats
+        # Fallback: string contains of target date in various formats
         fallback_formats = [
             target_date,
             f"{target_date[:4]}-{target_date[4:6]}-{target_date[6:8]}",
@@ -115,17 +127,15 @@ def determine_date_format(df, date_col, target_date):
             f"{target_date[6:8]}/{target_date[4:6]}/{target_date[:4]}",
         ]
         for pattern in fallback_formats:
-            # Check if any sample value contains the pattern
             if any(pattern in v for v in vals_str):
                 expr = pl.col(date_col).cast(pl.Utf8).str.contains(pattern)
                 return expr, f"fallback contains '{pattern}'"
         return None, "No format detected"
 
-    # Build filter: convert to date using the detected format, with strict=False
+    # Build filter: convert to date using the detected format, strict=False
     expr = pl.col(date_col).cast(pl.Utf8).str.strptime(pl.Datetime, best_format, strict=False)
     target_dt = datetime.strptime(target_date, "%Y%m%d")
     filter_expr = expr.dt.date() == target_dt.date()
-
     return filter_expr, f"parsed with {best_desc}"
 
 
@@ -186,22 +196,38 @@ def process_single_zip(zip_path: Path, target_date: str = None, chunk_size: int 
                         delimiter = ','
                 print(f"   Delimiter: {repr(delimiter)}")
 
-                # Read header
-                header_line = f.readline().decode('utf-8', errors='ignore').strip()
+                # Read first two lines (Turkish and English headers)
+                turkish_line = f.readline().decode('utf-8', errors='ignore').strip()
+                english_line = f.readline().decode('utf-8', errors='ignore').strip()
                 f.seek(0)
-                headers = header_line.split(delimiter)
+
+                turkish_headers = turkish_line.split(delimiter) if turkish_line else []
+                english_headers = english_line.split(delimiter) if english_line else []
+
+                # Determine which set to use for column names
+                use_english = False
+                if english_headers and is_likely_header_line(english_line, delimiter):
+                    use_english = True
+                    headers = english_headers
+                    print("   ✅ Using English column names (second header row).")
+                else:
+                    headers = turkish_headers
+                    print("   Using Turkish column names (only one header row).")
+
                 print(f"   Found {len(headers)} columns")
 
-                # Skip header
-                f.readline()
+                # Skip the appropriate number of header lines
+                f.readline()  # skip Turkish line
+                if use_english:
+                    f.readline()  # skip English line
 
-                # Determine date column and filter expression from first chunk
+                # Determine date column and filter from first chunk (using the chosen headers)
                 date_column = None
                 filter_expr = None
                 date_format_desc = "Not determined"
 
                 first_chunk_data = []
-                for _ in range(min(chunk_size, 10000)):  # read a sample for detection
+                for _ in range(min(chunk_size, 10000)):
                     line_bytes = f.readline()
                     if not line_bytes:
                         break
@@ -232,9 +258,11 @@ def process_single_zip(zip_path: Path, target_date: str = None, chunk_size: int 
                     print("   ⚠️  No data in first chunk")
                     return None
 
-                # Reset file pointer and skip header
+                # Reset and skip headers again
                 f.seek(0)
-                f.readline()
+                f.readline()  # skip Turkish
+                if use_english:
+                    f.readline()  # skip English
 
                 # Process remaining data in chunks
                 print(f"   Processing CSV rows...")
@@ -280,13 +308,12 @@ def process_single_zip(zip_path: Path, target_date: str = None, chunk_size: int 
                     if len(chunk_data) >= chunk_size:
                         process_chunk(chunk_data)
                         chunk_data = []
-                        if processed % (chunk_size * 10) == 0:
-                            elapsed = time.time() - start_time
-                            rate = processed / elapsed if elapsed > 0 else 0
-                            match_pct = (matched_count / processed * 100) if processed > 0 else 0
-                            # Print with newline so workers don't overwrite each other
-                            print(
-                                f"   Worker {worker_id}: ⏳ Processed: {processed:,} | Matched: {matched_count:,} ({match_pct:.1f}%) | Dropped: {dropped_count:,} | Rate: {rate:.0f}/s")
+                        # Print progress every chunk
+                        elapsed = time.time() - start_time
+                        rate = processed / elapsed if elapsed > 0 else 0
+                        match_pct = (matched_count / processed * 100) if processed > 0 else 0
+                        print(
+                            f"   Worker {worker_id}: ⏳ Processed: {processed:,} | Matched: {matched_count:,} ({match_pct:.1f}%) | Dropped: {dropped_count:,} | Rate: {rate:.0f}/s")
 
                 # Final chunk
                 if chunk_data and not stop_processing:
