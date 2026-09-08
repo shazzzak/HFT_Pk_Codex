@@ -61,37 +61,72 @@ def detect_date_column(df_sample):
 
 def determine_date_format(df, date_col, target_date):
     """
-    Determine the date format by matching target_date against sample values.
-    Returns a filter expression and a description.
+    Detect the date format from sample values, then return a filter expression
+    that compares the parsed date to the target date.
+    Invalid values (e.g., "DATE") become null and are ignored.
     """
-    sample = df.select(pl.col(date_col)).filter(pl.col(date_col).is_not_null() & (pl.col(date_col) != "")).head(1000)
+    # Get non-null, non-empty sample values, but skip the literal "DATE"
+    sample = df.select(pl.col(date_col)).filter(
+        (pl.col(date_col).is_not_null()) & (pl.col(date_col) != "") & (pl.col(date_col) != "DATE")
+    ).head(1000)
+
     if len(sample) == 0:
-        return None, "No data"
+        return None, "No valid data"
 
     vals = sample[date_col].to_list()
     vals_str = [str(v) for v in vals if v is not None]
 
-    # Try common formats
-    formats = {
-        "starts_with YYYYMMDD": target_date,
-        "contains YYYY-MM-DD": f"{target_date[:4]}-{target_date[4:6]}-{target_date[6:8]}",
-        "contains YYYY/MM/DD": f"{target_date[:4]}/{target_date[4:6]}/{target_date[6:8]}",
-        "contains DD-MM-YYYY": f"{target_date[6:8]}-{target_date[4:6]}-{target_date[:4]}",
-        "contains DD/MM/YYYY": f"{target_date[6:8]}/{target_date[4:6]}/{target_date[:4]}",
-        "contains DD.MM.YYYY": f"{target_date[6:8]}.{target_date[4:6]}.{target_date[:4]}",
-    }
+    # Try common datetime formats
+    formats_to_try = [
+        ("%Y-%m-%d", "YYYY-MM-DD"),
+        ("%Y/%m/%d", "YYYY/MM/DD"),
+        ("%d-%m-%Y", "DD-MM-YYYY"),
+        ("%d/%m/%Y", "DD/MM/YYYY"),
+        ("%d.%m.%Y", "DD.MM.YYYY"),
+        ("%Y%m%d", "YYYYMMDD"),
+    ]
 
-    for desc, pattern in formats.items():
-        if any(pattern in v for v in vals_str):
-            if desc.startswith("starts_with"):
-                expr = pl.col(date_col).cast(pl.Utf8).str.starts_with(pattern)
-            else:
+    best_format = None
+    best_desc = None
+    best_count = 0
+
+    for fmt, desc in formats_to_try:
+        parsed = []
+        for v in vals_str:
+            try:
+                dt = datetime.strptime(v, fmt)
+                parsed.append(dt)
+            except:
+                pass
+        if len(parsed) > best_count:
+            best_count = len(parsed)
+            best_format = fmt
+            best_desc = desc
+            if best_count / len(vals_str) > 0.8:
+                break
+
+    if best_format is None:
+        # Fallback: try string contains of target date in various formats
+        fallback_formats = [
+            target_date,
+            f"{target_date[:4]}-{target_date[4:6]}-{target_date[6:8]}",
+            f"{target_date[:4]}/{target_date[4:6]}/{target_date[6:8]}",
+            f"{target_date[6:8]}-{target_date[4:6]}-{target_date[:4]}",
+            f"{target_date[6:8]}/{target_date[4:6]}/{target_date[:4]}",
+        ]
+        for pattern in fallback_formats:
+            # Check if any sample value contains the pattern
+            if any(pattern in v for v in vals_str):
                 expr = pl.col(date_col).cast(pl.Utf8).str.contains(pattern)
-            return expr, desc
+                return expr, f"fallback contains '{pattern}'"
+        return None, "No format detected"
 
-    # Fallback
-    expr = pl.col(date_col).cast(pl.Utf8).str.contains(target_date)
-    return expr, "fallback contains YYYYMMDD"
+    # Build filter: convert to date using the detected format, with strict=False
+    expr = pl.col(date_col).cast(pl.Utf8).str.strptime(pl.Datetime, best_format, strict=False)
+    target_dt = datetime.strptime(target_date, "%Y%m%d")
+    filter_expr = expr.dt.date() == target_dt.date()
+
+    return filter_expr, f"parsed with {best_desc}"
 
 
 def append_to_parquet(df, out_path):
@@ -110,9 +145,9 @@ def append_to_parquet(df, out_path):
 
 
 def process_single_zip(zip_path: Path, target_date: str = None, chunk_size: int = 50000, worker_id: int = 0):
-    print(f"\n{'=' * 80}")
+    print(f"\n{'='*80}")
     print(f"🔧 Worker {worker_id}: Processing {zip_path.name}")
-    print(f"{'=' * 80}")
+    print(f"{'='*80}")
 
     if not zip_path.exists():
         print(f"❌ Worker {worker_id}: File not found: {zip_path}")
