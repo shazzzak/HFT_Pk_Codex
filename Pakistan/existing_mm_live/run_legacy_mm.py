@@ -47,11 +47,19 @@ from mm_backtest import Backtester, NaiveSymmetricMM, fee_for, FEE_TOTAL_PCT, La
 from micro_mm import MicrostructureMM
 
 # ------------------------------- CONFIG -------------------------------------
-# Point this at your store root (the folder that CONTAINS trades/ ob_updates/ ...).
-PARSED_ROOT = Path(
-    "/Users/shazzak/Library/CloudStorage/"
-    "GoogleDrive-shazzak@gmail.com/My Drive/Capital Stake - Parsed"
-)
+# Single source of truth for paths: import the raw-store root from config_pk.
+# (config_pk.py holds every filesystem path; move machines -> edit ONE file.)
+try:
+    # pull the parsed-store root from the central config
+    from config_pk import PARSED_ROOT
+# if config_pk isn't importable (e.g. launched from an odd cwd), fail LOUD rather
+# than silently falling back to a stale path -- a wrong store is worse than a crash.
+except Exception as _e:
+    # re-raise with a clear message so the fix is obvious
+    raise ImportError(
+        "run_legacy_mm: could not import PARSED_ROOT from config_pk. "
+        "Run from the existing_mm_live/ dir (or add it to sys.path). Original: %r" % _e
+    )
 # Where per-date result CSVs and the combined file are written.
 OUT_DIR = Path("./mm_results")
 

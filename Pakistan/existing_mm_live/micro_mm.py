@@ -185,6 +185,17 @@ class MicrostructureMM:
                  # toxic (realized <0), so push aged inventory out. Uses exit_ticks_inside.
                  enable_age_exit=False,
                  age_exit_ms=900000.0,   # 15 minutes
+                 # --- RUN-REPRICE (default off): after N consecutive same-side
+                 # aggressor ORDERS (sweep-collapsed distinct orders), push the
+                 # EXPOSED side away from the touch by run_reprice_ticks -- a buy
+                 # run lifts our ask, so quote the ask HIGHER (sell into the run at
+                 # a better price). Rides with the live mid; the push is active
+                 # only while the run holds (turns off when a distinct opposite-
+                 # side order arrives). Ask-only within a run (buy-run->ask up;
+                 # sell-run->bid down). ticks are set PER NAME from measured markout.
+                 enable_run_reprice=False,
+                 run_reprice_n=3,
+                 run_reprice_ticks=1,
                  # --- OBI-DEFENSIVE SKEW SWEEP (default OFF = current behavior) ---
                  # When True, suppress (widen) the side the book leans AGAINST, so
                  # we stop resting in front of predictable flow. imb>0.5 = bid-heavy
@@ -380,6 +391,14 @@ class MicrostructureMM:
         self.age_exit_ms = float(age_exit_ms)
         self._pos_since_ts = None   # ts (ms) the current net position was established
         self._pos_prev_sign = 0     # sign of pos last quote (to detect flips/flatten)
+        # --- RUN-REPRICE state (default off -> byte-identical) ---
+        self.enable_run_reprice = enable_run_reprice
+        self.run_reprice_n = int(run_reprice_n)
+        self.run_reprice_ticks = int(run_reprice_ticks)
+        self._rr_last_ts = None     # last trade ts (for the collapse: same ts+side = one order)
+        self._rr_last_side = 0      # last trade side (+1 buy / -1 sell)
+        self._rr_run = 0            # current consecutive distinct-order run length
+        self._rr_run_side = 0       # side of the current run (+1 buy / -1 sell)
         # --- OBI-defensive skew (sweep axis 2; False = current behavior) ---
         # master toggle
         self.obi_defensive = obi_defensive
@@ -555,6 +574,27 @@ class MicrostructureMM:
                 self.flow.append(float(obj.qty) * (1.0 if side == "BUY" else -1.0))
                 # Reset the quiet clock.
                 self.last_trade_ms = ts_exch
+                # RUN-REPRICE: maintain the COLLAPSED distinct-order run counter.
+                # Guarded -> off = no state change (byte-identical).
+                if self.enable_run_reprice:
+                    # +1 buy / -1 sell
+                    sd = 1 if side == "BUY" else -1
+                    # a NEW distinct order iff the ts changed OR the side flipped
+                    # (same ts + same side = one sweep = one order)
+                    if self._rr_last_ts is None or ts_exch != self._rr_last_ts or sd != self._rr_last_side:
+                        # extend the run if same side, else start a new run
+                        if sd == self._rr_run_side:
+                            # longer run
+                            self._rr_run += 1
+                        else:
+                            # new run of length 1
+                            self._rr_run = 1
+                            # remember the run's side
+                            self._rr_run_side = sd
+                    # update the collapse memory to this print
+                    self._rr_last_ts = ts_exch
+                    # remember the side
+                    self._rr_last_side = sd
                 # AGGRESSOR-FLOW THROTTLE: maintain a TIME-decayed, volume-weighted
                 # signed-flow signal + its trailing variance. Guarded -> when off
                 # no state changes (byte-identical).
@@ -1407,6 +1447,13 @@ class MicrostructureMM:
             if ofi_sig is not None and ofi_sig < -self.ofi_defensive_thresh:
                 # widen the threatened bid by the OFI defensive ticks
                 px = px - self.ofi_defensive_ticks * self.tick
+            # --- RUN-REPRICE (symmetric): a live SELL run (>=N) is hitting the bid
+            # -> quote it LOWER by run_reprice_ticks so we buy into the run cheaper.
+            # Bid-only for a sell run. Off / short run -> no change (byte-identical).
+            if (self.enable_run_reprice and self._rr_run_side == -1
+                    and self._rr_run >= self.run_reprice_n):
+                # push the bid down by the per-name measured tick count
+                px = px - self.run_reprice_ticks * self.tick
             # Post-only clip (the engine's cross guard): stay at least one tick
             # inside the ask. Applied LAST so it governs the base quote, the exit
             # skew, and the OBI widen identically -- nothing can cross the ask.
@@ -1463,6 +1510,13 @@ class MicrostructureMM:
             if ofi_sig is not None and ofi_sig > self.ofi_defensive_thresh:
                 # widen the threatened ask by the OFI defensive ticks
                 px = px + self.ofi_defensive_ticks * self.tick
+            # --- RUN-REPRICE: a live BUY run (>=N) is lifting the ask -> quote it
+            # HIGHER by run_reprice_ticks so we sell into the run at a better price.
+            # Ask-only for a buy run. Off / short run -> no change (byte-identical).
+            if (self.enable_run_reprice and self._rr_run_side == 1
+                    and self._rr_run >= self.run_reprice_n):
+                # push the ask up by the per-name measured tick count
+                px = px + self.run_reprice_ticks * self.tick
             # Post-only clip (the engine's cross guard): stay at least one tick
             # outside the bid. Applied LAST so it governs the base quote, the exit
             # skew, and the OBI widen identically -- nothing can cross the bid.

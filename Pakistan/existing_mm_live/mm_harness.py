@@ -36,12 +36,23 @@ import confirm_micro_vs_naive as C
 import persist_fills as PF
 
 # ---------------------------------------------------------------------------
-# PATHS -- overridable by a caller before use (set R.PARSED_ROOT etc.)
+# PATHS -- single source of truth is config_pk (edit ONE file to move machines).
+# The loader module's own PARSED_ROOT constant is stale/relative, so mm_harness
+# imports the canonical roots here and pushes PARSED_ROOT onto R for every runner.
 # ---------------------------------------------------------------------------
-# raw parsed store (the moved location; the loader module's constant is stale)
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
-# results root (outside the git project)
-RESULTS = Path("/Users/shazzak/Capital Stake - Results")
+# import the canonical roots from the central config; fail LOUD if unavailable
+# (a wrong/stale store that runs silently is worse than a clear crash).
+try:
+    # PARSED_ROOT = raw store; RESULTS_ROOT = where tools write
+    from config_pk import PARSED_ROOT as _PARSED, RESULTS_ROOT as _RESULTS
+# no config_pk on the path -> stop with an explicit message
+except Exception as _e:
+    # re-raise so the fix (run from existing_mm_live/ or add it to sys.path) is obvious
+    raise ImportError("mm_harness: could not import paths from config_pk (%r)" % _e)
+# push the raw-store root onto the loader module so every runner inherits it
+R.PARSED_ROOT = _PARSED
+# results root (from config_pk, not hardcoded)
+RESULTS = _RESULTS
 # spot feature store (fill-time context + the 5s net_bps lens)
 FS_ROOT = RESULTS / "feature_store"
 
