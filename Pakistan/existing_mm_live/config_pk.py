@@ -13,9 +13,9 @@ from pathlib import Path
 
 # ---------------------------------------------------------------- roots ------
 # raw parsed FIX data (date-partitioned parquet: trades / ob_updates / ob_snapshot)
-PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+PARSED_ROOT = Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Parsed")
 # everything the backtests/tools write
-RESULTS_ROOT = Path("/Users/shazzak/Capital Stake - Results")
+RESULTS_ROOT = Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results")
 # project code root
 PROJECT_ROOT = Path("/Users/shazzak/PycharmProjects/HFT")
 
@@ -46,3 +46,10 @@ DEV_SYMBOLS = ["PPL", "UBL"]
 LOCK_SYMBOL = "PACE"
 # per-symbol back-solved session_scale (skew at max inventory ~ 1x median spread)
 SESSION_SCALE = {"PPL": 7.6, "UBL": 3.9, "PACE": 46.15}
+
+# ---------------------------------------------------------------- engine ----
+# alias the raw store under the name run_legacy_mm / mm_harness expect to SET
+# (they do `R.PARSED_ROOT = ...`); importing this keeps one source of truth.
+PARSED = PARSED_ROOT
+# diagnostics write here (created on demand by the tools)
+DIAGNOSTICS = RESULTS_ROOT / "diagnostics"
