@@ -17,8 +17,8 @@ from tableauhyperapi import (
 )
 
 
-input_parquet = Path("/Users/shazzak/HFT Data/Vietnam - Ho Chi Minh")
-output_hyper = Path("/Users/shazzak/HFT Data/Vietnam - Ho Chi Minh/csv")
+input_parquet = Path("C:/Users/shahzeb/Desktop/Del/Output/")
+output_hyper = Path("C:/Users/shahzeb/Desktop/Del/Output/")
 table_name = TableName("Extract")
 
 
