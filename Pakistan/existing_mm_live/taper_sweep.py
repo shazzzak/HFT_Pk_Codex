@@ -95,61 +95,68 @@ MICRO_LAMBDA = [None]
 # Base = current production: OBI throttle (0.5x/300ms), OFI OFF. When the cap is
 # on, max acquirable |pos| = min(max_inv, unwind_capacity x mult); mult scales how
 # many unwind-capacities of inventory you allow to build. NONE = no-throttle anchor.
-# ---- INVENTORY-TAPER P&L SWEEP ----
-# Replaces the soft_inv CLIFF (full size -> side off at 3 clips) with a RAMP that
-# scales quote QUANTITY by how much of our remaining clearable capacity we have
-# already used:
-#     util      = |pos| / (_pov_capacity() * inv_taper_pov_mult)
-#     add side  = clip * max(floor, (1-util)^k)     [the side that grows |pos|]
-#     red side  = clip * (1+util)                   [only when ..._both=True]
-# Per-ticker automatically (each name's own volume profile) and it tightens
-# through the day as capacity decays. Acts on a CERTAINTY (our real inventory),
-# not a predictive signal, and changes QUANTITY only -- never price, never queue
-# position -- so the capture-destruction mechanism that killed the price-skew
-# tests does not apply.
+# ---- INVENTORY-TAPER P&L SWEEP (decoupled POV) ----
+# KEY DESIGN (SZ): unwind_pov stays at the production 10% -- the POV sweep proved
+# that is optimal for the EOD unwind trigger (lowering it only hurt last15). The
+# taper's bite is controlled SEPARATELY by inv_taper_pov_mult, which scales ONLY
+# the taper's capacity denominator (util = |pos| / (_pov_capacity()*mult)). So
+# mult=0.25 makes the taper see ~2.5% capacity -> util 4x larger -> the taper
+# actually engages -- WITHOUT touching the EOD trigger, so last15 is never harmed.
+# This is the decoupling that makes the taper viable.
 #
-# ANCHOR POV: set TAPER_POV to whatever unwind_pov won in pov_sweep.py. util is
-# computed off _pov_capacity(), which scales with unwind_pov, so the taper's bite
-# depends on it directly. Every config below uses this same rate, so the ONLY
-# thing varying across configs is the taper shape -- the POV effect is already
-# held constant (and was measured separately in pov_sweep.py).
-TAPER_POV = 0.025
+# SUCCESS BARS (pre-committed, per SZ):
+#   1. taper must beat 10%-no-taper PRODUCTION on net bps, day-as-unit, DD non-worse
+#   2. the per-ticker gain must be BROAD (not 2-3 names)
+#   3. it must survive being STACKED ON QUEUE SKEW (the confirmed edge)
+# clears all 3 -> full-year confirm -> deploy OBI+queue-skew+taper.
+# clears mechanism only -> "works but not worth it", document, close.
+#
+# The winning queue-skew config from the finer sweep (QT_1t: +1.17 bps/day,
+# Sharpe 37, 1/4 the drawdown) is used as the skew layer.
 _OBI = dict(obi_throttle=True, ofi_throttle=False, obi_throttle_thresh=0.15,
             throttle_frac=0.5, throttle_hold_ms=300.0, qdr_throttle=False,
             enable_pov_cap=False, flow_throttle=False, enable_run_reprice=False,
             enable_aggr_lean=False, enable_age_cross=False,
-            size_boost_mult=1.0, queue_skew_ticks=0.0, enable_inv_taper=False)
-# CONTROL = the anchor POV with the taper OFF. This is the right control: it
-# isolates the TAPER, with the participation rate held at the same value the
-# taper configs use (pov_sweep.py already measured POV vs production separately).
-THROTTLE_MODES = [dict(_OBI, unwind_pov=TAPER_POV)]
-THROTTLE_LABELS = [f"CTRL_pov{TAPER_POV*100:g}"]
-# sensitivity exponents: 1 = linear taper, 2 = steeper, 3 = aggressive
-_TAPER_K = [1.0, 2.0, 3.0]
-# capacity scalers: 1.0 = taper against full remaining capacity, 0.5 = engage
-# twice as early (treat capacity as half of what the POV model says)
-_TAPER_MULT = [1.0, 0.5]
-# add-side-only vs also boosting the reducing side
-_TAPER_BOTH = [False, True]
-# build the grid: k x capacity-scale x (add|both)
-for _k in _TAPER_K:
-    for _mult in _TAPER_MULT:
-        for _both in _TAPER_BOTH:
-            THROTTLE_MODES.append(dict(_OBI, unwind_pov=TAPER_POV,
-                                       enable_inv_taper=True,
-                                       inv_taper_k=_k,
-                                       inv_taper_pov_mult=_mult,
-                                       inv_taper_floor=0.25,
-                                       inv_taper_both=_both))
-            THROTTLE_LABELS.append(
-                f"T_k{_k:g}_m{_mult:g}_{'both' if _both else 'add'}")
+            size_boost_mult=1.0, queue_skew_ticks=0.0, queue_skew_bps=0.0,
+            enable_inv_taper=False)
+# the confirmed queue-skew layer (1 tick)
+_QSKEW = dict(queue_skew_ticks=1.0, queue_skew_thresh=0.15)
+# taper capacity multipliers (0.25 = ~2.5% capacity -> taper bites; 0.5 = ~5%)
+_MULTS = [0.25, 0.5]
+# taper sensitivity exponents
+_KS = [1.0, 2.0]
+# config list (label, params)
+THROTTLE_MODES = []
+THROTTLE_LABELS = []
+# 0) PRODUCTION baseline: 10% POV, no taper, no skew -- the bar to beat
+THROTTLE_MODES.append(dict(_OBI)); THROTTLE_LABELS.append("PROD")
+# 1) QUEUE SKEW only (confirmed edge) -- taper must beat THIS to be additive
+THROTTLE_MODES.append(dict(_OBI, **_QSKEW)); THROTTLE_LABELS.append("QSKEW")
+# 2) TAPER-only mechanism configs (no skew): does the taper help at all, on top of bare OBI?
+for _m in _MULTS:
+    for _k in _KS:
+        THROTTLE_MODES.append(dict(_OBI, enable_inv_taper=True, inv_taper_k=_k,
+                                   inv_taper_pov_mult=_m, inv_taper_floor=0.25,
+                                   inv_taper_both=True))
+        THROTTLE_LABELS.append(f"TAPER_m{_m:g}_k{_k:g}")
+# 3) THE DEPLOYMENT STACK: queue skew + taper together (the real question)
+for _m in _MULTS:
+    THROTTLE_MODES.append(dict(_OBI, **_QSKEW, enable_inv_taper=True, inv_taper_k=1.0,
+                               inv_taper_pov_mult=_m, inv_taper_floor=0.25,
+                               inv_taper_both=True))
+    THROTTLE_LABELS.append(f"QSKEW+TAPER_m{_m:g}")
+# NOTE: unwind_pov is left at the production default (0.10) in EVERY config, so the
+# EOD trigger / last15 is identical everywhere -- only the taper denominator varies.
 def _cfg_lab(thr):
     return THROTTLE_LABELS[thr]
 def _cfg_thr(thr):
     m = THROTTLE_MODES[thr]
-    # taper off -> just mark it the control
-    if not m.get("enable_inv_taper"):
-        return "off"
+    parts = []
+    if m.get("queue_skew_ticks", 0.0) != 0.0:
+        parts.append("qs1t")
+    if m.get("enable_inv_taper"):
+        parts.append(f"m{m['inv_taper_pov_mult']:g}k{m['inv_taper_k']:g}")
+    return "+".join(parts) if parts else "prod"
     # k, capacity multiplier, and which sides are affected
     return f"k{m['inv_taper_k']:g}/m{m['inv_taper_pov_mult']:g}"
 
@@ -1100,7 +1107,7 @@ def main():
                              for b in H.BUCKETS if b in daily_bkt[key][day]),
                 "off_minus_this_bps": diff})
     # write the granular daily CSV
-    dout = RESULTS / f"taper_sweep_DAILY_{stamp}.csv"
+    dout = RESULTS / f"taper_sweep_DAILY_{stamp}.parquet"
     pd.DataFrame(drows).to_csv(dout, index=False)
     print(f"wrote {dout}  ({len(drows)} rows: per config x day x bucket + ALL)")
 
@@ -1131,7 +1138,7 @@ def main():
                 # and markout in bps (the adverse-selection read, per name)
                 "markout_bps": _b(mko_pkr),
                 "opened_notional": on, "fills": fills})
-    nout = RESULTS / f"taper_sweep_PERNAME_{stamp}.csv"
+    nout = RESULTS / f"taper_sweep_PERNAME_{stamp}.parquet"
     pd.DataFrame(nrows).to_csv(nout, index=False)
     print(f"wrote {nout}  ({len(nrows)} rows: per config x day x name x bucket)")
 

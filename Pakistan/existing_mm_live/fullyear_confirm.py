@@ -95,72 +95,60 @@ MICRO_LAMBDA = [None]
 # Base = current production: OBI throttle (0.5x/300ms), OFI OFF. When the cap is
 # on, max acquirable |pos| = min(max_inv, unwind_capacity x mult); mult scales how
 # many unwind-capacities of inventory you allow to build. NONE = no-throttle anchor.
-# ---- UNWIND-POV P&L SWEEP (isolated) ----
-# unwind_pov is the assumed participation rate we can passively clear at. It has
-# been a hardcoded 0.10 (10% of volume) since day one and was NEVER swept. It
-# drives TWO things at once:
-#   * _unwind_needed(): WHEN the EOD unwind engages (mins_needed >= mins_left)
-#   * _pov_capacity(): how much inventory we consider still clearable
-# 10% of a thin PSX name's volume is an aggressive assumption; 2.5-5% is closer
-# to what is actually achievable without moving the price. A LOWER pov means we
-# believe we can clear less per minute -> the unwind engages EARLIER and more
-# often -> expect the effect to land in the preclose45 / last15 buckets.
-# NOTHING else changes in these configs: the taper, size skew and queue skew are
-# all off, so any difference is attributable to unwind_pov alone.
-#   OBI (thr=0) = current production (unwind_pov=0.10) = control.
+# ---- FULL-YEAR QUEUE-SKEW CONFIRMATION ----
+# The decision run: confirm the queue-skew edge on ALL 207 days (not the 30-day
+# tuning sample) and pick the deploy config. Configs are the CLEAN whole-tick
+# ones only (QT_1.5t dropped -- it was a grid-rounding artifact, not a real
+# parameter). QBPS_2 is legitimate because it snaps to whole ticks per-name.
+#   OBI     = current production = control
+#   QT_1t   = fixed 1 tick
+#   QT_2t   = fixed 2 ticks
+#   QBPS_2  = 2 bps of mid -> whole ticks per name (risk champion on 30d: Sharpe 41.6)
+# CHEAP-TICK EXCLUSION: KEL/PIBTL/TPL lose under every queue-skew variant because
+# their books are ~1 tick wide (no room to skew inside). They are EXCLUDED from the
+# skew here (forced to plain OBI) -- see _cheap_excluded below.
 _OBI = dict(obi_throttle=True, ofi_throttle=False, obi_throttle_thresh=0.15,
             throttle_frac=0.5, throttle_hold_ms=300.0, qdr_throttle=False,
             enable_pov_cap=False, flow_throttle=False, enable_run_reprice=False,
             enable_aggr_lean=False, enable_age_cross=False,
-            size_boost_mult=1.0, queue_skew_ticks=0.0, enable_inv_taper=False)
-# participation rates to test against the production 10%
-_POVS = [0.05, 0.025]
-# thr=0 control: production, unwind_pov untouched (build_micro_params default 0.10)
-THROTTLE_MODES = [dict(_OBI)]
-THROTTLE_LABELS = ["OBI_pov10"]
-# one config per candidate participation rate; ONLY unwind_pov differs
-for _p in _POVS:
-    THROTTLE_MODES.append(dict(_OBI, unwind_pov=_p))
-    THROTTLE_LABELS.append(f"POV_{_p*100:g}pct")
-def _safe_parquet(df, path):
-    """Write a DataFrame to parquet ATOMICALLY and VERIFY it reads back.
-    Writes to a .tmp sibling, reads the row count back, then os.replace()s into
-    place (atomic). A killed/OOM/disk-hiccup write leaves only the .tmp, never a
-    half-written real file. Falls back to CSV (same stem, .csv) if parquet engine
-    is unavailable, so the data is never lost to a missing dependency."""
-    import os as _os
-    # temp path in the same directory (so os.replace is a true atomic rename)
-    tmp = str(path) + ".tmp"
-    try:
-        # write parquet to the temp file
-        df.to_parquet(tmp, index=False)
-        # VERIFY: read the row count back before trusting it
-        import pyarrow.parquet as _pq
-        n = _pq.ParquetFile(tmp).metadata.num_rows
-        # row count must match what we wrote
-        assert n == len(df), f"parquet verify failed: wrote {len(df)} got {n}"
-        # atomic swap into the real path (complete-or-nothing)
-        _os.replace(tmp, path)
-        # report
-        print(f"wrote {path}  ({len(df)} rows, verified)")
-    except Exception as e:
-        # clean up the temp file if it exists
-        try:
-            _os.remove(tmp)
-        except OSError:
-            pass
-        # CSV fallback so a parquet problem never loses the data
-        csv_path = str(path).rsplit(".", 1)[0] + ".csv"
-        df.to_csv(csv_path, index=False)
-        print(f"parquet write failed ({e!r}) -> wrote CSV fallback {csv_path}  ({len(df)} rows)")
-
-
+            size_boost_mult=1.0, queue_skew_ticks=0.0, queue_skew_bps=0.0,
+            enable_inv_taper=False)
+# names excluded from queue skew (1-tick books -> skew cannot help, only hurts)
+CHEAP_EXCLUDED = {"KEL", "PIBTL", "TPL"}
+# the four confirmation configs
+THROTTLE_MODES = [
+    dict(_OBI),                                                   # OBI control
+    dict(_OBI, queue_skew_ticks=1.0, queue_skew_thresh=0.15),     # QT_1t
+    dict(_OBI, queue_skew_ticks=2.0, queue_skew_thresh=0.15),     # QT_2t
+    dict(_OBI, queue_skew_bps=2.0, queue_skew_thresh=0.15),       # QBPS_2
+    # QT_1t + inventory taper (m0.25,k1,both) -- the 30-day run showed zero
+    # drawdown / 100% win days / +34k on top of QT_1t, helping 24/38 names. The
+    # full year decides whether that risk improvement is real or 30-day luck.
+    dict(_OBI, queue_skew_ticks=1.0, queue_skew_thresh=0.15,
+         enable_inv_taper=True, inv_taper_k=1.0, inv_taper_pov_mult=0.25,
+         inv_taper_floor=0.25, inv_taper_both=True),              # QT_1t+TAPER m0.25
+    # same stack but the gentler taper (m0.5 ~= 5% capacity); 30-day run had it
+    # within noise of m0.25 -- let the full year pick the taper strength too.
+    dict(_OBI, queue_skew_ticks=1.0, queue_skew_thresh=0.15,
+         enable_inv_taper=True, inv_taper_k=1.0, inv_taper_pov_mult=0.5,
+         inv_taper_floor=0.25, inv_taper_both=True),              # QT_1t+TAPER m0.5
+]
+THROTTLE_LABELS = ["OBI", "QT_1t", "QT_2t", "QBPS_2", "QT_1t+TAP_m.25", "QT_1t+TAP_m.5"]
 def _cfg_lab(thr):
     return THROTTLE_LABELS[thr]
 def _cfg_thr(thr):
     m = THROTTLE_MODES[thr]
-    # the participation rate for this config (control shows the production 10%)
-    return f"{m.get('unwind_pov', 0.10)*100:g}%"
+    parts = []
+    if m.get("queue_skew_bps", 0.0) != 0.0:
+        parts.append(f"{m['queue_skew_bps']:g}bps")
+    elif m.get("queue_skew_ticks", 0.0) != 0.0:
+        parts.append(f"{m['queue_skew_ticks']:g}t")
+    if m.get("enable_inv_taper"):
+        parts.append(f"tpr{m['inv_taper_pov_mult']:g}")
+    return "+".join(parts) if parts else "-"
+    if m.get("queue_skew_ticks", 0.0) != 0.0:
+        return f"{m['queue_skew_ticks']:g}t"
+    return "-"
 
 EXIT_INV_THRESHOLD = 1.0
 # OBI-defensive engage threshold (|imb-0.5|) and widen ticks
@@ -173,7 +161,7 @@ JUMP_K = 4.0
 # not 4 hours. Set to None for the FULL ~207-day run ONLY after the canary's
 # anchor reads 0 on all 9 configs and preflight_coverage.py shows all names OK.
 # (Hard lesson: a multi-hour run was burned on an unverified sweep.)
-SMOKE_DAYS = 30
+SMOKE_DAYS = None   # None = ALL days after the trailing-median warmup (~197)
 # workers
 WORKERS = 9
 # -----------------------------------------------------------------------------
@@ -280,6 +268,11 @@ def _process(args):
     # frozen winner; ON (thr=1) enables the 0.5x time-boxed size throttle. Merged
     # AFTER build so it cleanly overrides the defaults without touching H.
     params.update(THROTTLE_MODES[thr])
+    # CHEAP-TICK EXCLUSION: force the 1-tick-book names to plain OBI (no skew),
+    # since queue skew only hurts them (measured: KEL/PIBTL/TPL lose every variant).
+    if sym in CHEAP_EXCLUDED:
+        params["queue_skew_ticks"] = 0.0
+        params["queue_skew_bps"] = 0.0
     # run
     dr = H.run_symbol_day(date, sym, dsets, params)
     if dr is None or dr.pnl() is None:
@@ -595,7 +588,7 @@ def main():
     # restart. The journal is the finest grain; the polished CSVs are still built
     # from the in-memory aggregation at the end (unchanged). File is fixed-named
     # (no stamp) so a resume finds the SAME journal.
-    ckpt_path = RESULTS / "pov_sweep_CKPT.jsonl"
+    ckpt_path = RESULTS / "fullyear_confirm_CKPT.jsonl"
     # a work item's identity for resume = (date, sym, thr) -- the only varying
     # axes here (everything else is a singleton). Load any already-done keys.
     done_keys = set()
@@ -625,7 +618,7 @@ def main():
     # open the journal in APPEND mode for this session (line-buffered so every
     # write hits disk promptly; we also flush explicitly per cell)
     ckpt_fh = open(ckpt_path, "a", buffering=1)
-    print(f"\nUNWIND-POV -- participation rate 10% vs 5% vs 2.5% (isolated) (winner frozen "
+    print(f"\nFULL-YEAR CONFIRMATION -- OBI vs QT_1t vs QT_2t vs QBPS_2, 207 days, cheap-tick excluded (winner frozen "
           f"et1/obi+/tol0/mid, OFI-defensive off; framing #2 = throttle STACKS "
           f"on obi_defensive): OFF vs ON = {len(configs)} configs",
           flush=True)
@@ -833,7 +826,6 @@ def main():
         tlab = _cfg_thr(thr)
         print(f"{wlab:>14s} {tlab:>7s} {n:>7d} {mean:>9.3f} {se:>7.3f}")
 
-
     # ---- RISK METRICS (built into every sweep; no separate script needed) ----
     # Per config, on the DAILY series: annualised Sharpe & Sortino on the net-bps
     # return proxy, max drawdown on cumulative net PKR, and win rate. Day-as-unit
@@ -889,7 +881,6 @@ def main():
         # labels
         print(f"{_cfg_lab(thr):>14s} {_cfg_thr(thr):>7s} {tot:>13,.0f} {mb:>7.2f} "
               f"{_sharpe(vals):>7.1f} {_sortino(vals):>8.1f} {_maxdd_pkr(pkr_by_day):>12,.0f} {win:>4.0f}%")
-
 
     # OFF-vs-OFI paired differences (paired by day)
     if off_key is not None:
@@ -1047,7 +1038,7 @@ def main():
                      "median_hold_s": (np.median(allhold) / 1000.0
                                        if allhold else np.nan),
                      "trades": sum(a[b]["trades"] for b in H.BUCKETS)})
-    out = RESULTS / f"pov_sweep_{stamp}.csv"
+    out = RESULTS / f"fullyear_confirm_{stamp}.csv"
     pd.DataFrame(rows).to_csv(out, index=False)
     print(f"\nwrote {out}")
 
@@ -1109,7 +1100,7 @@ def main():
                              for b in H.BUCKETS if b in daily_bkt[key][day]),
                 "off_minus_this_bps": diff})
     # write the granular daily CSV
-    dout = RESULTS / f"pov_sweep_DAILY_{stamp}.parquet"
+    dout = RESULTS / f"fullyear_confirm_DAILY_{stamp}.parquet"
     _safe_parquet(pd.DataFrame(drows), dout)
 
     # ---- PER-NAME DAILY CSV (finest grain; the axis that must never be dropped)
@@ -1139,7 +1130,7 @@ def main():
                 # and markout in bps (the adverse-selection read, per name)
                 "markout_bps": _b(mko_pkr),
                 "opened_notional": on, "fills": fills})
-    nout = RESULTS / f"pov_sweep_PERNAME_{stamp}.parquet"
+    nout = RESULTS / f"fullyear_confirm_PERNAME_{stamp}.parquet"
     _safe_parquet(pd.DataFrame(nrows), nout)
 
 

@@ -231,7 +231,8 @@ def _one(date, sym, dsets):
         to_clear = lab["ahead_qty"] + lab["qty"]
         # for each window, build the production column: live ewait if not censored,
         # else the historic-rate estimate (finite when the bucket rate is > 0)
-        for wl in [c[len("ewait_"):] for c in lab.columns if c.startswith("ewait_")]:
+        for wl in [c[len("ewait_"):] for c in lab.columns
+                   if c.startswith("ewait_") and not c.endswith("_prod")]:
             # historic expected-wait (minutes) = shares to clear / historic rate
             hist_ew = to_clear / hist_rate.replace(0.0, np.nan)
             # production column: live where available, historic fallback where censored
@@ -397,7 +398,8 @@ def _report(df, out_dir):
     # more). A good window shows a steep, monotone gradient AND its censored
     # quotes (rate 0) fill rarely. The best window = steepest monotone spread
     # between the shortest-wait and longest-wait deciles.
-    wlabs = sorted({c[len("ewait_"):] for c in df.columns if c.startswith("ewait_")})
+    wlabs = sorted({c[len("ewait_"):] for c in df.columns
+                    if c.startswith("ewait_") and not c.endswith("_prod")})
     if wlabs:
         print(_ts() + "\n===== ARRIVAL-RATE WINDOW CALIBRATION (does expected-wait predict fills?) =====")
         print(_ts() + "  per window: fill rate by expected-wait bucket (finite waits only), then censored.")

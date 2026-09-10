@@ -912,6 +912,7 @@ class Backtester:
                                "reason": "taker",
                                "window": getattr(self.strat, "current_window", "none"),
                                "bucket": getattr(self.strat, "current_bucket", "middle"),
+                               "regime": getattr(self.strat, "current_regime", "normal"),
                                "oid": o.oid})
             # reduce the remainder
             remaining -= take
@@ -973,6 +974,7 @@ class Backtester:
                            # ...and WHICH time-of-day bucket (first15/middle/
                            # preclose45/last15) for per-bucket net_bps analysis.
                            "bucket": getattr(self.strat, "current_bucket", "middle"),
+                           "regime": getattr(self.strat, "current_regime", "normal"),
                            # ...plus WHICH order this fill consumed (lifecycle join
                            # key for time-to-fill / queue-wait in the harness).
                            "oid": o.oid})

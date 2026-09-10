@@ -95,33 +95,38 @@ MICRO_LAMBDA = [None]
 # Base = current production: OBI throttle (0.5x/300ms), OFI OFF. When the cap is
 # on, max acquirable |pos| = min(max_inv, unwind_capacity x mult); mult scales how
 # many unwind-capacities of inventory you allow to build. NONE = no-throttle anchor.
-# ---- UNWIND-POV P&L SWEEP (isolated) ----
-# unwind_pov is the assumed participation rate we can passively clear at. It has
-# been a hardcoded 0.10 (10% of volume) since day one and was NEVER swept. It
-# drives TWO things at once:
-#   * _unwind_needed(): WHEN the EOD unwind engages (mins_needed >= mins_left)
-#   * _pov_capacity(): how much inventory we consider still clearable
-# 10% of a thin PSX name's volume is an aggressive assumption; 2.5-5% is closer
-# to what is actually achievable without moving the price. A LOWER pov means we
-# believe we can clear less per minute -> the unwind engages EARLIER and more
-# often -> expect the effect to land in the preclose45 / last15 buckets.
-# NOTHING else changes in these configs: the taper, size skew and queue skew are
-# all off, so any difference is attributable to unwind_pov alone.
-#   OBI (thr=0) = current production (unwind_pov=0.10) = control.
+# ---- FINER QUEUE-SKEW P&L SWEEP ----
+# QUEUE skew won the coarse sweep (QUEUE_1t: +1.17 bps/day, Sharpe 37 vs 22,
+# 1/4 the drawdown, 35/38 names). This refines it two ways:
+#   (a) FIXED-TICK granularity: 0.5t / 1t / 1.5t  (is 1t the sweet spot, or finer?)
+#   (b) PRICE-RELATIVE (bps): shift the favorable side by N bps of mid (>=1 tick),
+#       so cheap-tick names (KEL/PIBTL/TPL, where 1 tick ~10 bps was too coarse)
+#       skew by a sensible economic amount instead of a giant whole tick.
+# Mechanism reminder: queue skew shifts BOTH quotes toward the book lean by the
+# same distance -- width unchanged, center moved -- so it does NOT spend spread
+# capture; it changes fill PROBABILITY by improving queue position on the
+# favorable side. Tested incremental over the OBI throttle.
 _OBI = dict(obi_throttle=True, ofi_throttle=False, obi_throttle_thresh=0.15,
             throttle_frac=0.5, throttle_hold_ms=300.0, qdr_throttle=False,
             enable_pov_cap=False, flow_throttle=False, enable_run_reprice=False,
             enable_aggr_lean=False, enable_age_cross=False,
-            size_boost_mult=1.0, queue_skew_ticks=0.0, enable_inv_taper=False)
-# participation rates to test against the production 10%
-_POVS = [0.05, 0.025]
-# thr=0 control: production, unwind_pov untouched (build_micro_params default 0.10)
+            size_boost_mult=1.0, queue_skew_ticks=0.0, queue_skew_bps=0.0,
+            enable_inv_taper=False)
+# fixed-tick granularities to sweep
+_FIXED = [0.5, 1.0, 1.5]
+# price-relative (bps of mid) shifts to sweep
+_BPS = [2.0, 4.0, 6.0]
+# thr=0 control
 THROTTLE_MODES = [dict(_OBI)]
-THROTTLE_LABELS = ["OBI_pov10"]
-# one config per candidate participation rate; ONLY unwind_pov differs
-for _p in _POVS:
-    THROTTLE_MODES.append(dict(_OBI, unwind_pov=_p))
-    THROTTLE_LABELS.append(f"POV_{_p*100:g}pct")
+THROTTLE_LABELS = ["OBI"]
+# fixed-tick configs
+for _t in _FIXED:
+    THROTTLE_MODES.append(dict(_OBI, queue_skew_ticks=_t, queue_skew_thresh=0.15))
+    THROTTLE_LABELS.append(f"QT_{_t:g}t")
+# price-relative configs
+for _b in _BPS:
+    THROTTLE_MODES.append(dict(_OBI, queue_skew_bps=_b, queue_skew_thresh=0.15))
+    THROTTLE_LABELS.append(f"QBPS_{_b:g}")
 def _safe_parquet(df, path):
     """Write a DataFrame to parquet ATOMICALLY and VERIFY it reads back.
     Writes to a .tmp sibling, reads the row count back, then os.replace()s into
@@ -159,8 +164,11 @@ def _cfg_lab(thr):
     return THROTTLE_LABELS[thr]
 def _cfg_thr(thr):
     m = THROTTLE_MODES[thr]
-    # the participation rate for this config (control shows the production 10%)
-    return f"{m.get('unwind_pov', 0.10)*100:g}%"
+    if m.get("queue_skew_bps", 0.0) != 0.0:
+        return f"{m['queue_skew_bps']:g}bps"
+    if m.get("queue_skew_ticks", 0.0) != 0.0:
+        return f"{m['queue_skew_ticks']:g}t"
+    return "-"
 
 EXIT_INV_THRESHOLD = 1.0
 # OBI-defensive engage threshold (|imb-0.5|) and widen ticks
@@ -595,7 +603,7 @@ def main():
     # restart. The journal is the finest grain; the polished CSVs are still built
     # from the in-memory aggregation at the end (unchanged). File is fixed-named
     # (no stamp) so a resume finds the SAME journal.
-    ckpt_path = RESULTS / "pov_sweep_CKPT.jsonl"
+    ckpt_path = RESULTS / "queue_fine_sweep_CKPT.jsonl"
     # a work item's identity for resume = (date, sym, thr) -- the only varying
     # axes here (everything else is a singleton). Load any already-done keys.
     done_keys = set()
@@ -625,7 +633,7 @@ def main():
     # open the journal in APPEND mode for this session (line-buffered so every
     # write hits disk promptly; we also flush explicitly per cell)
     ckpt_fh = open(ckpt_path, "a", buffering=1)
-    print(f"\nUNWIND-POV -- participation rate 10% vs 5% vs 2.5% (isolated) (winner frozen "
+    print(f"\nFINER QUEUE-SKEW -- fixed-tick (0.5/1/1.5) + price-relative (2/4/6 bps) (winner frozen "
           f"et1/obi+/tol0/mid, OFI-defensive off; framing #2 = throttle STACKS "
           f"on obi_defensive): OFF vs ON = {len(configs)} configs",
           flush=True)
@@ -833,7 +841,6 @@ def main():
         tlab = _cfg_thr(thr)
         print(f"{wlab:>14s} {tlab:>7s} {n:>7d} {mean:>9.3f} {se:>7.3f}")
 
-
     # ---- RISK METRICS (built into every sweep; no separate script needed) ----
     # Per config, on the DAILY series: annualised Sharpe & Sortino on the net-bps
     # return proxy, max drawdown on cumulative net PKR, and win rate. Day-as-unit
@@ -889,7 +896,6 @@ def main():
         # labels
         print(f"{_cfg_lab(thr):>14s} {_cfg_thr(thr):>7s} {tot:>13,.0f} {mb:>7.2f} "
               f"{_sharpe(vals):>7.1f} {_sortino(vals):>8.1f} {_maxdd_pkr(pkr_by_day):>12,.0f} {win:>4.0f}%")
-
 
     # OFF-vs-OFI paired differences (paired by day)
     if off_key is not None:
@@ -1047,7 +1053,7 @@ def main():
                      "median_hold_s": (np.median(allhold) / 1000.0
                                        if allhold else np.nan),
                      "trades": sum(a[b]["trades"] for b in H.BUCKETS)})
-    out = RESULTS / f"pov_sweep_{stamp}.csv"
+    out = RESULTS / f"queue_fine_sweep_{stamp}.csv"
     pd.DataFrame(rows).to_csv(out, index=False)
     print(f"\nwrote {out}")
 
@@ -1109,7 +1115,7 @@ def main():
                              for b in H.BUCKETS if b in daily_bkt[key][day]),
                 "off_minus_this_bps": diff})
     # write the granular daily CSV
-    dout = RESULTS / f"pov_sweep_DAILY_{stamp}.parquet"
+    dout = RESULTS / f"queue_fine_sweep_DAILY_{stamp}.parquet"
     _safe_parquet(pd.DataFrame(drows), dout)
 
     # ---- PER-NAME DAILY CSV (finest grain; the axis that must never be dropped)
@@ -1139,7 +1145,7 @@ def main():
                 # and markout in bps (the adverse-selection read, per name)
                 "markout_bps": _b(mko_pkr),
                 "opened_notional": on, "fills": fills})
-    nout = RESULTS / f"pov_sweep_PERNAME_{stamp}.parquet"
+    nout = RESULTS / f"queue_fine_sweep_PERNAME_{stamp}.parquet"
     _safe_parquet(pd.DataFrame(nrows), nout)
 
 

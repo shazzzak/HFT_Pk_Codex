@@ -144,6 +144,39 @@ for _p in _POVS:
                                        inv_taper_k=_k, inv_taper_pov_mult=1.0,
                                        inv_taper_floor=0.25, inv_taper_both=_both))
             THROTTLE_LABELS.append(f"TAPER_{_p*100:g}pct_k{_k:g}_{'both' if _both else 'add'}")
+def _safe_parquet(df, path):
+    """Write a DataFrame to parquet ATOMICALLY and VERIFY it reads back.
+    Writes to a .tmp sibling, reads the row count back, then os.replace()s into
+    place (atomic). A killed/OOM/disk-hiccup write leaves only the .tmp, never a
+    half-written real file. Falls back to CSV (same stem, .csv) if parquet engine
+    is unavailable, so the data is never lost to a missing dependency."""
+    import os as _os
+    # temp path in the same directory (so os.replace is a true atomic rename)
+    tmp = str(path) + ".tmp"
+    try:
+        # write parquet to the temp file
+        df.to_parquet(tmp, index=False)
+        # VERIFY: read the row count back before trusting it
+        import pyarrow.parquet as _pq
+        n = _pq.ParquetFile(tmp).metadata.num_rows
+        # row count must match what we wrote
+        assert n == len(df), f"parquet verify failed: wrote {len(df)} got {n}"
+        # atomic swap into the real path (complete-or-nothing)
+        _os.replace(tmp, path)
+        # report
+        print(f"wrote {path}  ({len(df)} rows, verified)")
+    except Exception as e:
+        # clean up the temp file if it exists
+        try:
+            _os.remove(tmp)
+        except OSError:
+            pass
+        # CSV fallback so a parquet problem never loses the data
+        csv_path = str(path).rsplit(".", 1)[0] + ".csv"
+        df.to_csv(csv_path, index=False)
+        print(f"parquet write failed ({e!r}) -> wrote CSV fallback {csv_path}  ({len(df)} rows)")
+
+
 def _cfg_lab(thr):
     return THROTTLE_LABELS[thr]
 def _cfg_thr(thr):
@@ -1104,9 +1137,8 @@ def main():
                              for b in H.BUCKETS if b in daily_bkt[key][day]),
                 "off_minus_this_bps": diff})
     # write the granular daily CSV
-    dout = RESULTS / f"skew_sweep_DAILY_{stamp}.csv"
-    pd.DataFrame(drows).to_csv(dout, index=False)
-    print(f"wrote {dout}  ({len(drows)} rows: per config x day x bucket + ALL)")
+    dout = RESULTS / f"skew_sweep_DAILY_{stamp}.parquet"
+    _safe_parquet(pd.DataFrame(drows), dout)
 
     # ---- PER-NAME DAILY CSV (finest grain; the axis that must never be dropped)
     # One row per (config, day, name, bucket): net_pkr + opened_notional + fills.
@@ -1135,9 +1167,8 @@ def main():
                 # and markout in bps (the adverse-selection read, per name)
                 "markout_bps": _b(mko_pkr),
                 "opened_notional": on, "fills": fills})
-    nout = RESULTS / f"skew_sweep_PERNAME_{stamp}.csv"
-    pd.DataFrame(nrows).to_csv(nout, index=False)
-    print(f"wrote {nout}  ({len(nrows)} rows: per config x day x name x bucket)")
+    nout = RESULTS / f"skew_sweep_PERNAME_{stamp}.parquet"
+    _safe_parquet(pd.DataFrame(nrows), nout)
 
 
 if __name__ == "__main__":

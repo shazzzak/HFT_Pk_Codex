@@ -234,6 +234,15 @@ class MicrostructureMM:
                  # 0 -> byte-identical to today.
                  queue_skew_ticks=0.0,
                  queue_skew_thresh=0.15,
+                 # PRICE-RELATIVE queue skew (default 0 = use the fixed-tick mode
+                 # above). When >0, the skew DISTANCE is queue_skew_bps of the mid
+                 # (converted to whole ticks, min 1 tick when it rounds below one),
+                 # instead of a fixed tick count. This fixes the cheap-tick names:
+                 # 1 fixed tick is ~10 bps on a PKR 9 stock (way too coarse) but a
+                 # fraction of a tick on a PKR 900 stock. bps-relative shifts every
+                 # name by the same ECONOMIC amount. queue_skew_ticks is ignored
+                 # when this is >0. 0 -> unchanged (fixed-tick or off).
+                 queue_skew_bps=0.0,
                  # --- INVENTORY-DRIVEN SIZE TAPER (default off) ---
                  # Replaces the soft_inv CLIFF (full size -> side off) with a RAMP,
                  # anchored to real per-name capacity rather than a clip count:
@@ -252,6 +261,16 @@ class MicrostructureMM:
                  # dr.order_log becomes an unbiased fill-probability dataset.
                  # Pure logging -- never changes a quote (byte-identical either way).
                  log_fill_state=False,
+                 # --- ONE-TICK REGIME MM (default off): when the live spread is
+                 # exactly 1 tick, normal two-sided skew has no room. Instead, quote
+                 # ONLY the OBI-favorable side (bid if bid-heavy, ask if ask-heavy)
+                 # when |obi| >= onetick_obi_thresh; quote NOTHING when the signal
+                 # is absent. Once we hold inventory, revert to normal touch-following
+                 # exit on the reducing side (handled by the normal path). Every fill
+                 # is tagged current_regime ("onetick" vs "normal") so the 1-tick
+                 # regime P&L can be read separately. Off -> byte-identical.
+                 enable_onetick_mm=False,
+                 onetick_obi_thresh=0.15,
                  inv_taper_pov_mult=1.0,     # scales the capacity denominator
                  inv_taper_floor=0.25,       # never shrink the add side below this
                  inv_taper_both=False,       # also BOOST the reduce side by (1+util)
@@ -487,9 +506,15 @@ class MicrostructureMM:
         # --- QUEUE SKEW state (0 -> byte-identical) ---
         self.queue_skew_ticks = float(queue_skew_ticks)
         self.queue_skew_thresh = float(queue_skew_thresh)
+        self.queue_skew_bps = float(queue_skew_bps)
         # --- INVENTORY TAPER state (off -> byte-identical) ---
         # engine reads this to decide whether to capture post-time market state
         self.log_fill_state = bool(log_fill_state)
+        # --- ONE-TICK REGIME MM state (off -> byte-identical) ---
+        self.enable_onetick_mm = bool(enable_onetick_mm)
+        self.onetick_obi_thresh = float(onetick_obi_thresh)
+        # regime tag for the CURRENT quote cycle; the engine copies it onto fills
+        self.current_regime = "normal"
         self.enable_inv_taper = enable_inv_taper
         self.inv_taper_k = float(inv_taper_k)
         self.inv_taper_pov_mult = float(inv_taper_pov_mult)
@@ -1207,6 +1232,34 @@ class MicrostructureMM:
         # No two-sided book with depth on both sides -> nothing to quote against.
         if bb is None or ba is None or bq <= 0 or aq <= 0:
             return {}
+        # ---- REGIME TAG + ONE-TICK MM GATE ----
+        # default regime is normal; the engine copies current_regime onto each fill.
+        self.current_regime = "normal"
+        if self.enable_onetick_mm:
+            # is the live book locked at a 1-tick spread?
+            _is_onetick = (ba - bb) <= self.tick * 1.5
+            if _is_onetick:
+                # tag fills that happen now as the 1-tick regime
+                self.current_regime = "onetick"
+                # L1 imbalance in [-1,+1]: +ve bid-heavy (up-pressure), -ve ask-heavy
+                _obi1 = (bq - aq) / (bq + aq) if (bq + aq) > 0 else 0.0
+                # if we are FLAT, this is an ENTRY decision: quote ONLY the favorable
+                # side, and only when the OBI signal is present; else quote nothing.
+                if abs(pos) < 1e-9:
+                    # bid-heavy past threshold -> post ONLY the bid (buy favorable side)
+                    if _obi1 >= self.onetick_obi_thresh:
+                        # join the touch on the bid (1-tick book: at the best bid)
+                        return {"BUY": (round(bb, 2), self.size0)}
+                    # ask-heavy past threshold -> post ONLY the ask
+                    elif _obi1 <= -self.onetick_obi_thresh:
+                        # join the touch on the ask
+                        return {"SELL": (round(ba, 2), self.size0)}
+                    # no signal -> do not quote (sit out the flat+no-signal 1-tick state)
+                    else:
+                        return {}
+                # if we HOLD inventory, fall through to normal quoting so the exit
+                # side follows the touch (standard reduce-at-touch behaviour). The
+                # fills are still tagged "onetick" because the spread is 1 tick now.
         # ---- AGE-CROSS: cross the spread to fully flatten AGED inventory ----
         # Off -> the block is skipped entirely and want_taker_side stays None
         # (byte-identical). On: track the age of the current net position; once it
@@ -1541,9 +1594,22 @@ class MicrostructureMM:
         # Off (queue_skew_ticks==0) -> both halves equal `half` (byte-identical).
         qs_half_buy = half
         qs_half_sell = half
-        if self.queue_skew_ticks != 0.0:
-            # the tick distance to shift each side by
-            _qs = self.queue_skew_ticks * self.tick
+        # queue skew is active if EITHER the fixed-tick or the bps mode is set
+        if self.queue_skew_ticks != 0.0 or self.queue_skew_bps != 0.0:
+            # PRICE-RELATIVE mode: distance = queue_skew_bps of mid, rounded to a
+            # whole number of ticks (at least 1 tick so it always moves the quote).
+            if self.queue_skew_bps != 0.0:
+                # mid reference for the bps->price conversion
+                _mref = 0.5 * (bb + ba)
+                # target shift in price = bps of mid
+                _shift_px = self.queue_skew_bps / 1e4 * _mref
+                # convert to whole ticks, floor at 1 tick
+                _nticks = max(1, round(_shift_px / self.tick))
+                # the skew distance in price units
+                _qs = _nticks * self.tick
+            else:
+                # FIXED-tick mode: distance is a fixed number of ticks
+                _qs = self.queue_skew_ticks * self.tick
             # bid-heavy past threshold: BUY favorable (tighter), SELL exposed (wider)
             if (imb - 0.5) > self.queue_skew_thresh:
                 # step the bid closer to the touch
