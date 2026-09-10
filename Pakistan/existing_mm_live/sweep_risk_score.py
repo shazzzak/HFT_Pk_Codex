@@ -42,6 +42,9 @@ def score(path, control=None, bucket=None):
     cc = cfg_col(df)
     if bucket:
         df = df[df["bucket"] == bucket]
+    # a bucket with no rows (e.g. a name that never traded then) -> signal empty
+    if len(df) == 0:
+        return None, None
     g = df.groupby([cc, "date"]).agg(pkr=("net_pkr", "sum"), opn=("opened_notional", "sum")).reset_index()
     g["bps"] = np.where(g["opn"] > 0, g["pkr"] / g["opn"] * 1e4, np.nan)
     w_bps = g.pivot(index="date", columns=cc, values="bps")
@@ -73,9 +76,13 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("csv"); ap.add_argument("--control", default=None); ap.add_argument("--bucket", default=None)
     a = ap.parse_args()
-    for bk in ([a.bucket] if a.bucket else [None, "middle"]):
+    for bk in ([a.bucket] if a.bucket else [None, "first15", "middle", "preclose45", "last15"]):
         r, ctrl = score(a.csv, a.control, bk)
-        tag = f"BUCKET={bk}" if bk else "WHOLE DAY"
+        # nothing in this bucket -> say so and move on
+        if r is None or not len(r):
+            print(f"\n===== RISK-SCORED: {('BUCKET='+bk) if bk else 'WHOLE DAY'} -- no rows =====")
+            continue
+        tag = f"BUCKET={bk}" if bk else "WHOLE DAY (all buckets)"
         print(f"\n===== RISK-SCORED: {tag}  (control={ctrl}; quantstats={_QS}) =====")
         print(f"{'config':10s} {'net_PKR':>10s} {'bps':>6s} {'Sharpe':>7s} {'Sortino':>8s} {'maxDD_PKR':>11s} {'win%':>5s} {'vs_ctrl_bps':>11s} {'t':>6s}")
         for _, x in r.sort_values("net_pkr", ascending=False).iterrows():

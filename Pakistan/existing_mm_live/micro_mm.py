@@ -215,6 +215,46 @@ class MicrostructureMM:
                  # guarantee the exit; judged on drawdown/Sortino as much as P&L.
                  enable_age_cross=False,
                  age_cross_ms=900000.0,      # 15 minutes
+                 # --- SIZE SKEW (default 1.0 = off): the OFFENSIVE half of the
+                 # throttle. The throttle already CUTS the exposed side to
+                 # throttle_frac; this BOOSTS the FAVORABLE side (the one the book
+                 # leans toward) by size_boost_mult when |OBI| exceeds
+                 # size_boost_thresh. Changes QUANTITY only -- never price, never
+                 # queue position -- so it does not spend spread capture.
+                 # mult=1.0 -> byte-identical to today.
+                 size_boost_mult=1.0,
+                 size_boost_thresh=0.15,
+                 # --- QUEUE / AGGRESSIVENESS SKEW (default 0 = off): give the two
+                 # sides DIFFERENT queue positions instead of a symmetric half.
+                 # The FAVORABLE side steps queue_skew_ticks CLOSER to the touch
+                 # (better queue position -> higher fill probability); the EXPOSED
+                 # side steps the same distance BACK (lower fill probability).
+                 # Changes execution PROBABILITY, not size and not fair value --
+                 # the lever the literature flags for tick-constrained markets.
+                 # 0 -> byte-identical to today.
+                 queue_skew_ticks=0.0,
+                 queue_skew_thresh=0.15,
+                 # --- INVENTORY-DRIVEN SIZE TAPER (default off) ---
+                 # Replaces the soft_inv CLIFF (full size -> side off) with a RAMP,
+                 # anchored to real per-name capacity rather than a clip count:
+                 #   util = |pos| / (_pov_capacity() * inv_taper_pov_mult)
+                 # util=0 -> flat, quote full size. util->1 -> we already hold all
+                 # we can passively clear by the bell. The ADD side is scaled by
+                 # (1-util)^k (floored), and optionally the REDUCE side by (1+util).
+                 # Per-ticker automatically (each name's own volume profile) and it
+                 # tightens through the day as capacity decays. Acts on a CERTAINTY
+                 # (our actual inventory), not a predictive signal, and touches
+                 # QUANTITY only -- never price, never queue position.
+                 enable_inv_taper=False,
+                 inv_taper_k=1.0,            # sensitivity exponent on (1-util)
+                 # --- FILL-STATE LOGGING (default off): tell the engine to record
+                 # the market state at the instant each quote joins the queue, so
+                 # dr.order_log becomes an unbiased fill-probability dataset.
+                 # Pure logging -- never changes a quote (byte-identical either way).
+                 log_fill_state=False,
+                 inv_taper_pov_mult=1.0,     # scales the capacity denominator
+                 inv_taper_floor=0.25,       # never shrink the add side below this
+                 inv_taper_both=False,       # also BOOST the reduce side by (1+util)
                  # --- OBI-DEFENSIVE SKEW SWEEP (default OFF = current behavior) ---
                  # When True, suppress (widen) the side the book leans AGAINST, so
                  # we stop resting in front of predictable flow. imb>0.5 = bid-heavy
@@ -441,6 +481,20 @@ class MicrostructureMM:
         # age tracker: ts the current net position was established; sign last seen
         self._ac_pos_since_ts = None
         self._ac_prev_sign = 0
+        # --- SIZE SKEW state (mult 1.0 -> byte-identical) ---
+        self.size_boost_mult = float(size_boost_mult)
+        self.size_boost_thresh = float(size_boost_thresh)
+        # --- QUEUE SKEW state (0 -> byte-identical) ---
+        self.queue_skew_ticks = float(queue_skew_ticks)
+        self.queue_skew_thresh = float(queue_skew_thresh)
+        # --- INVENTORY TAPER state (off -> byte-identical) ---
+        # engine reads this to decide whether to capture post-time market state
+        self.log_fill_state = bool(log_fill_state)
+        self.enable_inv_taper = enable_inv_taper
+        self.inv_taper_k = float(inv_taper_k)
+        self.inv_taper_pov_mult = float(inv_taper_pov_mult)
+        self.inv_taper_floor = float(inv_taper_floor)
+        self.inv_taper_both = bool(inv_taper_both)
         # --- OBI-defensive skew (sweep axis 2; False = current behavior) ---
         # master toggle
         self.obi_defensive = obi_defensive
@@ -1306,6 +1360,33 @@ class MicrostructureMM:
         if sell_trig:
             self._throttle_sell_until = self.now + self.throttle_hold_ms
         # a side is throttled NOW if its hold is set and not yet expired
+        # --- SIZE SKEW: which side is FAVORABLE right now? imb>0.5 = bid-heavy =
+        # up-pressure -> a BUY (bid) fill is the favorable one; imb<0.5 -> SELL.
+        # Only boost when the imbalance clears the threshold AND the mult is on.
+        # Off (mult==1.0) -> both flags False -> sizes unchanged (byte-identical).
+        # --- INVENTORY TAPER: how full are we relative to what we can still clear?
+        # add_taper scales the side that INCREASES |pos|; red_boost scales the side
+        # that REDUCES it (only when inv_taper_both). Off -> 1.0/1.0 (no change).
+        add_taper = 1.0
+        red_boost = 1.0
+        if self.enable_inv_taper and abs(pos) > 0.0:
+            # shares we can still clear passively by the bell at our participation
+            cap = self._pov_capacity() * self.inv_taper_pov_mult
+            # utilisation of that capacity by the CURRENT position (clamped to 1)
+            util = min(1.0, abs(pos) / cap) if cap > 0.0 else 1.0
+            # taper the ADD side by (1-util)^k, never below the floor
+            add_taper = max(self.inv_taper_floor, (1.0 - util) ** self.inv_taper_k)
+            # optionally push harder on the REDUCE side
+            if self.inv_taper_both:
+                # scale the reducing side up as we fill capacity
+                red_boost = 1.0 + util
+        boost_buy = False
+        boost_sell = False
+        if self.size_boost_mult != 1.0:
+            # boost the BID when the book leans bid-heavy past the threshold
+            boost_buy = (imb - 0.5) > self.size_boost_thresh
+            # boost the ASK when the book leans ask-heavy past the threshold
+            boost_sell = (0.5 - imb) > self.size_boost_thresh
         buy_throttled = (self._throttle_buy_until is not None
                          and self.now <= self._throttle_buy_until)
         sell_throttled = (self._throttle_sell_until is not None
@@ -1453,6 +1534,28 @@ class MicrostructureMM:
         # to our 35bps floor and donating the difference.
         mkt_half = (ba - bb) / 2.0
         half = max(half, mkt_half - self.improve_ticks * self.tick)
+        # --- QUEUE / AGGRESSIVENESS SKEW: split the symmetric half into a
+        # per-side half. The favorable side moves CLOSER to the touch (smaller
+        # half = more aggressive = better queue position); the exposed side moves
+        # BACK (larger half). imb>0.5 = bid-heavy -> BUY is the favorable side.
+        # Off (queue_skew_ticks==0) -> both halves equal `half` (byte-identical).
+        qs_half_buy = half
+        qs_half_sell = half
+        if self.queue_skew_ticks != 0.0:
+            # the tick distance to shift each side by
+            _qs = self.queue_skew_ticks * self.tick
+            # bid-heavy past threshold: BUY favorable (tighter), SELL exposed (wider)
+            if (imb - 0.5) > self.queue_skew_thresh:
+                # step the bid closer to the touch
+                qs_half_buy = max(0.0, half - _qs)
+                # step the ask back from the touch
+                qs_half_sell = half + _qs
+            # ask-heavy past threshold: SELL favorable, BUY exposed
+            elif (0.5 - imb) > self.queue_skew_thresh:
+                # step the ask closer to the touch
+                qs_half_sell = max(0.0, half - _qs)
+                # step the bid back from the touch
+                qs_half_buy = half + _qs
         # NOTIONAL SIZING: 50 shares is 2.8k PKR on KTML but 20k on MCB. Fix the
         # PKR-at-risk per quote instead; fall back to share count if unset.
         base_size = (self.size_notional / fair) if self.size_notional else self.size0
@@ -1474,25 +1577,28 @@ class MicrostructureMM:
         ref_spr = max(spr, self.ema_spread)
         # per-side halves: apply the exploding widen, capped at k x reference
         # spread, and never BELOW the base half (the cap is a ceiling, not a target)
-        half_buy = half
+        # START FROM THE QUEUE-SKEWED HALF (equals `half` when queue skew is off,
+        # so this is byte-identical with the feature disabled).
+        half_buy = qs_half_buy
         # widen the BUY side if a trigger set urgency on it
         if trig["u_buy"] > 0.0:
             # the two candidates: the raw exploded half, and the cap ceiling
-            raw = half * (1.0 + trig["u_buy"])
+            raw = qs_half_buy * (1.0 + trig["u_buy"])
             cap = self.widen_cap_spreads * ref_spr
             # apply cap, keep at/above base half
-            half_buy = max(half, min(raw, cap))
+            half_buy = max(qs_half_buy, min(raw, cap))
             # the cap BOUND if it was the smaller of the two (it clamped the ramp)
             if cap < raw:
                 self.stats["widen_capped"] += 1
         # widen the SELL side if a trigger set urgency on it
-        half_sell = half
+        # START FROM THE QUEUE-SKEWED HALF (equals `half` when queue skew is off).
+        half_sell = qs_half_sell
         if trig["u_sell"] > 0.0:
             # same two candidates for the sell side
-            raw = half * (1.0 + trig["u_sell"])
+            raw = qs_half_sell * (1.0 + trig["u_sell"])
             cap = self.widen_cap_spreads * ref_spr
             # apply cap, keep at/above base half
-            half_sell = max(half, min(raw, cap))
+            half_sell = max(qs_half_sell, min(raw, cap))
             # count a bind (note: both sides binding in one cycle counts twice,
             # which is the intended "how many side-widenings got capped" measure)
             if cap < raw:
@@ -1567,6 +1673,19 @@ class MicrostructureMM:
             # throttle switch is on, buy_throttled is False -> size unchanged.
             size_buy = max(1.0, round(size * self.throttle_frac)) \
                 if buy_throttled else size
+            # SIZE SKEW: if this side is FAVORABLE (and not throttled), quote MORE.
+            # Throttle wins over boost -- never boost a side we just flagged toxic.
+            if boost_buy and not buy_throttled:
+                # scale the favorable bid up by the boost multiplier
+                size_buy = max(1.0, round(size * self.size_boost_mult))
+            # INVENTORY TAPER on the BID: buying ADDS when long (pos>0) and
+            # REDUCES when short (pos<0). Applied after throttle/boost so the
+            # inventory state always gets the final say on quantity.
+            if self.enable_inv_taper and pos != 0.0:
+                # long -> the bid is the adding side; short -> it reduces
+                _f = add_taper if pos > 0 else red_boost
+                # rescale the bid clip (>=1 share)
+                size_buy = max(1.0, round(size_buy * _f))
             out["BUY"] = (round(px, 2), size_buy)
         # Offer unless: trigger-killed, short at the hard cap, or short past the
         # soft band (past -soft_inv we stop selling so only the bid remains).
@@ -1629,6 +1748,17 @@ class MicrostructureMM:
             # SIZE THROTTLE: cut SELL clip while throttled (>=1 share).
             size_sell = max(1.0, round(size * self.throttle_frac)) \
                 if sell_throttled else size
+            # SIZE SKEW: boost the favorable ask when not throttled (throttle wins).
+            if boost_sell and not sell_throttled:
+                # scale the favorable ask up by the boost multiplier
+                size_sell = max(1.0, round(size * self.size_boost_mult))
+            # INVENTORY TAPER on the ASK: selling ADDS when short (pos<0) and
+            # REDUCES when long (pos>0) -- the mirror of the bid.
+            if self.enable_inv_taper and pos != 0.0:
+                # short -> the ask is the adding side; long -> it reduces
+                _f = add_taper if pos < 0 else red_boost
+                # rescale the ask clip (>=1 share)
+                size_sell = max(1.0, round(size_sell * _f))
             out["SELL"] = (round(px, 2), size_sell)
 
         # QUOTE PEGGING (burst-flow names): hold the previous desired quote until

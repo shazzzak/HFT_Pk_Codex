@@ -626,6 +626,26 @@ class Backtester:
         # both the strategy's flatten behaviour and the engine's permission to take.
         # When False, tagged taker orders are still rejected like any crossing order.
         self.allow_taker = bool(getattr(strategy, "allow_taker", False))
+        # LOG_FILL_STATE (default False = byte-identical): when True, each resting
+        # order's log record also captures the MARKET STATE at the instant it
+        # joined the queue (queue ahead, own/opp depth, spread, OBI, bucket). Pairs
+        # with end_reason to give an unbiased fill-probability dataset: every
+        # posted quote, filled or not, with the circumstances it was posted into.
+        self.log_fill_state = bool(getattr(strategy, "log_fill_state", False))
+        # ARRIVAL-RATE buffer (only maintained when log_fill_state is on): a
+        # trailing list of (ts_ms, side, qty) for EVERY continuous-market trade,
+        # so _arrive can estimate the recent side-signed trade arrival rate the
+        # quote's queue will actually clear against. Windows are min(T minutes,
+        # N trades) -- trade-anchored so a churn-with-no-trades regime cannot
+        # spuriously zero the event side; the time cap bounds slow tape, the
+        # trade cap bounds fast tape. Swept to calibrate what "recent" means.
+        self._arr_buf = []
+        # (label, T_ms, N_trades) window grid for the sweep
+        self._arr_windows = [("w1m50", 60000.0, 50),
+                             ("w3m150", 180000.0, 150),
+                             ("w5m300", 300000.0, 300)]
+        # keep at most the largest N so the buffer never grows unbounded
+        self._arr_max_n = max(n for _, _, n in self._arr_windows)
         # Skip the per-event equity+OBI logging when False (sweep speed path).
         # obi(5)/obi(None) scan book levels EVERY event and dominate runtime (~50x);
         # consumers needing only fills set cfg["log_equity"]=False. Defaults True so
@@ -747,11 +767,111 @@ class Backtester:
         # LIFECYCLE: the order is now live at the exchange (resting, matchable)
         if o.oid in self._olog:
             self._olog[o.oid]["t_live"] = t
+            # FILL-STATE CAPTURE (opt-in): record what the market looked like at
+            # the instant this quote joined the queue. These are the features a
+            # fill-probability model conditions on; end_reason is the outcome.
+            if self.log_fill_state:
+                # touch sizes for depth + OBI (bbo() returns bb, bq, ba, aq)
+                bb2, bq2, ba2, aq2 = self.book.bbo()
+                # shares resting ahead of us at our own price (the queue we wait behind)
+                ahead_qty = float(sum(o.ahead.values())) if o.ahead else 0.0
+                # visible depth on OUR side's touch and the OPPOSITE side's touch
+                own_touch = float(bq2 or 0.0) if o.side == "BUY" else float(aq2 or 0.0)
+                opp_touch = float(aq2 or 0.0) if o.side == "BUY" else float(bq2 or 0.0)
+                # spread in ticks-equivalent price units (None if one-sided)
+                spread = (ba2 - bb2) if (bb2 is not None and ba2 is not None) else None
+                # L1 imbalance in [-1,+1]: +ve = bid-heavy
+                den = float((bq2 or 0.0) + (aq2 or 0.0))
+                obi1 = ((float(bq2 or 0.0) - float(aq2 or 0.0)) / den) if den > 0 else 0.0
+                # how far inside/outside the touch we posted (ticks of price; +ve = inside)
+                if o.side == "BUY" and bb2 is not None:
+                    # a bid above the best bid is MORE aggressive (inside)
+                    rel_px = o.price - bb2
+                elif o.side == "SELL" and ba2 is not None:
+                    # an ask below the best ask is more aggressive
+                    rel_px = ba2 - o.price
+                else:
+                    # no reference touch
+                    rel_px = None
+                # write the features onto the order's log record
+                rec = self._olog[o.oid]
+                rec["ahead_qty"] = ahead_qty
+                rec["own_touch_qty"] = own_touch
+                rec["opp_touch_qty"] = opp_touch
+                rec["spread"] = spread
+                rec["obi1"] = obi1
+                rec["rel_px"] = rel_px
+                rec["mid_live"] = (0.5 * (bb2 + ba2)) if spread is not None else None
+                # session bucket + window the strategy was in when it posted
+                rec["bucket"] = getattr(self.strat, "current_bucket", "middle")
+                rec["window"] = getattr(self.strat, "current_window", "none")
+                # ARRIVAL-RATE / EXPECTED-WAIT per swept window. For each window,
+                # rate = recent clearing-side shares/min; expected_wait_min =
+                # (shares ahead + our own qty) / rate = minutes until we'd fill at
+                # that rate. rate==0 (no clearing trades in window) -> wait is
+                # CENSORED (won't fill at this rate): store a large sentinel + flag.
+                # Also store the clearing-trade count and window event count so the
+                # churn-with-no-trades state is measured, not just survived.
+                for (wlab, wt, wn) in self._arr_windows:
+                    # recent clearing-side rate + counts for this window
+                    rate, n_clear, n_evt = self._arrival_rate(t, o.side, wt, wn)
+                    # shares that must clear before us (queue ahead + our own size)
+                    to_clear = ahead_qty + float(o.qty)
+                    # expected wait in minutes; None-rate -> censored sentinel
+                    if rate > 0.0:
+                        # minutes to fill at the recent rate
+                        rec[f"ewait_{wlab}"] = to_clear / rate
+                        # not censored
+                        rec[f"cens_{wlab}"] = 0
+                    else:
+                        # no clearing trades in the window -> won't fill at this rate
+                        rec[f"ewait_{wlab}"] = float("inf")
+                        # mark censored (the churn / dead-tape state)
+                        rec[f"cens_{wlab}"] = 1
+                    # the clearing-side rate itself (shares/min) for analysis
+                    rec[f"rate_{wlab}"] = rate
+                    # clearing trades in the window (0 = the pathological state)
+                    rec[f"nclear_{wlab}"] = n_clear
+                    # total trades in the window (for churn composition)
+                    rec[f"nevt_{wlab}"] = n_evt
 
     # ============ fill engine (runs BEFORE the event mutates the book) ====
     # Ordering matters: fills are judged against the book AS IT WAS when
     # the aggressive order hit it. The main loop therefore calls these
     # handlers first, and only then applies the event to self.book.
+
+    def _arrival_rate(self, now, side, t_ms, n_trades):
+        """Recent trade arrival rate (shares/min) on the side that CLEARS a resting
+        order on `side`. A resting BUY (bid) is cleared by SELL aggressors hitting
+        it; a resting SELL (ask) by BUY aggressors. Window = min(t_ms, n_trades):
+        take the last n_trades prints, then keep only those within t_ms of now --
+        whichever is TIGHTER binds. Returns (rate_per_min, n_trades_in_window,
+        total_events_considered). rate can be 0.0 (no clearing trades in window)."""
+        # the aggressor side that fills a resting order on `side`
+        clearing = "SELL" if side == "BUY" else "BUY"
+        # nothing logged yet
+        if not self._arr_buf:
+            # zero rate, empty window
+            return 0.0, 0, 0
+        # last n_trades prints (trade-anchored event cap)
+        tail = self._arr_buf[-n_trades:]
+        # time floor for the window
+        cut = now - t_ms
+        # keep only prints within the time cap (min of the two windows)
+        win = [(ts, sd, q) for (ts, sd, q) in tail if ts >= cut]
+        # span of the retained window in minutes (guard divide-by-zero)
+        if not win:
+            # no trades in the time window: rate 0, 0 clearing, 0 IN-WINDOW events
+            # (consistent with the non-empty return below, which reports in-window)
+            return 0.0, 0, 0
+        # elapsed minutes across the retained window (>= a small floor)
+        span_min = max((now - win[0][0]) / 60000.0, 1.0 / 60000.0)
+        # shares that CLEARED our side (clearing-side aggressor volume)
+        cleared = sum(q for (ts, sd, q) in win if sd == clearing)
+        # rate in shares per minute
+        rate = cleared / span_min
+        # rate, clearing-trade count usable, total prints in window
+        return rate, sum(1 for (_, sd, _) in win if sd == clearing), len(win)
 
     def _taker_fill(self, t_exch, o):
         """Execute a tagged TAKER order by walking the opposite side of the book.
@@ -895,6 +1015,15 @@ class Backtester:
         # Auction prints have no continuous-market aggressor -> skip.
         if r.initiator == "AUCTION":
             return
+        # ARRIVAL-RATE: log this trade (ts, aggressor side, qty) for the recent-rate
+        # estimate. Guarded -> off = no buffer maintenance (byte-identical).
+        if self.log_fill_state and r.aggressor_side in ("BUY", "SELL"):
+            # append this print
+            self._arr_buf.append((r.ts_exch, r.aggressor_side, float(r.qty)))
+            # bound the buffer to the largest window's trade count
+            if len(self._arr_buf) > self._arr_max_n:
+                # drop the oldest
+                self._arr_buf.pop(0)
         # Which side was the aggressor (taker): BUY lifted an ask, SELL hit a bid.
         aggr = r.aggressor_side
         # PASSIVE side is the opposite: BUY aggressor hits resting SELLs, SELL hits BUYs.
