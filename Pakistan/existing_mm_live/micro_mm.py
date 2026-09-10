@@ -196,6 +196,25 @@ class MicrostructureMM:
                  enable_run_reprice=False,
                  run_reprice_n=3,
                  run_reprice_ticks=1,
+                 # --- AGGRESSION-LEAN (default off): shift FAIR VALUE in the
+                 # direction of recent volume-weighted aggression imbalance
+                 # (mbuy_vol - msell_vol)/(total) over a trailing ~1s window.
+                 # OFFENSIVE lean (follow the anticipated continuation) -- distinct
+                 # from the microprice lean (book imbalance) and the throttle (pull).
+                 # Gated to fire mainly when OBI is CALM (where the residual edge is).
+                 #   fair += aggr_lean_k * aggr_imbalance * spread
+                 enable_aggr_lean=False,
+                 aggr_lean_k=0.5,            # lean strength (x imbalance x spread)
+                 aggr_lean_win_ms=1000.0,    # trailing window for the imbalance (ms)
+                 aggr_lean_obi_calm=0.30,    # only lean when |obi_1| < this (0 = always)
+                 # --- AGE-CROSS (default off): once the current net position has
+                 # been held longer than age_cross_ms, CROSS THE SPREAD to fully
+                 # flatten it (a deliberate TAKER order, sized |pos|, priced through
+                 # the touch). Requires the engine's allow_taker flag, which this
+                 # same switch turns on (self.allow_taker). Pays the spread + fee to
+                 # guarantee the exit; judged on drawdown/Sortino as much as P&L.
+                 enable_age_cross=False,
+                 age_cross_ms=900000.0,      # 15 minutes
                  # --- OBI-DEFENSIVE SKEW SWEEP (default OFF = current behavior) ---
                  # When True, suppress (widen) the side the book leans AGAINST, so
                  # we stop resting in front of predictable flow. imb>0.5 = bid-heavy
@@ -399,6 +418,29 @@ class MicrostructureMM:
         self._rr_last_side = 0      # last trade side (+1 buy / -1 sell)
         self._rr_run = 0            # current consecutive distinct-order run length
         self._rr_run_side = 0       # side of the current run (+1 buy / -1 sell)
+        # --- AGGRESSION-LEAN state (default off -> byte-identical) ---
+        self.enable_aggr_lean = enable_aggr_lean
+        self.aggr_lean_k = float(aggr_lean_k)
+        self.aggr_lean_win_ms = float(aggr_lean_win_ms)
+        self.aggr_lean_obi_calm = float(aggr_lean_obi_calm)
+        # trailing window of (ts, signed_volume): +qty buy, -qty sell (collapsed)
+        self._al_buf = deque()
+        # running sums over the window: signed vol and absolute vol
+        self._al_signed = 0.0
+        self._al_abs = 0.0
+        # collapse memory (same-ts+side trade = one market order for the sign)
+        self._al_last_ts = None
+        self._al_last_side = 0
+        # --- AGE-CROSS state (default off -> byte-identical) ---
+        self.enable_age_cross = enable_age_cross
+        self.age_cross_ms = float(age_cross_ms)
+        # the engine reads THIS to permit taker execution (off -> post-only as before)
+        self.allow_taker = bool(enable_age_cross)
+        # the side we want the engine to treat as a taker this cycle (None = none)
+        self.want_taker_side = None
+        # age tracker: ts the current net position was established; sign last seen
+        self._ac_pos_since_ts = None
+        self._ac_prev_sign = 0
         # --- OBI-defensive skew (sweep axis 2; False = current behavior) ---
         # master toggle
         self.obi_defensive = obi_defensive
@@ -574,6 +616,26 @@ class MicrostructureMM:
                 self.flow.append(float(obj.qty) * (1.0 if side == "BUY" else -1.0))
                 # Reset the quiet clock.
                 self.last_trade_ms = ts_exch
+                # AGGRESSION-LEAN: maintain a trailing volume-weighted signed-flow
+                # window (collapsed by ts+side). Guarded -> off = no state change.
+                if self.enable_aggr_lean:
+                    # this trade's side +1/-1 and volume
+                    _sd = 1.0 if side == "BUY" else -1.0
+                    _q = float(obj.qty)
+                    # append every print's volume (fragmented sweep volume all counts)
+                    self._al_buf.append((ts_exch, _sd * _q, _q))
+                    # add to the running window sums
+                    self._al_signed += _sd * _q
+                    self._al_abs += _q
+                    # evict window entries older than the trailing window
+                    _cut = ts_exch - self.aggr_lean_win_ms
+                    # pop from the left while stale
+                    while self._al_buf and self._al_buf[0][0] < _cut:
+                        # remove its contribution from the sums
+                        _ot, _os, _oa = self._al_buf.popleft()
+                        # subtract signed + abs
+                        self._al_signed -= _os
+                        self._al_abs -= _oa
                 # RUN-REPRICE: maintain the COLLAPSED distinct-order run counter.
                 # Guarded -> off = no state change (byte-identical).
                 if self.enable_run_reprice:
@@ -1091,6 +1153,38 @@ class MicrostructureMM:
         # No two-sided book with depth on both sides -> nothing to quote against.
         if bb is None or ba is None or bq <= 0 or aq <= 0:
             return {}
+        # ---- AGE-CROSS: cross the spread to fully flatten AGED inventory ----
+        # Off -> the block is skipped entirely and want_taker_side stays None
+        # (byte-identical). On: track the age of the current net position; once it
+        # exceeds age_cross_ms, emit ONE taker order on the exit side, sized |pos|,
+        # priced THROUGH the touch so the engine's taker path executes it, and
+        # quote nothing else this cycle (don't add while flattening).
+        self.want_taker_side = None
+        if self.enable_age_cross:
+            # sign of the current position
+            _ps = 0 if abs(pos) < 1e-9 else (1 if pos > 0 else -1)
+            # flat -> reset the age clock
+            if _ps == 0:
+                self._ac_pos_since_ts = None
+            # new position, or a flip -> restart the clock now
+            elif self._ac_pos_since_ts is None or _ps != self._ac_prev_sign:
+                self._ac_pos_since_ts = self.now
+            # remember the sign
+            self._ac_prev_sign = _ps
+            # aged past the cutoff -> flatten by crossing
+            if (self._ac_pos_since_ts is not None
+                    and (self.now - self._ac_pos_since_ts) >= self.age_cross_ms):
+                # long -> SELL through the bid; short -> BUY through the ask
+                if pos > 0:
+                    # tag the sell as the taker side for the engine
+                    self.want_taker_side = "SELL"
+                    # ask AT the bid (crosses); size = whole position
+                    return {"SELL": (bb, abs(pos))}
+                else:
+                    # tag the buy as the taker side
+                    self.want_taker_side = "BUY"
+                    # bid AT the ask (crosses); size = whole position
+                    return {"BUY": (ba, abs(pos))}
         # ---- REACTIVE JUMP GATE: react to a large recent move by going dark ----
         # Checked first: if we are inside an active cooldown, quote nothing at all.
         # Then test for a fresh trigger over the lookback window. "Adverse" (for
@@ -1234,6 +1328,17 @@ class MicrostructureMM:
         _spr = ba - bb
         # the continuous-lambda fair value
         fair = _mid + _lam * (imb - 0.5) * _spr
+        # --- AGGRESSION-LEAN: shift fair in the direction of recent aggression.
+        # aggr_imbalance = signed_vol / abs_vol in [-1,+1] over the trailing window.
+        # Only lean when OBI is calm (where the residual edge lives) and the window
+        # has volume. Off -> no change (byte-identical).
+        if self.enable_aggr_lean and self._al_abs > 1e-9:
+            # gate: fire only when |obi_1| is below the calm threshold (0 = always)
+            if self.aggr_lean_obi_calm <= 0.0 or abs(imb - 0.5) * 2.0 < self.aggr_lean_obi_calm:
+                # volume-weighted aggression imbalance in [-1, +1]
+                _aggr = self._al_signed / self._al_abs
+                # shift fair value in the aggression direction, scaled by spread
+                fair = fair + self.aggr_lean_k * _aggr * _spr
         # Ho-Stoll horizon.
         tau = self._horizon()
         # Per-unit inventory risk: risk aversion x variance x remaining horizon.

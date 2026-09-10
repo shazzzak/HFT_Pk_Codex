@@ -532,6 +532,11 @@ class MyOrder:
     t_active: int
     cancel_at: int = None
     oid: int = 0       # unique id: cancels target THIS order, not just the side
+    # TAKER FLAG (default False = a normal passive quote). When True AND the
+    # engine's allow_taker flag is on, an order that CROSSES the touch executes
+    # as a taker (walks the opposite book) instead of being post-only rejected.
+    # Used by the age-cross flatten: a deliberate, tagged liquidity-taking exit.
+    taker: bool = False
 
 class LatencyModel:
     """Stochastic, two-leg latency (production model).
@@ -616,6 +621,11 @@ class Backtester:
                  cfg):  # constructor. strategy = the quoting logic (e.g. NaiveSymmetricMM); cfg = config dict (latency, fees, session window, fill rules).
         self.strat = strategy  # store the strategy object; _requote() calls self.strat.quotes(...) each event to ask where to quote.
         self.cfg = cfg  # store the config dict; read throughout for session window, fill rules, etc.
+        # ALLOW_TAKER FLAG (default False = post-only engine, byte-identical to before).
+        # Read from the strategy so ONE strategy switch (enable_age_cross) turns on
+        # both the strategy's flatten behaviour and the engine's permission to take.
+        # When False, tagged taker orders are still rejected like any crossing order.
+        self.allow_taker = bool(getattr(strategy, "allow_taker", False))
         # Skip the per-event equity+OBI logging when False (sweep speed path).
         # obi(5)/obi(None) scan book levels EVERY event and dominate runtime (~50x);
         # consumers needing only fills set cfg["log_equity"]=False. Defaults True so
@@ -717,6 +727,18 @@ class Backtester:
         crosses = ((o.side == "BUY" and ba is not None and o.price >= ba) or  # would our order execute immediately instead of resting? For a BUY: our bid at/above the best ask means we'd cross and take.
                    (o.side == "SELL" and bb is not None and o.price <= bb))  # for a SELL: our ask at/below the best bid means we'd cross and take. (the 'is not None' guards an empty side.)
         if crosses:  # our order would be marketable (take liquidity) rather than post passively.
+            # TAKER PATH (opt-in): a DELIBERATELY tagged taker order, with the engine's
+            # allow_taker flag on, executes against the opposite book instead of being
+            # rejected. Walks best-first levels, fills at each LEVEL price (a taker pays
+            # the resting price), books pos/cash/fee exactly like _fill, reason="taker".
+            # Shadow-fill semantics (does not mutate the historical book), same as
+            # every other fill in this engine. Off (default) -> falls through to the
+            # original post-only reject below, byte-identical.
+            if self.allow_taker and getattr(o, "taker", False):
+                # execute the taker and stop (the order never rests)
+                self._taker_fill(t, o)
+                # done
+                return
             self.stats["rejected_crossing"] += 1  # count it as a rejected crossing order.
             return  # FLAGGED SIMPLIFICATION: reject it (post-only behavior) instead of executing as a taker. The order never enters the book. Exit early.
         o.ahead = self.book.qty_at(o.side, o.price)  # order rests: snapshot our QUEUE POSITION -- {order_id: qty} of every order already resting at our price (all ahead of us under price-time priority).
@@ -730,6 +752,55 @@ class Backtester:
     # Ordering matters: fills are judged against the book AS IT WAS when
     # the aggressive order hit it. The main loop therefore calls these
     # handlers first, and only then applies the event to self.book.
+
+    def _taker_fill(self, t_exch, o):
+        """Execute a tagged TAKER order by walking the opposite side of the book.
+
+        A BUY taker consumes asks best-first (ascending); a SELL taker consumes
+        bids best-first (descending). Each level is filled at the LEVEL price
+        (the taker pays the resting price, never its own limit). Accounting is
+        identical in form to _fill: pos moves with sgn*take, cash moves opposite
+        at the level price, fee per fill, one fills-row per level with
+        reason="taker". Unfilled remainder (book exhausted) is simply not filled.
+        Shadow-fill: the historical book is NOT mutated (same assumption as every
+        passive fill here). Counted in stats["taker_fills"].
+        """
+        # the opposite side's ranked levels, best-first: BUY taker eats asks
+        bids, asks = self.book.ranked_depth(n=50)
+        # levels to consume
+        levels = asks if o.side == "BUY" else bids
+        # position sign of this side
+        sgn = 1 if o.side == "BUY" else -1
+        # remaining quantity to fill
+        remaining = float(o.qty)
+        # walk the levels
+        for px, avail in levels:
+            # stop when done
+            if remaining <= 0:
+                break
+            # take what this level has, up to what we still need
+            take = min(float(avail), remaining)
+            # skip empty levels
+            if take <= 0:
+                continue
+            # position moves with the side
+            self.pos += sgn * take
+            # cash moves opposite, at the LEVEL price, minus the fee
+            self.cash += -sgn * take * px - fee_for(px, take)
+            # one fills row per level consumed, tagged as a taker fill
+            self.fills.append({"t": t_exch, "side": o.side, "px": px, "qty": take,
+                               "reason": "taker",
+                               "window": getattr(self.strat, "current_window", "none"),
+                               "bucket": getattr(self.strat, "current_bucket", "middle"),
+                               "oid": o.oid})
+            # reduce the remainder
+            remaining -= take
+        # count the taker event
+        self.stats["taker_fills"] = self.stats.get("taker_fills", 0) + 1
+        # LIFECYCLE: the order ended by taking (fully or partially)
+        if o.oid in self._olog:
+            self._olog[o.oid]["t_end"] = t_exch
+            self._olog[o.oid]["end_reason"] = "taker"
 
     def _fill(self, side, price, qty, t_exch, reason): # book a fill of OUR order. side = BUY/SELL; price = the trade's print price (not used for our cash);
         # qty = shares offered to us; t_exch = fill time; reason = provenance tag ("through"/"at_queue"/etc).
@@ -1084,9 +1155,12 @@ class Backtester:
                                          "px": w[0], "qty": w[1],
                                          "t_sent": ts_know, "t_live": None,
                                          "t_end": None, "end_reason": None}
+                # TAKER TAG: the strategy sets want_taker_side to the side it wants to
+                # CROSS with (a deliberate flatten); any other order is a passive quote.
+                _tk = (getattr(self.strat, "want_taker_side", None) == side)
                 # Schedule the new order to arrive; empty {} = queue-ahead filled at _arrive.
                 self._push(t_land, "ARRIVE",
-                           MyOrder(side, w[0], w[1], {}, t_land, oid=self._oid))
+                           MyOrder(side, w[0], w[1], {}, t_land, oid=self._oid, taker=_tk))
 
     # ============================ main loop ================================
     def run(self, events, snap_groups):
