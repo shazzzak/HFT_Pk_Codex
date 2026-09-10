@@ -163,11 +163,35 @@ def _gap(df, sig, hcol):
     return float(np.mean(np.sign(s[strong]) * f[strong]))
 
 
-# adds-on-top gap: same, but ONLY on rows where plain L1 is NEUTRAL
-def _gap_l1neutral(df, sig, hcol):
-    calm = np.abs(df["l1"].to_numpy()) < L1_NEUTRAL
-    sub = df[calm]
-    return _gap(sub, sig, hcol)
+# ADDS-ON-TOP-OF-L1 via PARTIAL CORRELATION (the correct incremental-information
+# test; the old decile-gap-within-neutral-band was ill-posed -- L1 still predicts
+# inside its own "neutral" band, so L1-self failed to read 0). Method:
+#   1. regress fwd markout on L1 (through-origin is fine; include intercept for safety)
+#   2. take the residual = the part of fwd L1 does NOT explain
+#   3. Spearman corr(signal, residual) = the signal's UNIQUE predictive power.
+# By construction, corr(L1, residual_of_fwd_on_L1) == 0, so L1-self MUST read ~0.
+# A wobi variant "adds on top" iff its partial corr is clearly > 0 (and > L1's ~0).
+def _partial_corr_over_l1(df, sig, hcol):
+    from scipy import stats
+    x = df["l1"].to_numpy(); s = df[sig].to_numpy(); f = df[hcol].to_numpy()
+    ok = ~(np.isnan(x) | np.isnan(s) | np.isnan(f))
+    x, s, f = x[ok], s[ok], f[ok]
+    if x.size < MIN_ROWS:
+        return np.nan
+    # regress fwd on L1 (OLS with intercept); residual is fwd minus L1's linear fit
+    # (rank/Spearman on the residual keeps it robust to heavy tails, per methodology)
+    A = np.vstack([x, np.ones_like(x)]).T
+    # least-squares fit coefficients
+    coef, *_ = np.linalg.lstsq(A, f, rcond=None)
+    # residual of forward markout after removing L1's linear contribution
+    resid = f - A @ coef
+    # degenerate residual (all ~equal) -> no correlation defined
+    if np.std(resid) < 1e-12 or np.std(s) < 1e-12:
+        return 0.0
+    # Spearman rank correlation between the signal and the L1-residual
+    rho, _ = stats.spearmanr(s, resid)
+    # NaN guard
+    return float(rho) if np.isfinite(rho) else np.nan
 
 
 # per-process
@@ -219,9 +243,9 @@ def _work_date(date):
             for r in DECAYS:
                 sig = f"w_d{d}_r{r:g}"
                 rec[f"{sig}_gap"] = _gap(df, sig, h)
-                rec[f"{sig}_addl1"] = _gap_l1neutral(df, sig, h)
+                rec[f"{sig}_addl1"] = _partial_corr_over_l1(df, sig, h)
         # L1's own adds-on-top is by definition ~0 (it's neutral there) -- for ref
-        rec["l1_addl1"] = _gap_l1neutral(df, "l1", h)
+        rec["l1_addl1"] = _partial_corr_over_l1(df, "l1", h)
         rows.append(rec)
     return rows
 
@@ -256,8 +280,8 @@ def run_real(out_dir=OUT_DIR, symbols=None, workers=WORKERS, max_days=MAX_DAYS):
     print(_ts() + "===== DECAY-WEIGHTED OBI vs L1 (forward markout gap @5s, day-as-unit) =====")
     print(_ts() + f"  L1 OBI baseline gap: {l1m:+.3f} +/- {l1se:.3f}  [name-days {l1n}]")
     print(_ts() + "  a wobi variant is only interesting if (a) its overall gap >= L1, AND")
-    print(_ts() + "  (b) its ADDS-ON-TOP-OF-L1 gap (predicts when L1 is neutral) is clearly > 0.")
-    print(_ts() + f"  {'variant':>12} {'overall_gap':>12} {'vs_L1':>8} {'addl1_gap':>10}")
+    print(_ts() + "  (b) its ADDS-ON-TOP partial corr over L1 (unique signal) is clearly > 0.")
+    print(_ts() + f"  {'variant':>12} {'overall_gap':>12} {'vs_L1':>8} {'partial_rho':>12}")
     best = None
     for d in DEPTHS:
         for r in DECAYS:
