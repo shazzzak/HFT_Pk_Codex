@@ -161,7 +161,7 @@ JUMP_K = 4.0
 # not 4 hours. Set to None for the FULL ~207-day run ONLY after the canary's
 # anchor reads 0 on all 9 configs and preflight_coverage.py shows all names OK.
 # (Hard lesson: a multi-hour run was burned on an unverified sweep.)
-SMOKE_DAYS = None   # None = ALL days after the trailing-median warmup (~197)
+SMOKE_DAYS = 3   # None = ALL days after the trailing-median warmup (~197)
 # workers
 WORKERS = 9
 # -----------------------------------------------------------------------------
@@ -537,6 +537,34 @@ def _process(args):
             "recon_gap": recon_gap,
             # RAW engine P&L for this cell -- the reconciliation ANCHOR.
             "engine_pnl": float(dr.pnl())}
+
+
+# atomic, verified parquet write with CSV fallback (matches the sweeps' contract):
+# write to .tmp, verify row count on readback, then atomically replace. On any
+# failure, fall back to CSV with the same stem so the data is never lost.
+def _safe_parquet(df, path):
+    # local os import so the helper is self-contained
+    import os as _os
+    # write to a temp path first
+    tmp = str(path) + ".tmp"
+    try:
+        # write the parquet
+        df.to_parquet(tmp, index=False)
+        # verify the row count matches before committing
+        import pyarrow.parquet as _pq
+        assert _pq.ParquetFile(tmp).metadata.num_rows == len(df)
+        # atomic move into the final location
+        _os.replace(tmp, path)
+        # confirm success
+        print(f"wrote {path} ({len(df)} rows, verified)")
+    except Exception as e:
+        # clean up the temp file on failure
+        try: _os.remove(tmp)
+        except OSError: pass
+        # CSV fallback with the same stem so data is never lost
+        csv = str(path).rsplit(".", 1)[0] + ".csv"
+        df.to_csv(csv, index=False)
+        print(f"parquet failed ({e!r}) -> CSV {csv}")
 
 
 def main():
