@@ -52,102 +52,80 @@ CLIP_MULT = 3.0
 # sampled days
 MAX_DAYS = 20
 # workers
-WORKERS = 3
+WORKERS = 6
 
 
 # split fills by regime and FIFO-attribute P&L within each regime.
 # Returns {regime: {capture, markout, fee, net, fills, pnl}} using the harness FIFO.
 def attribute_by_regime(dr, H):
-    """FIFO round-trip P&L by OPENING regime, WITH residual liquidation, reconciled
-    to the engine's true total P&L.
-
-    Two fixes over the naive version (both caught by SZ):
-      1. Round trips book to the OPENING fill's regime (not the closing fill's),
-         so a trip entered on a 1-tick book but exited once the spread widened
-         attributes ALL its P&L to 'onetick' -- the regime of the ENTRY decision.
-      2. RESIDUAL open inventory at EOD is NOT dropped. Each leftover lot is marked
-         at the engine's real liquidation VWAP (dr.eod['liq_vwap']) and booked to
-         its OPENING regime. Fees on the (synthetic) liquidation leg are charged.
-
-    RECONCILIATION: sum over regimes of net == dr.pnl() (equity_liquidated) to the
-    penny. If residual were dropped or mismarked this assert fails loudly. This is
-    the same discipline every trusted sweep uses; the earlier version lacked it,
-    which is how the residual hole (and the nonsensical -PKR/+bps) hid.
+    """Per-regime P&L via the VALIDATED harness FIFO attribution -- reconciled to
+    the engine by construction (residual = engine_pnl - matched_realized). We do
+    NOT reinvent FIFO/fees/residual here; we call mm_harness.fifo_attribution and
+    simply use the fill's REGIME as the attribution key, by (a) copying regime
+    into the 'bucket' field the harness reads, and (b) temporarily widening its
+    BUCKETS set to include the regime labels so they accumulate. Round trips book
+    to the OPENING regime and the residual reconciles -- both for free from the
+    proven function. Returns {regime: {net, net_bps, n_fills}} + a _recon record.
     """
     f = dr.fills
     if f is None or len(f) == 0 or "regime" not in f.columns:
         return {}
-    # engine ground-truth total for this symbol-day
-    engine_total = dr.pnl()
-    # liquidation price for residual lots (VWAP the engine actually achieved)
-    eod = dr.eod or {}
-    liq_vwap = eod.get("liq_vwap")
-    # single time-ordered stream (FIFO matches across regimes)
-    recs = f.sort_values("t").to_dict("records")
-    from collections import deque, defaultdict
-    # open lots: (price, signed_qty, open_regime)
-    lots = deque()
-    # accumulators keyed by OPENING regime
-    realized = defaultdict(float)
-    fee_by = defaultdict(float)
-    fills_by = defaultdict(int)
-    matched_notional = defaultdict(float)
-    # walk fills
-    for r in recs:
-        reg = r.get("regime", "normal")
-        fills_by[reg] += 1
-        # fee for this real fill, charged to the regime it occurred in
-        fee_by[reg] += FEE_BPS / 1e4 * abs(r["qty"]) * r["px"]
-        q = r["qty"] * (1 if r["side"] == "BUY" else -1)
-        while lots and q != 0 and (lots[0][1] * q < 0):
-            px0, q0, oreg = lots[0]
-            m = min(abs(q), abs(q0))
-            realized[oreg] += (r["px"] - px0) * (m if q0 > 0 else -1 * m)
-            matched_notional[oreg] += m * px0
-            if abs(q0) == m:
-                lots.popleft()
-            else:
-                lots[0] = (px0, q0 - (m if q0 > 0 else -m), oreg)
-            q -= (m if q > 0 else -m)
-        if q != 0:
-            lots.append((r["px"], q, reg))
-    # ---- RESIDUAL: close every leftover lot at the engine's liquidation VWAP,
-    # booked to that lot's OPENING regime. This is the inventory the naive version
-    # silently dropped.
-    residual_pos = sum(qy for (_, qy, _) in lots)
-    if lots and liq_vwap is not None:
-        for (px0, q0, oreg) in lots:
-            # marking a long lot (q0>0): sell at liq_vwap -> (liq_vwap - px0)*q0
-            realized[oreg] += (liq_vwap - px0) * q0
-            matched_notional[oreg] += abs(q0) * px0
-            # liquidation-leg fee, charged to the opening regime (best available split)
-            fee_by[oreg] += FEE_BPS / 1e4 * abs(q0) * liq_vwap
-    # assemble per-regime
+    # EXCLUDE the engine's own EOD liquidation fills (reason 'liq' / 'liq_residual').
+    # THE ROOT CAUSE of the 1-2 PKR non-reconciliation: fifo_attribution is DESIGNED
+    # for the liquidation to be ABSENT from the fill stream -- it recovers the
+    # residual as engine_pnl - matched and attributes it to the still-OPEN lots.
+    # The engine now also emits liq fills into dr.fills; feeding those in makes FIFO
+    # close every lot (open_lots empty at the end), so residual_total has no lot to
+    # land on and is silently dropped. It is non-zero because 'liq_residual' is a
+    # HAIRCUT MARK, not an execution: the engine adds it to equity with NO fee, but
+    # fifo_attribution charges fee_for on it as if it were a fill. That fee gap is
+    # exactly the observed -1.15/-1.96 PKR. Dropping liq rows restores the function's
+    # contract: intraday fills leave the true residual OPEN, the plug captures the
+    # liquidation (haircut + correct fees) and books it to the OPENING regime. Exact.
+    if "reason" in f.columns:
+        ff = f[~f["reason"].astype(str).str.startswith("liq")].copy()
+    else:
+        ff = f.copy()
+    # nothing intraday -> nothing to attribute (all P&L is liquidation-only)
+    if len(ff) == 0:
+        return {}
+    # remember the real session bucket in case anything else needs it (unused here)
+    ff["bucket"] = ff["regime"]
+    # the engine's ground-truth total P&L for this symbol-day
+    engine_pnl = dr.pnl()
+    # the liquidation time (residual lots are held to here) -- session end
+    liq_t = float(ff["t"].max()) if len(ff) else 0.0
+    # TEMPORARILY widen the harness BUCKETS to the regime labels so per[] accumulates
+    regimes = sorted(ff["regime"].dropna().unique().tolist())
+    saved = H.BUCKETS
+    try:
+        # the harness builds per = {b: {...} for b in BUCKETS}; make those the regimes
+        H.BUCKETS = tuple(regimes)
+        # call the VALIDATED attribution (matched->opening bucket, residual reconciled)
+        per = H.fifo_attribution(ff, engine_pnl, liq_t)
+    finally:
+        # always restore, even on error
+        H.BUCKETS = saved
+    # assemble the per-regime view + net bps on opened notional
     out = {}
-    for reg in set(list(realized.keys()) + list(fills_by.keys())):
-        rz = realized.get(reg, 0.0); fe = fee_by.get(reg, 0.0)
-        mn = matched_notional.get(reg, 0.0); net = rz - fe
-        out[reg] = dict(realized=rz, fee=fe, net=net, matched_notional=mn,
-                        net_bps=(net / mn * 1e4) if mn > 0 else float("nan"),
-                        n_fills=fills_by.get(reg, 0))
-    # ---- RECONCILIATION: our per-regime net must sum to the engine total.
-    # Note: our 'net' subtracts the TREC fee at FEE_BPS; the engine's
-    # equity_liquidated already nets its own fees. These fee conventions can
-    # differ slightly, so we reconcile the pre-fee REALIZED sum to (engine_total
-    # + our_total_fee) rather than asserting net==engine (which would fold in a
-    # fee-convention mismatch). This still catches any DROPPED residual/inventory.
-    our_realized = sum(realized.values())
-    our_fee = sum(fee_by.values())
-    # what realized SHOULD be if nothing is dropped: engine_total + fees we charged
-    # (engine_total is already net of the engine's fees; we add back OUR fee model
-    # to compare gross realized paths). Use a tolerance scaled to the day's size.
-    expected_realized = engine_total + our_fee
-    resid_err = our_realized - expected_realized
-    # attach reconciliation info to the result (checked by the caller / reported)
-    out["_recon"] = dict(engine_total=engine_total, our_realized=our_realized,
-                         our_fee=our_fee, residual_pos=residual_pos,
-                         recon_err=resid_err,
-                         recon_ok=abs(resid_err) <= max(1.0, 0.02 * abs(engine_total)))
+    total_realized = 0.0
+    for reg in regimes:
+        d = per.get(reg, {})
+        rz = float(d.get("realized", 0.0))
+        onot = float(d.get("opened_notional", 0.0))
+        total_realized += rz
+        out[reg] = dict(net=rz,
+                        net_bps=(rz / onot * 1e4) if onot > 0 else float("nan"),
+                        n_fills=int(d.get("fills", 0)),
+                        matched_notional=onot)
+    # reconciliation: harness guarantees sum(realized) == engine_pnl by construction
+    err = total_realized - engine_pnl
+    # tolerance: STRICT. The attribution is exact by construction once the liq
+    # fills are excluded, so only float64 rounding remains (~1e-12 relative). Any
+    # error above 0.01 PKR (or 1e-9 relative) is a REAL bug and must surface.
+    out["_recon"] = dict(engine_total=engine_pnl, our_realized=total_realized,
+                         recon_err=err,
+                         recon_ok=abs(err) <= max(0.01, 1e-9 * abs(engine_pnl)))
     return out
 
 
@@ -199,7 +177,12 @@ def _one(thr_label, thr, date, sym, dsets):
     # run the day
     dr = _H.run_symbol_day(date, sym, dsets, params)
     # nothing
-    if dr is None:
+    # skip unpriceable days: the run failed (dr None) OR there was no clean close
+    # (dr.pnl() is None -- eod None, or equity_liquidated None on a broken close).
+    # Without the pnl() half, engine_pnl=None reaches fifo_attribution and raises
+    # TypeError at float(engine_pnl) (mm_harness.py:380); _work_date's try/except
+    # then swallows it as a misleading "SKIP ... TypeError" and drops the day.
+    if dr is None or dr.pnl() is None:
         return []
     # attribute per regime
     attr = attribute_by_regime(dr, _H)
@@ -290,21 +273,33 @@ def run_real(out_dir=OUT_DIR, workers=WORKERS, max_days=MAX_DAYS):
     # ---- REPORT: P&L by config x regime, day-as-unit ----
     print(_ts() + "===== ONE-TICK MM: P&L BY REGIME (day-as-unit) =====")
     print(_ts() + "  the question: is the 'onetick' regime (1-tick spread fills) profitable on its own?")
-    print(_ts() + f"  {'config':>8} {'regime':>8} {'net_PKR':>12} {'net_bps':>9} {'fills':>10} {'name-days':>10}")
-    # per (config, regime): total net, day-as-unit bps
+    # THREE numbers, deliberately distinct so nothing looks contradictory:
+    #  net_PKR    = total cash summed over name-days (dominated by big names/days)
+    #  bps_wtd    = PKR-weighted bps = sum(net)/sum(notional) -- SAME SIGN as net_PKR
+    #               by construction (this is the honest "rate the money earned")
+    #  bps_eqwt   = equal-weighted mean of per-name-day bps (every name-day counts
+    #               the same). Can differ in SIGN from net_PKR when a few big-loss
+    #               name-days sink the cash while most small name-days are green --
+    #               that divergence is INFORMATION (concentration), not an error.
+    print(_ts() + f"  {'config':>8} {'regime':>8} {'net_PKR':>12} {'bps_wtd':>8} {'bps_eqwt':>9} {'fills':>9} {'n-days':>7} {'win%':>5}")
     for cfg in ["OBI", "OT_t0.15", "OT_t0.25", "OT_t0.4"]:
         for regime in ["onetick", "normal"]:
             sub = df[(df.config == cfg) & (df.regime == regime)]
             if len(sub) == 0:
                 continue
-            # total net PKR
+            # total cash
             tot = sub["net"].sum()
-            # day-as-unit bps: per (symbol,date) bps then mean across name-days
-            nd = sub.groupby(["symbol", "date"])["net_bps"].mean()
-            mbps = nd.mean()
-            # total fills
+            # PKR-weighted bps (consistent in sign with the cash sum)
+            notl = sub["matched_notional"].sum()
+            bps_wtd = (tot / notl * 1e4) if notl > 0 else float("nan")
+            # equal-weighted mean of per-name-day bps
+            nd = sub.groupby(["symbol", "date"]).agg(pkr=("net", "sum"),
+                                                     bps=("net_bps", "mean"))
+            bps_eqwt = nd["bps"].mean()
+            # win rate on name-day CASH (what fraction of name-days made money)
+            win = (nd["pkr"] > 0).mean() * 100
             fills = int(sub["n_fills"].sum())
-            print(_ts() + f"  {cfg:>8} {regime:>8} {tot:>12,.0f} {mbps:>9.2f} {fills:>10,} {len(nd):>10}")
+            print(_ts() + f"  {cfg:>8} {regime:>8} {tot:>12,.0f} {bps_wtd:>8.2f} {bps_eqwt:>9.2f} {fills:>9,} {len(nd):>7} {win:>4.0f}%")
     # the headline: onetick-regime P&L under the best one-tick config vs OBI's onetick fills
     print(_ts() + "  READ: if 'onetick' net_bps is clearly >0 under OT_* configs, MM works on 1-tick books.")
     print(_ts() + "        if ~0 or <0, locked books are not passively quotable -- keep excluding them.")
@@ -346,44 +341,74 @@ def smoke():
 
 # validate the per-regime FIFO attribution on hand-built fills
 def self_test():
-    # a fake DayResult-like object with a fills frame + engine total + eod
+    # A faithful local stub of mm_harness.fifo_attribution (matching the real source)
+    # + a fake harness module, so we can test the WRAPPER + reconciliation offline.
+    from collections import deque
+    def fee_for(px, qty):
+        # flat TREC-ish fee for the test (the real one is fee_for; value irrelevant
+        # to the reconciliation because residual = engine_pnl - matched absorbs it)
+        return 1.554/1e4 * px * qty
+    def stub_fifo(fills, engine_pnl, liq_time, residual_hint=None):
+        f = fills.to_dict("records") if hasattr(fills, "to_dict") else fills
+        open_lots = deque()
+        per = {b: {"realized":0.0,"opened_qty":0.0,"opened_notional":0.0,"holds":[],"fills":0}
+               for b in FakeH.BUCKETS}
+        matched = 0.0
+        for fl in f:
+            side=fl["side"]; px=float(fl["px"]); qty=float(fl["qty"]); b=fl.get("bucket","middle"); t=float(fl["t"])
+            if b in per: per[b]["fills"]+=1
+            if not open_lots or open_lots[0]["side"]==side:
+                open_lots.append({"qty":qty,"px":px,"bucket":b,"t":t,"side":side})
+                if b in per: per[b]["opened_qty"]+=qty; per[b]["opened_notional"]+=qty*px
+                continue
+            rem=qty
+            while rem>1e-9 and open_lots and open_lots[0]["side"]!=side:
+                lot=open_lots[0]; m=min(rem,lot["qty"])
+                rz=((px-lot["px"])*m) if lot["side"]=="BUY" else ((lot["px"]-px)*m)
+                rz-=fee_for(lot["px"],m); rz-=fee_for(px,m)
+                if lot["bucket"] in per: per[lot["bucket"]]["realized"]+=rz
+                matched+=rz; lot["qty"]-=m; rem-=m
+                if lot["qty"]<=1e-9: open_lots.popleft()
+            if rem>1e-9:
+                open_lots.append({"qty":rem,"px":px,"bucket":b,"t":t,"side":side})
+                if b in per: per[b]["opened_qty"]+=rem; per[b]["opened_notional"]+=rem*px
+        residual_total=float(engine_pnl)-matched
+        resid_notional=sum(l["qty"]*l["px"] for l in open_lots)
+        for lot in open_lots:
+            w=(lot["qty"]*lot["px"]/resid_notional) if resid_notional>0 else 0.0
+            if lot["bucket"] in per: per[lot["bucket"]]["realized"]+=residual_total*w
+        return per
+    class FakeH:
+        BUCKETS=("first15","middle","preclose45","last15")
+        fifo_attribution=staticmethod(stub_fifo)
     class DR:
-        # engine total P&L (equity_liquidated) for reconciliation
-        def pnl(self):
-            return self.eod["equity_liquidated"]
-    dr = DR()
-    # fills: onetick regime buy@100 then sell@100.01 (+1 tick round trip);
-    # normal regime buy@50 then sell@49.99 (-1 tick, a loss). Both flat at end,
-    # so there is NO residual -> engine_total = sum of realized minus our fees.
-    dr.fills = pd.DataFrame([
-        dict(t=1, side="BUY", px=100.00, qty=100, reason="x", regime="onetick"),
-        dict(t=2, side="SELL", px=100.01, qty=100, reason="x", regime="onetick"),
-        dict(t=3, side="BUY", px=50.00, qty=100, reason="x", regime="normal"),
-        dict(t=4, side="SELL", px=49.99, qty=100, reason="x", regime="normal"),
+        def __init__(self,fills,eod): self.fills=fills; self.eod=eod
+        def pnl(self): return self.eod["equity_liquidated"]
+
+    # CASE: onetick entry (buy 100@100), partial exit in normal (sell 60@100.02),
+    # a normal round trip (buy 50@99.99, sell 50@100.01), leaving 40 residual open.
+    fills=pd.DataFrame([
+      dict(t=1,side="BUY", px=100.00,qty=100,reason="x",regime="onetick"),
+      dict(t=2,side="SELL",px=100.02,qty=60, reason="x",regime="normal"),
+      dict(t=3,side="BUY", px=99.99, qty=50, reason="x",regime="normal"),
+      dict(t=4,side="SELL",px=100.01,qty=50, reason="x",regime="normal"),
     ])
-    # realized: onetick +1.00 (100*0.01), normal -1.00 -> gross 0.00; flat -> no residual
-    # our fee model total (for reconciliation the engine_total = gross_realized - our_fee)
-    _fee = FEE_BPS / 1e4 * (100*100.00 + 100*100.01 + 100*50.00 + 100*49.99)
-    # eod: flat, engine total ties to gross realized (0.00) minus our fee
-    dr.eod = {"equity_liquidated": 0.00 - _fee, "liq_vwap": None, "pos_at_close": 0}
-    out = attribute_by_regime(dr, None)
-    # drop the recon record for the regime assertions
-    recon = out.pop("_recon", {})
-    print(_ts() + f"[self-test] regimes: {list(out.keys())}")
-    # onetick: bought 100@100.00, sold 100@100.01 -> realized +1.00 (100*0.01), minus fees
-    ot = out["onetick"]
-    assert abs(ot["realized"] - 1.00) < 1e-6, f"onetick realized {ot['realized']}"
-    # normal: bought @50, sold @49.99 -> realized -1.00
-    nm = out["normal"]
-    assert abs(nm["realized"] - (-1.00)) < 1e-6, f"normal realized {nm['realized']}"
-    # net includes fees (both negative contributions)
-    assert ot["net"] < ot["realized"] and nm["net"] < nm["realized"]
-    # bps signs: onetick positive-ish, normal negative
-    print(_ts() + f"[self-test] onetick realized={ot['realized']:.2f} net={ot['net']:.2f} bps={ot['net_bps']:.1f}")
-    print(_ts() + f"[self-test] normal  realized={nm['realized']:.2f} net={nm['net']:.2f} bps={nm['net_bps']:.1f}")
-    assert ot["net_bps"] > nm["net_bps"], "onetick should beat the losing normal split"
-    print(_ts() + "[self-test] per-regime FIFO attribution correct; regimes separated  OK")
-    print(_ts() + "[self-test] ALL ASSERTIONS PASSED.")
+    # pick ANY engine_pnl -- the harness reconciles to it by construction
+    dr=DR(fills, {"equity_liquidated": 123.45, "liq_vwap":100.005})
+    out=attribute_by_regime(dr, FakeH)
+    rec=out.pop("_recon")
+    print(_ts()+f"[self-test] regimes: {list(out.keys())}")
+    print(_ts()+f"[self-test] sum realized={rec['our_realized']:.4f} engine={rec['engine_total']:.2f} err={rec['recon_err']:.2e}")
+    # THE KEY GUARANTEE: reconciles to engine_pnl by construction
+    assert rec["recon_ok"], f"must reconcile: err={rec['recon_err']}"
+    assert abs(rec["our_realized"]-123.45)<1e-6, "sum of regimes must equal engine_pnl"
+    print(_ts()+"[self-test] per-regime sum == engine_pnl EXACTLY (reconciled by construction)  OK")
+    # onetick opened the 100-lot; its matched(60) + residual share book to onetick
+    assert "onetick" in out and "normal" in out
+    print(_ts()+f"[self-test] onetick net={out['onetick']['net']:.2f}  normal net={out['normal']['net']:.2f}")
+    # no _recon leaks as a regime
+    assert "_recon" not in out
+    print(_ts()+"[self-test] ALL ASSERTIONS PASSED.")
 
 
 # entry

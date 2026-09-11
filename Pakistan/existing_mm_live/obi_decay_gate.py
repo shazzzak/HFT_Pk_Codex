@@ -163,35 +163,50 @@ def _gap(df, sig, hcol):
     return float(np.mean(np.sign(s[strong]) * f[strong]))
 
 
-# ADDS-ON-TOP-OF-L1 via PARTIAL CORRELATION (the correct incremental-information
-# test; the old decile-gap-within-neutral-band was ill-posed -- L1 still predicts
-# inside its own "neutral" band, so L1-self failed to read 0). Method:
-#   1. regress fwd markout on L1 (through-origin is fine; include intercept for safety)
-#   2. take the residual = the part of fwd L1 does NOT explain
-#   3. Spearman corr(signal, residual) = the signal's UNIQUE predictive power.
-# By construction, corr(L1, residual_of_fwd_on_L1) == 0, so L1-self MUST read ~0.
-# A wobi variant "adds on top" iff its partial corr is clearly > 0 (and > L1's ~0).
+# ADDS-ON-TOP-OF-L1 via PARTIAL SPEARMAN done ENTIRELY IN RANK SPACE.
+# BUG FIXED: the previous version regressed forward markout on L1 with OLS (a LINEAR
+# fit) then evaluated the residual with Spearman (a RANK stat). OLS only forces
+# PEARSON corr(L1, residual)=0 -- the RANK relationship survives, so the L1-self
+# sanity check floored at ~-0.044 instead of 0. The old docstring claim that
+# "corr(L1, residual)==0 by construction" is true for Pearson, FALSE for Spearman.
+# FIX: rank-transform first, residualize BOTH sides on L1 in rank space, evaluate
+# with Pearson on the rank residuals (== partial Spearman). Now:
+#   - L1-self is 0 BY CONSTRUCTION (sr_resid is the zero vector) -> sanity reads ~0,
+#   - a wobi variant "adds on top" iff its partial Spearman over L1 is clearly > 0.
+# NOTE: still a SCREEN. A clean partial>0 must be confirmed by the engine-accurate
+# P&L head-to-head (wire wobi into the trigger vs L1) -- do not close on rho alone.
 def _partial_corr_over_l1(df, sig, hcol):
+    # scipy for rankdata (Spearman == Pearson on ranks)
     from scipy import stats
+    # L1 control (x), candidate signal (s), forward-markout label (f)
     x = df["l1"].to_numpy(); s = df[sig].to_numpy(); f = df[hcol].to_numpy()
+    # keep only rows finite in all three so the arrays stay aligned
     ok = ~(np.isnan(x) | np.isnan(s) | np.isnan(f))
     x, s, f = x[ok], s[ok], f[ok]
+    # too few rows for a stable rank correlation on this name-day
     if x.size < MIN_ROWS:
         return np.nan
-    # regress fwd on L1 (OLS with intercept); residual is fwd minus L1's linear fit
-    # (rank/Spearman on the residual keeps it robust to heavy tails, per methodology)
-    A = np.vstack([x, np.ones_like(x)]).T
-    # least-squares fit coefficients
-    coef, *_ = np.linalg.lstsq(A, f, rcond=None)
-    # residual of forward markout after removing L1's linear contribution
-    resid = f - A @ coef
-    # degenerate residual (all ~equal) -> no correlation defined
-    if np.std(resid) < 1e-12 or np.std(s) < 1e-12:
+    # rank-transform ALL THREE (average ranks handle ties) -- this IS the Spearman space
+    xr = stats.rankdata(x); sr = stats.rankdata(s); fr = stats.rankdata(f)
+    # center the control ranks (equivalent to an intercept; needed for orthogonality)
+    xr_c = xr - xr.mean()
+    # squared norm of the centered control ranks
+    denom = float(xr_c @ xr_c)
+    # degenerate control (all equal ranks) -> partialling undefined -> no incremental info
+    if denom < 1e-12:
         return 0.0
-    # Spearman rank correlation between the signal and the L1-residual
-    rho, _ = stats.spearmanr(s, resid)
+    # rank residual of the LABEL on the control (OLS slope in rank space, then subtract fit)
+    fr_resid = (fr - fr.mean()) - ((xr_c @ (fr - fr.mean())) / denom) * xr_c
+    # rank residual of the CANDIDATE on the control (FULL partial residualizes BOTH sides)
+    sr_resid = (sr - sr.mean()) - ((xr_c @ (sr - sr.mean())) / denom) * xr_c
+    # candidate collinear with L1 in rank space (e.g. sig=='l1') -> its residual is ~0
+    # -> 0 incremental BY CONSTRUCTION (this is why the sanity check now reads 0)
+    if np.std(sr_resid) < 1e-12 or np.std(fr_resid) < 1e-12:
+        return 0.0
+    # partial Spearman = Pearson correlation of the two rank residuals
+    rho = float(np.corrcoef(fr_resid, sr_resid)[0, 1])
     # NaN guard
-    return float(rho) if np.isfinite(rho) else np.nan
+    return rho if np.isfinite(rho) else np.nan
 
 
 # per-process
