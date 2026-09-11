@@ -1,11 +1,18 @@
-import pandas as pd, numpy as np
-df = pd.read_parquet("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results/diagnostics/obi_decay_gate.parquet")
-cfgs = [f"w_d{d}_r{r:g}" for d in (2,3,5) for r in (0.3,0.5,0.7)]
-print(f"{'config':>10} {'n':>4} {'mean_rho':>9} {'fisherz':>9} {'frac>0':>7}")
-for c in cfgs:
-    a = df[f"{c}_addl1"].to_numpy(); a = a[np.isfinite(a)]
-    # Fisher-z mean is the unbiased way to average correlations (my earlier flag)
-    fz = np.tanh(np.mean(np.arctanh(np.clip(a, -0.999, 0.999))))
-    print(f"{c:>10} {len(a):>4} {a.mean():>+9.4f} {fz:>+9.4f} {(a>0).mean():>7.2f}")
-s = df["l1_addl1"].to_numpy(); s = s[np.isfinite(s)]
-print(f"self-test l1_addl1: mean={s.mean():+.5f}  max|.|={np.max(np.abs(s)):.5f}")
+import pandas as pd
+
+d = pd.read_parquet("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results/fullyear_confirm_DAILY_20260911_1456.parquet")
+CFG = "throttle"
+
+# portfolio daily P&L + notional per (config, date): sum across buckets (+names if present)
+g = d.groupby([CFG, "date"]).agg(pkr=("net_pkr","sum"), opn=("opened_notional","sum")).reset_index()
+g["bps"] = g.pkr / g.opn * 1e4
+piv = g.pivot(index="date", columns=CFG, values="bps").sort_index()
+
+# split-half: is QBPS_2's edge over OBI steady across the year?
+h = len(piv) // 2
+print(f"{'config':>16} {'H1':>7} {'H2':>7}   edge_vs_OBI_H1/H2")
+for c in piv.columns:
+    h1, h2 = piv[c].iloc[:h].mean(), piv[c].iloc[h:].mean()
+    e1 = h1 - piv["OBI"].iloc[:h].mean()
+    e2 = h2 - piv["OBI"].iloc[h:].mean()
+    print(f"{c:>16} {h1:>7.2f} {h2:>7.2f}   {e1:+.2f} / {e2:+.2f}")

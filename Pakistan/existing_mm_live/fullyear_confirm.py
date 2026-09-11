@@ -49,6 +49,33 @@ import run_legacy_mm as R
 # reuse the validated decomposition helpers (mid asof + jump/diff split)
 from spot_capture_markout_decomp import _mid_at, _split_move
 
+# ---- TIMESTAMPED PRINTS ------------------------------------------------------
+# _ts() returns a [HH:MM:SS] stamp; the wrapper below prepends it to EVERY print
+# in THIS module -- one place instead of ~50 call sites, so no line is missed or
+# mangled. Imported modules (e.g. the harness's 'pre-pass N/207') keep their own
+# print and stay unstamped.
+import builtins as _builtins
+# current wall-clock stamp
+def _ts():
+    return datetime.now().strftime("[%H:%M:%S]")
+# handle to the real builtin print
+_real_print = _builtins.print
+# module-level print wrapper: timestamp each line
+def print(*args, **kwargs):
+    # preserve a bare print() as a blank line (no lone timestamp)
+    if not args:
+        _real_print(**kwargs)
+        return
+    # if the first arg leads with newlines, keep those blank lines, stamp the text
+    if isinstance(args[0], str) and args[0].startswith("\n"):
+        s = args[0]
+        n = len(s) - len(s.lstrip("\n"))
+        args = ("\n" * n + _ts() + " " + s[n:],) + args[1:]
+        _real_print(*args, **kwargs)
+    else:
+        # normal case: stamp then the original args (sep supplies the space)
+        _real_print(_ts(), *args, **kwargs)
+
 # store paths
 R.PARSED_ROOT = Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Parsed")
 RESULTS = Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results")
@@ -161,7 +188,7 @@ JUMP_K = 4.0
 # not 4 hours. Set to None for the FULL ~207-day run ONLY after the canary's
 # anchor reads 0 on all 9 configs and preflight_coverage.py shows all names OK.
 # (Hard lesson: a multi-hour run was burned on an unverified sweep.)
-SMOKE_DAYS = 3   # None = ALL days after the trailing-median warmup (~197)
+SMOKE_DAYS = None   # None = ALL days after the trailing-median warmup (~197)
 # workers
 WORKERS = 9
 # -----------------------------------------------------------------------------
