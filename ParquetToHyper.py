@@ -17,8 +17,8 @@ from tableauhyperapi import (
 )
 
 
-input_parquet = Path("C:/Users/shahzeb/Desktop/Del/Output/")
-output_hyper = Path("C:/Users/shahzeb/Desktop/Del/Output/")
+input_parquet = Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results/")
+output_hyper = Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results/")
 table_name = TableName("Extract")
 
 
@@ -168,6 +168,7 @@ def main():
     prepare_hyper_binary()
 
     parquet_files = sorted(input_parquet.glob("*.parquet"))
+    parquet_files = sorted(input_parquet.glob("universe_expand_PERNAME_20260912_0312.parquet"))
 
     if not parquet_files:
         print(f"No .parquet files found in: {input_parquet}")

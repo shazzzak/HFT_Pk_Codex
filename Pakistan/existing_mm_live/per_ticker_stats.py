@@ -8,12 +8,16 @@
 # frames + numerics
 import pandas as pd
 import numpy as np
+# for building the output path
+import os
 
 # ---- EDIT: parquet path + which config to profile ----
 # path to the PERNAME parquet from the full-year run
 PERNAME = "/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results/fullyear_confirm_PERNAME_20260911_1456.parquet"
 # which throttle config to profile ("QBPS_2","QT_2t","QT_1t","OBI",... or None = all)
 CONFIG = "QBPS_2"
+# all outputs go here (RESULTS_ROOT), per standing preference -- never relative paths
+OUT_DIR = "/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results"
 # annualization factor for Sharpe/Sortino (trading days/yr)
 ANN = np.sqrt(252.0)
 
@@ -133,7 +137,7 @@ def main():
         print(f"  [check] sum net_pkr = {overall['net_pkr'].sum():,.0f}  "
               f"(should match the run's {cfg} net_PKR)")
         # save
-        overall.to_parquet(f"per_ticker_OVERALL_{cfg}.parquet", index=False)
+        overall.to_parquet(os.path.join(OUT_DIR, f"per_ticker_OVERALL_{cfg}.parquet"), index=False)
 
         # ---- VIEW 2: per ticker x bucket ----
         bybuck = per_ticker(df, cfg, by_bucket=True)
@@ -148,9 +152,9 @@ def main():
         with pd.option_context("display.float_format", lambda x: f"{x:,.2f}"):
             print(bybuck[["symbol", "bucket"] + cols[1:]].to_string(index=False))
         # save
-        bybuck.to_parquet(f"per_ticker_BYBUCKET_{cfg}.parquet", index=False)
+        bybuck.to_parquet(os.path.join(OUT_DIR, f"per_ticker_BYBUCKET_{cfg}.parquet"), index=False)
         # tell where files went
-        print(f"\nwrote per_ticker_OVERALL_{cfg}.parquet and per_ticker_BYBUCKET_{cfg}.parquet")
+        print(f"\nwrote per_ticker_OVERALL_{cfg}.parquet and per_ticker_BYBUCKET_{cfg}.parquet -> {OUT_DIR}")
 
 
 if __name__ == "__main__":
