@@ -1,0 +1,21 @@
+[01:19:57] RUN_ONLY active: 3 of 114 names
+[01:19:57] pre-pass: calibration + trailing median trade size
+  pre-pass 50/207  0m01s
+  pre-pass 100/207  0m03s
+  pre-pass 150/207  0m05s
+  pre-pass 200/207  0m06s
+  pre-pass 207/207  0m06s
+[01:20:04] pre-flight: 3/3 names have complete calibration
+
+[01:20:04]   calibration in force:
+[01:20:04]     session_scales_20260913_0957.csv
+[01:20:04]     volume_profile_20260913_1234.csv
+[01:20:04]     time_windows_20260913_1245.csv
+[01:20:04]     session_segments_20260820_0107.csv
+[01:20:04]   calibration tag: 4a0aacad
+[01:20:04]   1182 cells to run this session (1182 total, 0 already journaled).
+
+[01:20:04] FULL-YEAR CONFIRMATION -- OBI vs QT_1t vs QT_2t vs QBPS_2, 207 days, cheap-tick excluded (winner frozen et1/obi+/tol0/mid, OFI-defensive off; framing #2 = throttle STACKS on obi_defensive): OFF vs ON = 2 configs
+[01:20:04]   x 3 names x 197 days = 1182 cells
+[01:20:04]   workers: 9
+

@@ -243,6 +243,16 @@ class MicrostructureMM:
                  # name by the same ECONOMIC amount. queue_skew_ticks is ignored
                  # when this is >0. 0 -> unchanged (fixed-tick or off).
                  queue_skew_bps=0.0,
+                 # --- GRADED STAIRCASE (default None = off, byte-identical) ---
+                 # A ladder of (imbalance_threshold, ticks) rungs, ASCENDING by
+                 # threshold: the skew distance grows with how one-sided the book
+                 # is, instead of one flat step at a single threshold. The last
+                 # rung the imbalance clears wins. rungs[0][0] must equal
+                 # queue_skew_thresh (asserted in __init__), since that is the
+                 # gate quotes() applies. Overrides queue_skew_ticks and _bps.
+                 #   [(0.15, 2)]                        == today's QT_2t
+                 #   [(0.15, 2), (0.20, 3), (0.25, 4)]  == the graded stair
+                 queue_skew_stairs=None,
                  # --- INVENTORY-DRIVEN SIZE TAPER (default off) ---
                  # Replaces the soft_inv CLIFF (full size -> side off) with a RAMP,
                  # anchored to real per-name capacity rather than a clip count:
@@ -507,6 +517,24 @@ class MicrostructureMM:
         self.queue_skew_ticks = float(queue_skew_ticks)
         self.queue_skew_thresh = float(queue_skew_thresh)
         self.queue_skew_bps = float(queue_skew_bps)
+        # --- STAIRCASE state. None -> byte-identical to the single-step skew ---
+        self.queue_skew_stairs = queue_skew_stairs
+        # validate the ladder NOW, not three hours into a sweep
+        if self.queue_skew_stairs:
+            # normalise so a tuple-of-tuples, or ints, behave like a list of floats
+            self.queue_skew_stairs = [(float(t), float(k))
+                                      for t, k in self.queue_skew_stairs]
+            # the rung thresholds, in the order supplied
+            _ths = [t for t, _ in self.queue_skew_stairs]
+            # "last rung that fires wins" is only correct on an ASCENDING ladder
+            if _ths != sorted(_ths):
+                raise ValueError(f"queue_skew_stairs must ascend by threshold, "
+                                 f"got {_ths}")
+            # the fire gate in quotes() uses queue_skew_thresh -- it must BE rung 0,
+            # or the ladder's lowest step and the gate would disagree silently
+            if abs(_ths[0] - self.queue_skew_thresh) > 1e-12:
+                raise ValueError(f"queue_skew_stairs[0][0]={_ths[0]} must equal "
+                                 f"queue_skew_thresh={self.queue_skew_thresh}")
         # --- INVENTORY TAPER state (off -> byte-identical) ---
         # engine reads this to decide whether to capture post-time market state
         self.log_fill_state = bool(log_fill_state)
@@ -1594,11 +1622,26 @@ class MicrostructureMM:
         # Off (queue_skew_ticks==0) -> both halves equal `half` (byte-identical).
         qs_half_buy = half
         qs_half_sell = half
-        # queue skew is active if EITHER the fixed-tick or the bps mode is set
-        if self.queue_skew_ticks != 0.0 or self.queue_skew_bps != 0.0:
+        # queue skew is active if a staircase, the fixed-tick, or the bps mode is set
+        if self.queue_skew_stairs or self.queue_skew_ticks != 0.0 \
+                or self.queue_skew_bps != 0.0:
+            # STAIRCASE mode: the skew DISTANCE scales with the STRENGTH of the
+            # imbalance instead of being one flat step. Rungs are (threshold,
+            # ticks) ascending by threshold; the LAST rung this imbalance clears
+            # wins. __init__ asserts rungs[0][0] == queue_skew_thresh, so the
+            # threshold test below IS the lowest rung and the two cannot disagree.
+            if self.queue_skew_stairs:
+                # no rung cleared -> no skew (the test below then fails too)
+                _qs = 0.0
+                # walk the ladder upward, keeping the highest rung that fires
+                for _th, _tk in self.queue_skew_stairs:
+                    # strictly greater, matching the threshold test below exactly
+                    if abs(imb - 0.5) > _th:
+                        # this rung's distance in price units
+                        _qs = _tk * self.tick
             # PRICE-RELATIVE mode: distance = queue_skew_bps of mid, rounded to a
             # whole number of ticks (at least 1 tick so it always moves the quote).
-            if self.queue_skew_bps != 0.0:
+            elif self.queue_skew_bps != 0.0:
                 # mid reference for the bps->price conversion
                 _mref = 0.5 * (bb + ba)
                 # target shift in price = bps of mid

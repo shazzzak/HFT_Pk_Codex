@@ -93,6 +93,11 @@ T_EXIT_OBI = -1.0
 # a dropped name only returns if its best config is profitable AND its own
 # daily t clears this -- stops a name hovering at zero from flip-flopping
 T_REENTRY = 2.0
+# MATERIALITY FLOOR in PKR per trading day. A live name below this earns less
+# than it costs in operational surface. 0.0 = off, which reproduces the
+# walk-forward-validated rule exactly. Measured on the 2026-09-13 run: 19 of 99
+# live names sit under 200 PKR/day and contribute 1.96% of assigned P&L.
+MIN_PKR_PER_DAY = 0.0
 # how long this assignment is good for
 REFIT_DAYS = 91
 
@@ -244,34 +249,57 @@ def main():
 
     # ---- apply the rule ----------------------------------------------------
     def decide(r):
-        """Return (assigned_config, reason) for one name."""
-        # 1. capacity is a risk limit and outranks P&L
+        """Return (assigned_config, reason) for one name.
+
+        ORDER MATTERS. The gate is applied to the config this function actually
+        CHOOSES, never to the better of the two. Testing `best_pkr` and then
+        assigning the other config lets a money-losing assignment through the
+        gate -- ASL and WTL did exactly that on the 2026-09-13 run (both were
+        assigned QT_2t, which loses on those names, because their paired t was
+        not past the entry threshold while OBI carried the positive P&L).
+        """
+        # 1. capacity is a risk limit and outranks every P&L consideration
         if r.capacity_flag != "ok":
             # cannot be unwound inside the cap -> never quote it
             return "DROP", f"capacity:{r.capacity_flag}"
-        # 2. both configs lose -> no config fixes it
-        if r.best_pkr <= 0:
-            # a name previously dropped only returns on a significant positive
-            if r.prior_config == "DROP" and not (r.best_pkr > 0
-                                                 and r.t_best > T_REENTRY):
+        # 2. BOTH configs lose -> no config fixes this name
+        if max(r.obi_pkr, r.qt2t_pkr) <= 0:
+            # a dropped name only returns on a significant positive
+            if r.prior_config == "DROP" and not r.t_best > T_REENTRY:
                 return "DROP", "loses under both (held)"
             # first-time drop
             return "DROP", "loses under both"
-        # 3. the CHEAP_EXCLUDED names: the skew is inert, the two configs are
-        #    byte-identical, so the choice is cosmetic -- name it explicitly
+        # 3. CHOOSE the config. The cheap-tick names have no difference to test
+        #    (QT_2t and OBI are byte-identical every day) -> the choice is
+        #    cosmetic, so name that case rather than let a NaN fall through.
         if pd.isna(r.t_diff):
-            # no difference exists to test
-            return "OBI", "skew inert (cheap tick)"
-        # 4. hysteresis on the paired t
-        if r.t_diff < T_ENTER_OBI:
+            # the skew is inert on a one-tick book
+            cfg, why = "OBI", "skew inert (cheap tick)"
+        elif r.t_diff < T_ENTER_OBI:
             # OBI significantly better -> enter/hold OBI
-            return "OBI", f"t={r.t_diff:.2f} < {T_ENTER_OBI}"
-        if r.prior_config == "OBI" and r.t_diff <= T_EXIT_OBI:
+            cfg, why = "OBI", f"t={r.t_diff:.2f} < {T_ENTER_OBI}"
+        elif r.prior_config == "OBI" and r.t_diff <= T_EXIT_OBI:
             # inside the band and already on OBI -> hold, do not churn
-            return "OBI", f"t={r.t_diff:.2f} in band, held"
-        # 5. default: the global winner
-        return "QT_2t", (f"t={r.t_diff:.2f}" if r.t_diff > T_EXIT_OBI
-                         else f"t={r.t_diff:.2f} in band, default")
+            cfg, why = "OBI", f"t={r.t_diff:.2f} in band, held"
+        else:
+            # default: the global winner
+            cfg, why = "QT_2t", (f"t={r.t_diff:.2f}" if r.t_diff > T_EXIT_OBI
+                                 else f"t={r.t_diff:.2f} in band, default")
+        # the P&L of the config we just chose -- NOT the better of the two
+        chosen = r.obi_pkr if cfg == "OBI" else r.qt2t_pkr
+        # 4. GATE THE CHOICE. Quoting a config that lost money on this name over
+        #    197 sessions is never correct, whatever the other config did.
+        if chosen <= 0:
+            # say which config was rejected, so the log explains itself
+            return "DROP", f"{cfg} loses ({chosen:,.0f})"
+        # 5. MATERIALITY FLOOR. A name earning a few PKR a day consumes a
+        #    quoting slot, risk budget and monitoring attention for nothing.
+        #    Default 0.0 keeps the validated rule unchanged; raise it to prune.
+        if MIN_PKR_PER_DAY > 0 and (chosen / r.days) < MIN_PKR_PER_DAY:
+            # immaterial, not unprofitable -- a distinct reason
+            return "DROP", f"immaterial ({chosen / r.days:,.0f}/day)"
+        # the surviving assignment
+        return cfg, why
     # apply it row by row
     P[["assigned_config", "reason"]] = P.apply(
         lambda r: pd.Series(decide(r)), axis=1)

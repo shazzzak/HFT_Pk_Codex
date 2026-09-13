@@ -114,7 +114,11 @@ NAMES = ['AGHA', 'AGP', 'AHCL', 'AICL', 'AIRLINK', 'AKBL', 'APL', 'ASL',
 # so one cohort can be rerun under the current calibration without recomputing
 # the rest. Applied here, before anything reads NAMES, so the preflight, the
 # work list and every printed count reflect the reduced set.
-RUN_ONLY = ['KEL', 'PIBTL', 'TPL']
+RUN_ONLY = ['AKBL', 'ATRL', 'BAFL', 'BOP', 'DGKC', 'ENGROH', 'FFC', 'FNEL',
+            'HASCOL', 'HBL', 'HUBC', 'KEL', 'LUCK', 'MARI', 'MEBL', 'MLCF',
+            'NBP', 'NCPL', 'NML', 'NPL', 'NRL', 'OGDC', 'PACE', 'PAEL',
+            'PIAHCLA', 'PIBTL', 'PIOC', 'PPL', 'PSO', 'PTC', 'SAZEW', 'SEARL',
+            'SYS', 'THCCL', 'TOMCL', 'TPL', 'TRG', 'UBL']
 # apply the filter immediately
 if RUN_ONLY is not None:
     # a typo must fail loudly, not silently run 37 names
@@ -187,12 +191,12 @@ CHEAP_EXCLUDED = {"KEL", "PIBTL", "TPL"}
 # on them, which is the ONLY way to measure whether the exclusion is still right.
 # Their paired t is currently undefined because both configs produce identical
 # P&L -- that is the blacklist suppressing its own evidence.
-HONOUR_CHEAP_EXCLUDED = False
+HONOUR_CHEAP_EXCLUDED = True
 # OUTPUT STEM for every artifact this run writes: the CSV, the DAILY and PERNAME
 # parquets, and the checkpoint journal. Change it for a side experiment so the
 # results land in their own file series instead of the main one, and so the
 # journal cannot collide with the production run's.
-OUT_STEM = "cheap_test"
+OUT_STEM = "universe_expand"
 # the four confirmation configs
 # UNIVERSE EXPANSION: two configs only. QT_2t is the deploy pick from the
 # full-year confirmation (8,736,780 PKR vs QBPS_2's 8,278,591; paired edge over
