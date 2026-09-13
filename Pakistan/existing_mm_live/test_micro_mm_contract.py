@@ -70,6 +70,9 @@ REQUIRED_KWARGS = [
     "flow_throttle", "flow_hl_s", "flow_thresh_n", "flow_std_hl_s",
     # THE ONE THAT WAS LOST IN THE CLOBBER -- never remove either of these
     "queue_skew_ticks", "queue_skew_bps", "queue_skew_thresh",
+    # the graded staircase -- REQUIRED as of 2026-09-14; the sweep cannot run
+    # without it, and a clobber that drops it must fail loudly, not silently
+    "queue_skew_stairs",
     # size skew / taper
     "size_boost_mult", "size_boost_thresh",
     "enable_inv_taper", "inv_taper_k", "inv_taper_pov_mult",
@@ -86,8 +89,7 @@ REQUIRED_KWARGS = [
 # PENDING, never as a failure, so an un-applied edit cannot block a run whose
 # real contract is intact. Move a name up into REQUIRED_KWARGS once it lands.
 PENDING_KWARGS = [
-    # the graded staircase -- needed by the magnitude/threshold sweep
-    "queue_skew_stairs",
+    # (empty) -- queue_skew_stairs landed 2026-09-14 and moved up to REQUIRED.
 ]
 
 # a running tally so every failure is reported, not just the first
@@ -246,6 +248,100 @@ def main():
               q_on["SELL"][0] >= bb + strat.tick - 1e-9,
               f"ask {q_on['SELL'][0]:.2f} vs bid {bb:.2f}")
 
+
+    # ---- 6. STAIRCASE: the rung actually selected, and the ladder guard -------
+    # The stair arm is the only config where the skew DISTANCE is a function of
+    # the imbalance. A silent fall-through to rung 0 would still produce a
+    # plausible-looking run -- it would just be QT_2t wearing a STAIR label and
+    # the sweep's whole conclusion would be wrong. So assert the selection.
+    def staircase():
+        # the ladder the sweep actually runs
+        ladder = [(0.15, 2.0), (0.20, 3.0), (0.25, 4.0)]
+        # the stair config: gate MUST equal rungs[0][0] or __init__ raises
+        kw_st = dict(kw)
+        # the fixed-tick path must be off, or the test proves nothing
+        kw_st["queue_skew_ticks"] = 0.0
+        # the ladder
+        kw_st["queue_skew_stairs"] = ladder
+        # the gate, matching rung 0
+        kw_st["queue_skew_thresh"] = 0.15
+        # build it
+        st = MicrostructureMM(**kw_st)
+        # same clock as the rest of the block
+        st.now = SESSION[0] + 60_000
+        # a reference with no skew at all, to measure displacement against
+        kw_ref = dict(kw)
+        # skew fully off
+        kw_ref["queue_skew_ticks"] = 0.0
+        # build the reference
+        rf = MicrostructureMM(**kw_ref)
+        # same clock
+        rf.now = st.now
+        # one tick, for converting displacement back into rungs
+        tk = st.tick
+        # A WIDE book on purpose. quotes() clamps the favorable half at
+        # max(0.0, half - _qs), so on a narrow book a 4-tick rung can bind the
+        # clamp and the measured displacement would be smaller than the rung --
+        # a false failure that says nothing about the ladder. 40 ticks between
+        # the touches puts `half` near 20 ticks, well clear of the top rung.
+        wb, wa = 100.00, 100.40
+        # (imb, expected_ticks). The gate is on |imb - 0.5|, NOT on imb, so the
+        # rung boundaries in imb terms are 0.65 / 0.70 / 0.75, and the test is
+        # STRICTLY greater -- an imbalance sitting exactly on a rung does not
+        # climb it. 0.60 -> |0.10|, below every rung: no skew at all.
+        cases = [(0.60, 0.0), (0.68, 2.0), (0.73, 3.0), (0.80, 4.0)]
+        # walk each case
+        for imb, want in cases:
+            # total book size is arbitrary; only the ratio matters
+            tot = 1000.0
+            # bid quantity produces the target imbalance
+            bqi = imb * tot
+            # ask quantity is the remainder
+            aqi = tot - bqi
+            # quote with the staircase on
+            q_s = st.quotes(wb, bqi, wa, aqi, 0.0, depth=None)
+            # and with it off
+            q_r = rf.quotes(wb, bqi, wa, aqi, 0.0, depth=None)
+            # if either side is missing the comparison is meaningless -- say so
+            if not ({"BUY", "SELL"} <= set(q_s)) or not ({"BUY", "SELL"} <= set(q_r)):
+                check(f"stair rung at imb={imb:.2f}", False,
+                      f"one side unquoted: stair={sorted(q_s)} ref={sorted(q_r)}")
+                continue
+            # displacement of the bid, in ticks
+            got = (q_s["BUY"][0] - q_r["BUY"][0]) / tk
+            # the rung the ladder should have selected
+            check(f"stair selects {want:g}t at imb={imb:.2f}",
+                  abs(got - want) < 1e-6,
+                  f"expected {want:g}t, got {got:.4f}t")
+        # THE LADDER GUARD. A descending ladder silently inverts "last rung wins",
+        # so __init__ must refuse it. If this check fails, a typo in a sweep
+        # config would run for hours and produce a wrong answer instead of an error.
+        kw_bad = dict(kw_st)
+        # descending: 0.25 before 0.15
+        kw_bad["queue_skew_stairs"] = [(0.25, 4.0), (0.15, 2.0)]
+        # and the gate matches the FIRST entry, so only the ordering is wrong
+        kw_bad["queue_skew_thresh"] = 0.25
+        # it must raise
+        try:
+            MicrostructureMM(**kw_bad)
+            check("descending ladder is rejected", False, "constructor accepted it")
+        except ValueError:
+            check("descending ladder is rejected", True)
+        # THE GATE GUARD. rungs[0][0] must equal queue_skew_thresh, or the fire
+        # test in quotes() and the ladder's bottom step disagree silently.
+        kw_gap = dict(kw_st)
+        # ladder starts at 0.15 ...
+        kw_gap["queue_skew_stairs"] = ladder
+        # ... but the gate is 0.20: rung 0 could never fire
+        kw_gap["queue_skew_thresh"] = 0.20
+        # it must raise
+        try:
+            MicrostructureMM(**kw_gap)
+            check("rung0 != queue_skew_thresh is rejected", False,
+                  "constructor accepted it")
+        except ValueError:
+            check("rung0 != queue_skew_thresh is rejected", True)
+
     # run it under a blanket guard: nothing in here may take the process down
     try:
         geometry()
@@ -257,6 +353,13 @@ def main():
         print("\n  NOTE: the contract checks above are the gate and they stand.")
         print("        The geometry block needs engine state the constructor does")
         print("        not set. Paste the error above if you want it diagnosed.")
+
+    # same blanket guard: the staircase block must never take the process down
+    try:
+        staircase()
+    # deliberate bare Exception -- report, do not judge
+    except Exception as e:
+        check("staircase checks ran", False, repr(e))
 
 
 # entry point

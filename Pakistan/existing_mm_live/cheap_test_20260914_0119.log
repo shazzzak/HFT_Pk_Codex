@@ -19,3 +19,86 @@
 [01:20:04]   x 3 names x 197 days = 1182 cells
 [01:20:04]   workers: 9
 
+[01:23:07]   200/1182  3m09s  ETA 15m29s
+[01:25:05]   400/1182  5m07s  ETA 10m01s
+[01:28:20]   600/1182  8m22s  ETA 8m07s
+[01:30:01]   800/1182  10m03s  ETA 4m48s
+[01:32:17]   1000/1182  12m20s  ETA 2m14s
+[01:34:22]   1182/1182  14m24s  ETA 0m00s
+[01:20:06] RUN_ONLY active: 3 of 114 names
+[01:20:06] RUN_ONLY active: 3 of 114 names
+[01:20:06] RUN_ONLY active: 3 of 114 names
+[01:20:06] RUN_ONLY active: 3 of 114 names
+[01:20:06] RUN_ONLY active: 3 of 114 names
+[01:20:06] RUN_ONLY active: 3 of 114 names
+[01:20:06] RUN_ONLY active: 3 of 114 names
+[01:20:06] RUN_ONLY active: 3 of 114 names
+
+[01:34:22]   checkpoint complete -> cheap_test_CKPT.4a0aacad.jsonl.20260914_0119.done
+
+[01:34:22] ====================================================================================
+[01:34:22] ### 2D SKEW SWEEP DONE: 14m24s for 1182 cells ###
+[01:34:22] ====================================================================================
+
+[01:34:22] === SUMMARY: OFI-defensive configs (winner frozen: et1/obi+/tol0) ===
+[01:34:22]     ofi_window  thresh   net_bps       net_PKR
+[01:34:22]            OBI       -    -0.943       -19,797
+[01:34:22]          QT_2t      2t    -3.904      -259,543
+
+[01:34:22] === DAY-AS-UNIT net_bps: mean +/- SE (each day = one observation) ===
+[01:34:22]     ofi_window  thresh  n_days  mean_bps      se
+[01:34:22]            OBI       -     197     0.469   1.168
+[01:34:22]          QT_2t      2t     197    -4.036   0.600
+
+[01:34:22] === RISK METRICS (day-as-unit; Sharpe/Sortino annualised, DD on cum PKR) ===
+[01:34:22]         config  thresh       net_PKR     bps  Sharpe  Sortino    maxDD_PKR  win%
+[01:34:22]            OBI       -       -19,797    0.47     0.5      0.4      -39,959   57%
+[01:34:22]          QT_2t      2t      -259,543   -4.04    -7.6     -5.9     -272,352   32%
+
+[01:34:22] === control(OBI) - config (PAIRED by day): positive => current OBI wins ===
+[01:34:22]         config  thresh  n_pair    d_bps      se       t
+[01:34:22]          QT_2t      2t     197    4.506   0.977    4.61
+[01:34:22]   (|t| >~ 2 => the gap vs NONE is beyond day-to-day noise)
+
+[01:34:22] === RECONCILIATION ANCHOR: MEASURED decomposition vs engine P&L ===
+[01:34:22]     ofi_window  thresh     measured_net       engine_pnl   unexplained     pct   ok?
+[01:34:22]            OBI       -          -19,797          -19,797             0   -0.0%    OK
+[01:34:22]          QT_2t      2t         -259,543         -259,543            -0    0.0%    OK
+
+[01:34:22] ====================================================================================
+[01:34:22] CONFIG: et=1 obi=True tol=0.0   throttle=OBI thresh=-
+[01:34:22] ====================================================================================
+[01:34:22] bucket       cap_bps  mko_bps  jmp_bps  dif_bps  fee_bps  liq_bps   unexpl  net_bps     net_pkr  med_hld mean_hld med_tks_mid  thr%   trades   sh/trd
+[01:34:22] first15       -1.008    2.830    0.061    2.794   -1.554   -0.596   -0.000   -0.328        -883     96.3    655.4        0.50    58    2,813     1325
+[01:34:22] middle         2.641    0.032    0.017   -0.215   -1.553   -1.052   -0.000    0.067         951    323.6   1170.4        0.50    46   18,051     1208
+[01:34:22] preclose45    -0.770    1.938    0.090    1.930   -1.551   -4.256    0.000   -4.639     -15,020    262.2    568.5        0.50    47    4,164     1220
+[01:34:22] last15         2.450   -1.745   -0.002    1.791   -1.551   -4.450    0.000   -5.296      -4,846    194.4    262.7        0.50    54    1,216     1114
+
+[01:34:22] bucket        raw_obi5  signed_obi5   buy_obi5  sell_obi5  (signed<0 = book against us)
+[01:34:22] first15         0.0289       0.0163     0.0448     0.0127
+[01:34:22] middle          0.0670       0.0218     0.0903     0.0444
+[01:34:22] preclose45      0.0734       0.0298     0.1047     0.0429
+[01:34:22] last15          0.0899       0.0652     0.1620     0.0237
+
+[01:34:22]   daily markout (n=197): mean 65  median 194  t=0.63 p=0.531  Wilcoxon p=0.136
+
+[01:34:22] ====================================================================================
+[01:34:22] CONFIG: et=1 obi=True tol=0.0   throttle=QT_2t thresh=2t
+[01:34:22] ====================================================================================
+[01:34:22] bucket       cap_bps  mko_bps  jmp_bps  dif_bps  fee_bps  liq_bps   unexpl  net_bps     net_pkr  med_hld mean_hld med_tks_mid  thr%   trades   sh/trd
+[01:34:22] first15       -2.415    1.560    0.052    1.528   -1.554   -0.429    0.000   -2.837     -15,898     60.8    312.2        0.50    80    6,049     1378
+[01:34:22] middle        -1.718    0.322    0.012    0.274   -1.554   -0.461    0.000   -3.410    -156,180    207.3    653.8        0.50    78   59,920     1180
+[01:34:22] preclose45    -2.083   -0.564    0.055   -0.870   -1.552   -2.542    0.000   -6.741     -71,775    172.6    360.8        0.50    78   13,939     1202
+[01:34:22] last15        -1.042    2.743    0.049    3.177   -1.553   -3.683    0.000   -3.534     -15,690     95.9    156.7        0.50    78    5,827     1201
+
+[01:34:22] bucket        raw_obi5  signed_obi5   buy_obi5  sell_obi5  (signed<0 = book against us)
+[01:34:22] first15         0.0371       0.0499     0.0893    -0.0125
+[01:34:22] middle          0.0750       0.0429     0.1279     0.0298
+[01:34:22] preclose45      0.0767       0.0415     0.1288     0.0325
+[01:34:22] last15          0.0797       0.0458     0.1359     0.0315
+
+[01:34:22]   daily markout (n=197): mean 151  median 350  t=0.92 p=0.361  Wilcoxon p=0.14
+
+[01:34:22] wrote /Users/shazzak/HFT Data/Pakistan/Capital Stake - Results/cheap_test_20260914_0119.csv
+[01:34:22] wrote /Users/shazzak/HFT Data/Pakistan/Capital Stake - Results/cheap_test_DAILY_20260914_0119.parquet (1970 rows, verified)
+[01:34:22] wrote /Users/shazzak/HFT Data/Pakistan/Capital Stake - Results/cheap_test_PERNAME_20260914_0119.parquet (4728 rows, verified)

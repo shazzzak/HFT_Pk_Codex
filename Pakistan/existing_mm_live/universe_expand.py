@@ -114,7 +114,30 @@ NAMES = ['AGHA', 'AGP', 'AHCL', 'AICL', 'AIRLINK', 'AKBL', 'APL', 'ASL',
 # so one cohort can be rerun under the current calibration without recomputing
 # the rest. Applied here, before anything reads NAMES, so the preflight, the
 # work list and every printed count reflect the reduced set.
-RUN_ONLY = ['KEL', 'PIBTL', 'TPL']
+# STRATIFIED 30-NAME SUBSET for the graded-skew sweep. NOT a random sample and
+# NOT the top 30 by P&L -- either would bias the answer. The strata span the
+# RESPONSE SURFACE of the QT_2t-minus-OBI edge measured on the 113-name run, so
+# the sweep is asked the question on names where more skew should help, on names
+# where it already hurts, and on names where it does nothing:
+#   12 strong QT_2t winners  (t_diff +6.3 to +13.8) -- does MORE lean pay more?
+#    8 OBI winners           (t_diff -2.1 to -7.1)  -- does a stricter gate
+#                                                      rescue them, or is the
+#                                                      whole mechanism wrong
+#                                                      for these books?
+#   10 indifferent           (|t_diff| < 1.0)       -- is the null a real null,
+#                                                      or just an under-powered
+#                                                      threshold?
+# Coverage: 29.9% of the book's QT_2t PKR and 32.6% of the total QT_2t-OBI edge.
+# KEL/PIBTL/TPL are deliberately ABSENT: A.2 settled them (t = +4.61 for OBI).
+RUN_ONLY = [
+    # --- strong QT_2t winners: the magnitude question ---
+    'NRL', 'NBP', 'ENGROH', 'NPL', 'MLCF', 'NCPL',
+    'DGKC', 'NML', 'PPL', 'SEARL', 'AIRLINK', 'LUCK',
+    # --- OBI winners: the threshold question ---
+    'FNEL', 'TELE', 'TBL', 'TPLP', 'HASCOL', 'SLGL', 'LOADS', 'PACE',
+    # --- indifferent: the power question ---
+    'TREET', 'UNITY', 'FFL', 'AICL', 'BECO', 'DFML', 'CEPB', 'FCL', 'BNL', 'FCCL',
+]
 # apply the filter immediately
 if RUN_ONLY is not None:
     # a typo must fail loudly, not silently run 37 names
@@ -187,39 +210,94 @@ CHEAP_EXCLUDED = {"KEL", "PIBTL", "TPL"}
 # on them, which is the ONLY way to measure whether the exclusion is still right.
 # Their paired t is currently undefined because both configs produce identical
 # P&L -- that is the blacklist suppressing its own evidence.
-HONOUR_CHEAP_EXCLUDED = False
+HONOUR_CHEAP_EXCLUDED = True
 # OUTPUT STEM for every artifact this run writes: the CSV, the DAILY and PERNAME
 # parquets, and the checkpoint journal. Change it for a side experiment so the
 # results land in their own file series instead of the main one, and so the
 # journal cannot collide with the production run's.
-OUT_STEM = "cheap_test"
-# the four confirmation configs
-# UNIVERSE EXPANSION: two configs only. QT_2t is the deploy pick from the
-# full-year confirmation (8,736,780 PKR vs QBPS_2's 8,278,591; paired edge over
-# OBI +1.3036 bps/day, t=+9.42). OBI is kept as thr=0 because every downstream
-# diff is computed against the control, and because the 76 never-run names need
-# their OWN control -- QT_2t beating OBI on the existing 38 is not evidence that
-# it beats OBI on names the engine has never seen.
+OUT_STEM = "gate_sweep"
+# ---- GRADED-SKEW SWEEP, GATE-PRIMARY (2026-09-14) ----
+# Eight arms. The PRIMARY axis is the GATE (queue_skew_thresh), not the
+# magnitude. Rationale:
+#   * The gate has never been swept. It has been 0.15 since the mechanism was
+#     built; every sweep since has moved ticks with the gate held fixed.
+#   * The magnitude axis is already well characterised: the 113-name run made
+#     QT_1t the efficiency winner and QT_2t the money winner, so the tick count
+#     is probably peaked at 2 and 3/4 ticks were testing the known axis.
+#   * obi_throttle_thresh is ALSO 0.15, so today the defensive throttle and the
+#     queue skew fire on the SAME ticks -- a confound that has never been
+#     separated. A 0.10 gate makes the skew fire on a band where the throttle
+#     is not engaged, decoupling the two mechanisms for the first time.
+#
+#   thr  label      ticks  gate   what it isolates
+#   ---  ---------  -----  -----  --------------------------------------------
+#    0   OBI          -      -    control: no skew at all
+#    1   QT_2t@15     2    0.15   incumbent -- also the run's ANCHOR
+#    2   QT_2t@10     2    0.10   gate DOWN: fires more often, same lean
+#    3   QT_2t@20     2    0.20   gate UP
+#    4   QT_2t@25     2    0.25   gate UP further
+#    5   QT_3t@15     3    0.15   magnitude probe, gate held
+#    6   STAIR_LO   2/3/4  0.10   graded ladder from the low base
+#    7   STAIR_HI   2/3/4  0.15   graded ladder from the incumbent base
+#
+# Arms 1-4 form a clean FOUR-POINT GATE CURVE at fixed magnitude, so the gate
+# response is identifiable rather than inferred. The previous design's QT_3t@20
+# arm is deliberately GONE: it moved ticks and gate together, so any difference
+# it showed could not be attributed to either. Arms 6-7 earn their place only by
+# beating every flat arm on their own base, not merely by beating the incumbent.
 THROTTLE_MODES = [
-    dict(_OBI),                                                   # OBI control
-    dict(_OBI, queue_skew_ticks=2.0, queue_skew_thresh=0.15),     # QT_2t
+    # thr=0 -- control. No skew. Every paired diff is measured against this.
+    dict(_OBI),
+    # thr=1 -- incumbent QT_2t. Fixed-tick path (NOT a one-rung stair), so it
+    # stays byte-identical to the production arm and reconciles against it.
+    dict(_OBI, queue_skew_ticks=2.0, queue_skew_thresh=0.15),
+    # thr=2 -- GATE DOWN. Same 2-tick lean, fires on |imb-0.5| > 0.10. Expect
+    # materially more fills; the A.2 lesson is that more fills are only a win if
+    # CAPTURE holds up, so this arm is judged on the decomposition, not on PKR.
+    dict(_OBI, queue_skew_ticks=2.0, queue_skew_thresh=0.10),
+    # thr=3 -- GATE UP. Same lean, fires only past 0.20.
+    dict(_OBI, queue_skew_ticks=2.0, queue_skew_thresh=0.20),
+    # thr=4 -- GATE UP further: rarer, more selective.
+    dict(_OBI, queue_skew_ticks=2.0, queue_skew_thresh=0.25),
+    # thr=5 -- MAGNITUDE probe. Gate held at the incumbent 0.15, 3 ticks. One
+    # point is enough to keep the axis alive alongside the known 1t/2t results.
+    dict(_OBI, queue_skew_ticks=3.0, queue_skew_thresh=0.15),
+    # thr=6 -- STAIR_LO. Ladder from the low base. rungs[0][0] MUST equal
+    # queue_skew_thresh; micro_mm __init__ raises if not, so a typo here fails
+    # in seconds rather than after hours of compute.
+    dict(_OBI, queue_skew_stairs=[(0.10, 2.0), (0.15, 3.0), (0.20, 4.0)],
+         queue_skew_thresh=0.10),
+    # thr=7 -- STAIR_HI. The original ladder, from the incumbent base.
+    dict(_OBI, queue_skew_stairs=[(0.15, 2.0), (0.20, 3.0), (0.25, 4.0)],
+         queue_skew_thresh=0.15),
 ]
-THROTTLE_LABELS = ["OBI", "QT_2t"]
+# short labels; these land in the CSV/parquet 'throttle' column
+THROTTLE_LABELS = ["OBI", "QT_2t@15", "QT_2t@10", "QT_2t@20", "QT_2t@25",
+                   "QT_3t@15", "STAIR_LO", "STAIR_HI"]
 def _cfg_lab(thr):
     return THROTTLE_LABELS[thr]
 def _cfg_thr(thr):
+    # the parameter dict for this arm
     m = THROTTLE_MODES[thr]
+    # accumulate one token per active mechanism
     parts = []
-    if m.get("queue_skew_bps", 0.0) != 0.0:
+    # STAIRCASE first: it overrides ticks and bps inside quotes(), so the label
+    # must report it first too, or the CSV would describe a skew that never ran.
+    if m.get("queue_skew_stairs"):
+        # render the ladder compactly: 0.15:2t/0.20:3t/0.25:4t
+        parts.append("/".join(f"{t:g}:{k:g}t" for t, k in m["queue_skew_stairs"]))
+    # PRICE-RELATIVE mode
+    elif m.get("queue_skew_bps", 0.0) != 0.0:
         parts.append(f"{m['queue_skew_bps']:g}bps")
+    # FIXED-tick mode: report the gate too, since it is now a swept axis and
+    # "2t" alone no longer identifies the arm (2t@0.15 and 2t@0.20 differ).
     elif m.get("queue_skew_ticks", 0.0) != 0.0:
-        parts.append(f"{m['queue_skew_ticks']:g}t")
+        parts.append(f"{m['queue_skew_ticks']:g}t@{m.get('queue_skew_thresh', 0.15):g}")
+    # inventory taper, if it is ever switched back on
     if m.get("enable_inv_taper"):
         parts.append(f"tpr{m['inv_taper_pov_mult']:g}")
+    # "-" is the control's marker
     return "+".join(parts) if parts else "-"
-    if m.get("queue_skew_ticks", 0.0) != 0.0:
-        return f"{m['queue_skew_ticks']:g}t"
-    return "-"
 
 EXIT_INV_THRESHOLD = 1.0
 # OBI-defensive engage threshold (|imb-0.5|) and widen ticks
@@ -359,6 +437,11 @@ def _process(args):
         params["queue_skew_ticks"] = 0.0
         # and none in bps either
         params["queue_skew_bps"] = 0.0
+        # and no staircase either -- WITHOUT this line a stair arm would leave
+        # queue_skew_stairs set on an excluded name and the skew would still
+        # fire, because the stair branch in quotes() is tested BEFORE the ticks
+        # and bps branches. Clearing only ticks/bps would silently un-exclude it.
+        params["queue_skew_stairs"] = None
     # run
     dr = H.run_symbol_day(date, sym, dsets, params)
     if dr is None or dr.pnl() is None:
@@ -757,16 +840,34 @@ def main():
                   H.newest("volume_profile_*.csv").name,
                   H.newest("time_windows_*.csv").name,
                   H.newest("session_segments_*.csv").name]
-    # an 8-hex digest that changes the moment ANY calibration file changes
-    _cal_tag = hashlib.sha1("|".join(_cal_files).encode()).hexdigest()[:8]
+    # THE ARM SET IS PART OF THE JOURNAL'S IDENTITY. Resume keys a completed
+    # cell on (date, sym, thr) -- an INTEGER index into THROTTLE_MODES, with no
+    # record of what that index meant. Redefine the arms and thr=2 silently
+    # changes meaning, so a resume would fold results computed under one config
+    # into the row of another. It would reconcile perfectly, because each cell
+    # is internally consistent; the error is invisible in every anchor. Folding
+    # the arm definitions into the tag makes that class of mistake structurally
+    # impossible: change any arm and the journal name changes with it.
+    _arm_sig = "|".join(
+        f"{lab}:{sorted(m.items(), key=lambda kv: kv[0])!r}"
+        for lab, m in zip(THROTTLE_LABELS, THROTTLE_MODES))
+    # an 8-hex digest that changes if ANY calibration file OR ANY arm changes
+    _cal_tag = hashlib.sha1(
+        ("|".join(_cal_files) + "||" + _arm_sig).encode()).hexdigest()[:8]
     # put the exact calibration in the run log, permanently
     print("\n  calibration in force:", flush=True)
     # one line per file so a stale one is visible at a glance
     for _f in _cal_files:
         # name the file
         print(f"    {_f}", flush=True)
-    # and the tag the journal is scoped to
-    print(f"  calibration tag: {_cal_tag}", flush=True)
+    # the arms in force, so the log alone identifies what was run
+    print("\n  arms in force:", flush=True)
+    # one line per arm: index, label, and the rendered mechanism string
+    for _i, _lab in enumerate(THROTTLE_LABELS):
+        # _cfg_thr renders stairs / ticks@gate / bps, so this cannot drift
+        print(f"    thr={_i}  {_lab:10s}  {_cfg_thr(_i)}", flush=True)
+    # and the tag the journal is scoped to (calibration AND arms)
+    print(f"  calibration+arm tag: {_cal_tag}", flush=True)
     # the journal path, scoped to this calibration
     ckpt_path = RESULTS / f"{OUT_STEM}_CKPT.{_cal_tag}.jsonl"
     # a work item's identity for resume = (date, sym, thr) -- the only varying
