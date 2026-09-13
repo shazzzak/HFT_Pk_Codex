@@ -1,0 +1,174 @@
+[18:18:25] RUN_ONLY active: 38 of 114 names
+[18:18:25] pre-pass: calibration + trailing median trade size
+  pre-pass 50/207  0m11s
+  pre-pass 100/207  0m23s
+  pre-pass 150/207  0m35s
+  pre-pass 200/207  0m46s
+  pre-pass 207/207  0m48s
+[18:19:13] pre-flight: 38/38 names have complete calibration
+
+[18:19:13]   calibration in force:
+[18:19:13]     session_scales_20260913_0957.csv
+[18:19:13]     volume_profile_20260913_1234.csv
+[18:19:13]     time_windows_20260913_1245.csv
+[18:19:13]     session_segments_20260820_0107.csv
+[18:19:13]   calibration tag: 4a0aacad
+[18:19:13]   14972 cells to run this session (14972 total, 0 already journaled).
+
+[18:19:13] FULL-YEAR CONFIRMATION -- OBI vs QT_1t vs QT_2t vs QBPS_2, 207 days, cheap-tick excluded (winner frozen et1/obi+/tol0/mid, OFI-defensive off; framing #2 = throttle STACKS on obi_defensive): OFF vs ON = 2 configs
+[18:19:13]   x 38 names x 197 days = 14972 cells
+[18:19:13]   workers: 9
+
+[18:21:40]   200/14972  3m15s  ETA 240m10s
+[18:23:59]   400/14972  5m33s  ETA 202m42s
+[18:26:05]   600/14972  7m40s  ETA 183m44s
+[18:28:20]   800/14972  9m54s  ETA 175m37s
+[18:30:44]   1000/14972  12m19s  ETA 172m14s
+[18:33:19]   1200/14972  14m54s  ETA 171m06s
+[18:35:42]   1400/14972  17m17s  ETA 167m37s
+[18:38:20]   1600/14972  19m54s  ETA 166m26s
+[18:40:47]   1800/14972  22m21s  ETA 163m39s
+[18:43:00]   2000/14972  24m35s  ETA 159m26s
+[18:45:25]   2200/14972  27m00s  ETA 156m45s
+[18:47:26]   2400/14972  29m01s  ETA 152m03s
+[18:49:31]   2600/14972  31m06s  ETA 148m03s
+[18:51:44]   2800/14972  33m19s  ETA 144m51s
+[18:53:51]   3000/14972  35m25s  ETA 141m24s
+[18:55:46]   3200/14972  37m21s  ETA 137m26s
+[18:57:52]   3400/14972  39m27s  ETA 134m17s
+[18:59:53]   3600/14972  41m28s  ETA 130m59s
+[19:01:57]   3800/14972  43m32s  ETA 128m00s
+[19:03:45]   4000/14972  45m20s  ETA 124m22s
+[19:05:35]   4200/14972  47m10s  ETA 120m59s
+[19:07:41]   4400/14972  49m15s  ETA 118m21s
+[19:09:52]   4600/14972  51m27s  ETA 116m01s
+[19:12:08]   4800/14972  53m43s  ETA 113m50s
+[19:14:25]   5000/14972  55m59s  ETA 111m40s
+[19:17:01]   5200/14972  58m36s  ETA 110m08s
+[19:19:17]   5400/14972  60m52s  ETA 107m54s
+[19:21:27]   5600/14972  63m01s  ETA 105m28s
+[19:23:40]   5800/14972  65m15s  ETA 103m11s
+[19:26:06]   6000/14972  67m41s  ETA 101m13s
+[19:29:12]   6200/14972  70m47s  ETA 100m09s
+[19:32:11]   6400/14972  73m46s  ETA 98m48s
+[19:35:03]   6600/14972  76m37s  ETA 97m12s
+[19:37:46]   6800/14972  79m21s  ETA 95m22s
+[19:40:25]   7000/14972  81m59s  ETA 93m22s
+[19:42:53]   7200/14972  84m27s  ETA 91m10s
+[19:45:46]   7400/14972  87m21s  ETA 89m23s
+[19:48:13]   7600/14972  89m47s  ETA 87m06s
+[19:51:02]   7800/14972  92m37s  ETA 85m09s
+[19:53:31]   8000/14972  95m05s  ETA 82m52s
+[19:55:48]   8200/14972  97m22s  ETA 80m25s
+[19:58:42]   8400/14972  100m17s  ETA 78m27s
+[20:00:37]   8600/14972  102m11s  ETA 75m43s
+[20:02:39]   8800/14972  104m14s  ETA 73m06s
+[20:04:33]   9000/14972  106m08s  ETA 70m25s
+[20:06:32]   9200/14972  108m06s  ETA 67m49s
+[20:08:25]   9400/14972  109m59s  ETA 65m12s
+[20:10:15]   9600/14972  111m50s  ETA 62m34s
+[20:11:45]   9800/14972  113m20s  ETA 59m48s
+[20:13:20]   10000/14972  114m55s  ETA 57m08s
+[20:15:26]   10200/14972  117m00s  ETA 54m44s
+[20:17:19]   10400/14972  118m54s  ETA 52m16s
+[20:19:40]   10600/14972  121m15s  ETA 50m00s
+[20:21:41]   10800/14972  123m15s  ETA 47m36s
+[20:23:58]   11000/14972  125m32s  ETA 45m20s
+[20:26:30]   11200/14972  128m04s  ETA 43m08s
+[20:29:10]   11400/14972  130m44s  ETA 40m58s
+[20:32:00]   11600/14972  133m35s  ETA 38m49s
+[20:34:30]   11800/14972  136m05s  ETA 36m35s
+[20:36:46]   12000/14972  138m20s  ETA 34m15s
+[20:39:29]   12200/14972  141m03s  ETA 32m03s
+[20:41:59]   12400/14972  143m33s  ETA 29m46s
+[20:44:17]   12600/14972  145m51s  ETA 27m27s
+[20:46:22]   12800/14972  147m56s  ETA 25m06s
+[20:48:30]   13000/14972  150m05s  ETA 22m46s
+[20:50:20]   13200/14972  151m54s  ETA 20m23s
+[20:52:34]   13400/14972  154m08s  ETA 18m05s
+[20:54:51]   13600/14972  156m25s  ETA 15m46s
+[20:56:46]   13800/14972  158m20s  ETA 13m26s
+[20:58:40]   14000/14972  160m15s  ETA 11m07s
+[21:00:41]   14200/14972  162m16s  ETA 8m49s
+[21:03:37]   14400/14972  165m12s  ETA 6m33s
+[21:06:09]   14600/14972  167m43s  ETA 4m16s
+[21:08:06]   14800/14972  169m41s  ETA 1m58s
+[21:09:49]   14972/14972  171m24s  ETA 0m00s
+[18:19:15] RUN_ONLY active: 38 of 114 names
+[18:19:16] RUN_ONLY active: 38 of 114 names
+[18:19:24] RUN_ONLY active: 38 of 114 names
+[18:19:19] RUN_ONLY active: 38 of 114 names
+[18:19:18] RUN_ONLY active: 38 of 114 names
+[18:19:25] RUN_ONLY active: 38 of 114 names
+[18:19:22] RUN_ONLY active: 38 of 114 names
+[18:19:26] RUN_ONLY active: 38 of 114 names
+[18:19:21] RUN_ONLY active: 38 of 114 names
+
+[21:09:49]   checkpoint complete -> universe_expand_CKPT.4a0aacad.jsonl.20260913_1818.done
+
+[21:09:49] ====================================================================================
+[21:09:49] ### 2D SKEW SWEEP DONE: 171m24s for 14972 cells ###
+[21:09:49] ====================================================================================
+
+[21:09:49] === SUMMARY: OFI-defensive configs (winner frozen: et1/obi+/tol0) ===
+[21:09:49]     ofi_window  thresh   net_bps       net_PKR
+[21:09:49]            OBI       -     2.353     2,724,700
+[21:09:49]          QT_2t      2t     3.763     8,543,790
+
+[21:09:49] === DAY-AS-UNIT net_bps: mean +/- SE (each day = one observation) ===
+[21:09:49]     ofi_window  thresh  n_days  mean_bps      se
+[21:09:49]            OBI       -     197     2.528   0.206
+[21:09:49]          QT_2t      2t     197     3.810   0.145
+
+[21:09:49] === RISK METRICS (day-as-unit; Sharpe/Sortino annualised, DD on cum PKR) ===
+[21:09:49]         config  thresh       net_PKR     bps  Sharpe  Sortino    maxDD_PKR  win%
+[21:09:49]            OBI       -     2,724,700    2.53    13.9     13.7     -139,952   81%
+[21:09:49]          QT_2t      2t     8,543,790    3.81    29.8     34.6      -19,552   95%
+
+[21:09:49] === control(OBI) - config (PAIRED by day): positive => current OBI wins ===
+[21:09:49]         config  thresh  n_pair    d_bps      se       t
+[21:09:49]          QT_2t      2t     197   -1.282   0.138   -9.28
+[21:09:49]   (|t| >~ 2 => the gap vs NONE is beyond day-to-day noise)
+
+[21:09:49] === RECONCILIATION ANCHOR: MEASURED decomposition vs engine P&L ===
+[21:09:49]     ofi_window  thresh     measured_net       engine_pnl   unexplained     pct   ok?
+[21:09:49]            OBI       -        2,724,700        2,724,700             0    0.0%    OK
+[21:09:49]          QT_2t      2t        8,543,790        8,543,790             0    0.0%    OK
+
+[21:09:49] ====================================================================================
+[21:09:49] CONFIG: et=1 obi=True tol=0.0   throttle=OBI thresh=-
+[21:09:49] ====================================================================================
+[21:09:49] bucket       cap_bps  mko_bps  jmp_bps  dif_bps  fee_bps  liq_bps   unexpl  net_bps     net_pkr  med_hld mean_hld med_tks_mid  thr%   trades   sh/trd
+[21:09:50] first15        5.700   -1.576    0.072   -1.420   -1.554   -0.268   -0.000    2.302     305,205     44.8    307.6        5.50    84   75,831      406
+[21:09:50] middle         7.848   -2.928    0.033   -2.991   -1.554   -0.197   -0.000    3.169   2,454,130    186.0    718.8        7.00    78  499,882      352
+[21:09:50] preclose45     7.143   -4.720    0.020   -5.055   -1.553   -1.039   -0.000   -0.169     -32,146    161.6    373.4        6.00    74  119,480      361
+[21:09:50] last15         5.221   -2.480    0.023   -1.968   -1.554   -1.227   -0.000   -0.041      -2,490    131.8    216.6        6.00    78   38,296      351
+
+[21:09:50] bucket        raw_obi5  signed_obi5   buy_obi5  sell_obi5  (signed<0 = book against us)
+[21:09:50] first15         0.0033      -0.0178    -0.0150     0.0204
+[21:09:50] middle         -0.0279      -0.0133    -0.0421    -0.0144
+[21:09:50] preclose45     -0.0617      -0.0175    -0.0784    -0.0447
+[21:09:50] last15         -0.0633      -0.0174    -0.0801    -0.0462
+
+[21:09:50]   daily markout (n=197): mean -17,887  median -13,881  t=-12.40 p=1.95e-26  Wilcoxon p=3.99e-27
+
+[21:09:50] ====================================================================================
+[21:09:50] CONFIG: et=1 obi=True tol=0.0   throttle=QT_2t thresh=2t
+[21:09:50] ====================================================================================
+[21:09:50] bucket       cap_bps  mko_bps  jmp_bps  dif_bps  fee_bps  liq_bps   unexpl  net_bps     net_pkr  med_hld mean_hld med_tks_mid  thr%   trades   sh/trd
+[21:09:50] first15        6.309   -1.392    0.048   -1.269   -1.554   -0.142   -0.000    3.221     605,395     40.3    257.0        4.00    91  107,122      480
+[21:09:50] middle         7.919   -2.356    0.026   -2.383   -1.554   -0.087   -0.000    3.922   5,816,128    152.9    500.4        5.50    88  967,716      410
+[21:09:50] preclose45     8.572   -2.890    0.022   -3.018   -1.554   -0.305   -0.000    3.824   1,741,009    118.6    254.5        6.50    88  282,544      380
+[21:09:50] last15         7.136   -1.744    0.013   -1.946   -1.554   -1.193   -0.000    2.645     381,258     88.3    155.5        5.00    88   93,425      395
+
+[21:09:50] bucket        raw_obi5  signed_obi5   buy_obi5  sell_obi5  (signed<0 = book against us)
+[21:09:50] first15         0.0042       0.0102     0.0151    -0.0057
+[21:09:50] middle         -0.0343       0.0333    -0.0010    -0.0627
+[21:09:50] preclose45     -0.0768       0.0403    -0.0392    -0.1096
+[21:09:50] last15         -0.0801       0.0307    -0.0523    -0.1050
+
+[21:09:50]   daily markout (n=197): mean -27,018  median -22,917  t=-13.82 p=9.26e-31  Wilcoxon p=1.27e-29
+
+[21:09:50] wrote /Users/shazzak/HFT Data/Pakistan/Capital Stake - Results/universe_expand_20260913_1818.csv
+[21:09:50] wrote /Users/shazzak/HFT Data/Pakistan/Capital Stake - Results/universe_expand_DAILY_20260913_1818.parquet (1970 rows, verified)
+[21:09:50] wrote /Users/shazzak/HFT Data/Pakistan/Capital Stake - Results/universe_expand_PERNAME_20260913_1818.parquet (59760 rows, verified)
