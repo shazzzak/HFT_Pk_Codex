@@ -57,10 +57,26 @@ import confirm_micro_vs_naive as C
 # L1 mid series, segments loader, roots list, futures fee
 import futures_mm_run as F
 
-# raw store + results locations
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# ---- PATHS: from config_pk, never a literal in this file -------------------
+# The literals that were here pointed at the OLD store location. When the data
+# moved under "~/HFT Data/Pakistan/" every query in this file started failing
+# with IOException. A path literal is a defect: it is valid syntax, so nothing
+# warns you, and it fails deep into a run instead of at the top.
+# config_pk exposes PARSED_ROOT and RESULTS_ROOT as Paths.
+from config_pk import PARSED_ROOT, RESULTS_ROOT
+# push the parsed store onto the driver module, as every other script does
+R.PARSED_ROOT = PARSED_ROOT
 # where result CSVs are written
-RESULTS = Path("/Users/shazzak/Capital Stake - Results")
+RESULTS = RESULTS_ROOT
+# fail here, with the path named, rather than deep inside a DuckDB glob
+if not PARSED_ROOT.is_dir():
+    raise SystemExit(f"PARSED store not found: {PARSED_ROOT}")
+# the results folder must exist BEFORE the run, not after hours of compute
+if not RESULTS.is_dir():
+    raise SystemExit(f"RESULTS folder not found: {RESULTS}")
+# say which stores this run used, so the log is self-describing
+print(f"parsed : {PARSED_ROOT}")
+print(f"results: {RESULTS}")
 
 # ------------------------------ experiment knobs ------------------------------
 # SMOKE: named roots, one span each, per-day ledger printed. Flip False for full.

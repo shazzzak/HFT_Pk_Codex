@@ -4,7 +4,20 @@
 # Read-only. Run:  python futures_trade_intensity.py
 from pathlib import Path
 import duckdb, pandas as pd, numpy as np
-PARSED="/Users/shazzak/Capital Stake - Parsed"
+# ---- PATHS: from config_pk, never a literal in this file -------------------
+# The literals that were here pointed at the OLD store location. When the data
+# moved under "~/HFT Data/Pakistan/" every query in this file started failing
+# with IOException. A path literal is a defect: it is valid syntax, so nothing
+# warns you, and it fails deep into a run instead of at the top.
+# config_pk exposes PARSED_ROOT and RESULTS_ROOT as Paths.
+from config_pk import PARSED_ROOT, RESULTS_ROOT
+# the parsed store as a string, for the f-string globs below
+PARSED = str(PARSED_ROOT)
+# fail here, with the path named, rather than inside the first query
+if not PARSED_ROOT.is_dir():
+    raise SystemExit(f"PARSED store not found: {PARSED}")
+# say which store this run read
+print(f"parsed store: {PARSED}\n")
 con=duckdb.connect(); pd.set_option("display.width",170,"display.max_columns",30)
 TRADES=f"{PARSED}/trades/date=*/*.parquet"
 

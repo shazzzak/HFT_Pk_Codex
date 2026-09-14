@@ -53,10 +53,45 @@ import futures_mm_run as F
 # the carry runner -- reuse its spot book walk + capture/markout lens
 import futures_carry_hedge_run as CH
 
-# raw store + results
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# ---- PATHS: from config_pk, never a literal in this file -------------------
+# The hardcoded paths that used to live here pointed at the OLD store location
+# and every query raised IOException once the data moved under
+# "~/HFT Data/Pakistan/". A path literal in a script is a defect: it is valid
+# syntax, so nothing warns you, and it fails hours into a run instead of at the
+# top. config_pk is the single source of truth.
+try:
+    # the project's central path module
+    import config_pk
+    # accept either spelling the module may expose for the parsed store
+    _P = getattr(config_pk, "PARSED_ROOT", None) or getattr(config_pk, "PARSED", None)
+    # and either spelling for the results root
+    _Rr = getattr(config_pk, "RESULTS_ROOT", None) or getattr(config_pk, "RESULTS", None)
+except Exception:
+    # config_pk not importable from this working directory
+    _P = _Rr = None
+# the parsed store, as a Path (run_legacy_mm treats it as one)
+PARSED_ROOT = Path(_P) if _P else Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Parsed")
 # where result CSVs are written
-RESULTS = Path("/Users/shazzak/Capital Stake - Results")
+RESULTS = Path(_Rr) if _Rr else Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results")
+# push the parsed store onto the driver module, as every other script does
+R.PARSED_ROOT = PARSED_ROOT
+# fail here, with the path named, rather than inside a DuckDB glob later
+if not PARSED_ROOT.is_dir():
+    raise SystemExit(f"PARSED store not found: {PARSED_ROOT}\n"
+                     f"  set PARSED_ROOT in config_pk.py to the real location.")
+# the results folder must exist before the run, not after hours of compute
+if not RESULTS.is_dir():
+    raise SystemExit(f"RESULTS folder not found: {RESULTS}")
+# say which stores this run used, so the log is self-describing
+print(f"parsed : {PARSED_ROOT}")
+print(f"results: {RESULTS}")
+
+# ---- capture the SPOT fee at IMPORT, before anything patches it ------------
+# main() runs once per arm and patches MB.FEE_TOTAL_PCT to the futures fee on
+# every call. Reading the spot fee inside main() would therefore pick up the
+# already-patched FUTURES fee from the second arm onward and charge the spot
+# hedge legs ~8x too little -- silently, with no error anywhere.
+SPOT_FEE_PER_SIDE = MB.FEE_TOTAL_PCT
 
 # ------------------------------ experiment knobs ------------------------------
 # SMOKE: named roots, one span each, per-day ledger. Flip False for full run.
@@ -91,9 +126,48 @@ MIN_SPAN_DAYS = 5
 UNHEDGE_DELAY_MIN = 5.0
 # engine defaults; EOD trigger ON so the position POV-unwinds into EVERY close
 GAMMA = 0.15
-# locked production strategy params; EOD trigger ON so it flattens daily
-MID_BASE = dict(min_edge_pct=0.0005, improve_ticks=0.0, use_microprice=False,
-                enable_eod_trigger=True, enable_lock_trigger=True)
+# ---- THE ARMS -------------------------------------------------------------
+# EVERY futures run to date used the PLAIN base below. The three mechanisms that
+# carry the spot edge are all OFF BY DEFAULT in micro_mm (queue_skew_ticks=0.0
+# line 235, obi_defensive=False line 292, obi_throttle=False line 326) and none
+# of the three futures runners passed them. So the August result compared a
+# plain futures quoter against a fully-tuned spot one -- never like-for-like.
+#
+# PLAIN: exactly what was run before. Reproduces the existing baseline.
+MID_BASE_PLAIN = dict(min_edge_pct=0.0005, improve_ticks=0.0, use_microprice=False,
+                      enable_eod_trigger=True, enable_lock_trigger=True)
+# 1. DEFENSIVE WIDEN: step the exposed side 1 tick back when the book leans
+# against us. Frozen ON in every spot sweep (obi_defensive=True paid at exit_ticks=1).
+SPOT_DEFENSIVE = dict(obi_defensive=True, obi_defensive_thresh=0.15,
+                      obi_defensive_ticks=1.0)
+# 2. SIZE THROTTLE: halve the clip for 300 ms past the same threshold.
+# Catalogued as the confirmed spot edge (+0.66 bps/day vs no throttle).
+SPOT_THROTTLE = dict(obi_throttle=True, obi_throttle_thresh=0.15,
+                     throttle_frac=0.5, throttle_hold_ms=300.0)
+# 3. THE LEAN: shift BOTH quotes 2 ticks toward the heavy side once the book is
+# lopsided past 0.15. Worth +1.18 bps on the spot book (2.13 -> 3.32).
+# SAFE HERE: probe_futures_mm.py measured the BOP futures book at a 5.0-tick
+# median spread, 87.9% of the session >= 3 ticks -- ample room for a 2-tick
+# shift to stay inside the opposite touch. On a 1-2 tick book this INVERTS
+# capture (A.2 on KEL/PIBTL/TPL: +1.64 -> -1.79 bps), so re-check any root
+# whose width probe comes back thin before trusting its number.
+SPOT_LEAN = dict(queue_skew_ticks=2.0, queue_skew_thresh=0.15)
+# The arms run in this order, each a strict superset of the one before, so the
+# per-arm delta ATTRIBUTES the change to a single mechanism.
+ARMS = [
+    # the existing baseline
+    ("plain", {}),
+    # + defensive widen only
+    ("defensive", dict(SPOT_DEFENSIVE)),
+    # + size throttle on top
+    ("def_throttle", {**SPOT_DEFENSIVE, **SPOT_THROTTLE}),
+    # + the lean = the full spot production recipe
+    ("full_spot", {**SPOT_DEFENSIVE, **SPOT_THROTTLE, **SPOT_LEAN}),
+]
+# the arm currently running; the entry point rebinds both of these per arm
+ARM_NAME = "plain"
+# the params main() actually hands the strategy
+MID_BASE = dict(MID_BASE_PLAIN)
 # futures fee (reuse) + spot fee captured at runtime before the patch
 FUT_FEE_PER_SIDE = F.FUT_FEE_PER_SIDE
 # ------------------------------------------------------------------------------
@@ -102,8 +176,11 @@ FUT_FEE_PER_SIDE = F.FUT_FEE_PER_SIDE
 def main():
     # run stamp
     stamp = datetime.now().strftime("%Y%m%d_%H%M")
-    # capture SPOT fee before patching futures fee (hedge legs pay spot fee)
-    SPOT_FEE_PER_SIDE = MB.FEE_TOTAL_PCT
+    # SPOT fee comes from the MODULE-LEVEL constant captured at import time.
+    # It must NOT be re-read from MB.FEE_TOTAL_PCT here: main() now runs once
+    # per arm, and by the second call MB.FEE_TOTAL_PCT is already the patched
+    # FUTURES fee -- so re-reading it would charge the spot hedge legs the
+    # futures fee on every arm after the first, silently and with no error.
     # patch futures fee into both modules
     MB.FEE_TOTAL_PCT = FUT_FEE_PER_SIDE
     # and into the strategy module (imported the fee by value at import time)
@@ -601,6 +678,8 @@ def main():
                 day_pnl = _dtot() - dec_before
                 # append the per-day ledger row
                 day_rows.append({
+                    # which arm produced this row
+                    "arm": ARM_NAME,
                     "date": date, "root": root, "contract": sym,
                     "fills": len(fills), "day_pnl": round(day_pnl, 2),
                     "unfilled_sh": abs(unfilled),
@@ -653,6 +732,8 @@ def main():
             flat_rate = (n_clean_flat / n_days) if n_days else np.nan
             # append the per-span verdict row
             span_rows.append({
+                # which arm produced this row
+                "arm": ARM_NAME,
                 "root": root, "contract": sym, "days": len(span_dates),
                 "pnl_total": round(total_cash, 2),
                 "quoting": round(dec["quoting"], 2),
@@ -697,9 +778,9 @@ def main():
     # daily rows to a frame
     dd = pd.DataFrame(day_rows)
     # write the span CSV
-    sd.to_csv(RESULTS / f"fut_sameday_spans_{stamp}.csv", index=False)
+    sd.to_csv(RESULTS / f"fut_sameday_spans_{ARM_NAME}_{stamp}.csv", index=False)
     # write the daily CSV
-    dd.to_csv(RESULTS / f"fut_sameday_daily_{stamp}.csv", index=False)
+    dd.to_csv(RESULTS / f"fut_sameday_daily_{ARM_NAME}_{stamp}.csv", index=False)
     # header
     print("\n=== FUTURES SAME-DAY FLATTEN (+ residual spot hedge) ===")
     # column-definitions header
@@ -797,11 +878,75 @@ def main():
     # (guide continued)
     print("fails, PSX futures are too illiquid/toxic for MM -- thread closed.")
     # wrote-span-file line
-    print(f"\nwrote {RESULTS / f'fut_sameday_spans_{stamp}.csv'}")
+    print(f"\nwrote {RESULTS / f'fut_sameday_spans_{ARM_NAME}_{stamp}.csv'}")
     # wrote-daily-file line
-    print(f"wrote {RESULTS / f'fut_sameday_daily_{stamp}.csv'}")
+    print(f"wrote {RESULTS / f'fut_sameday_daily_{ARM_NAME}_{stamp}.csv'}")
+    # hand the span frame back so the entry point can compare arms
+    return sd
 
 
 # entry point
 if __name__ == "__main__":
-    main()
+    # collected per-arm span frames, for the cross-arm comparison at the end
+    _results = {}
+    # run every arm in turn. Each call re-does the pre-passes (calendar, roll
+    # map, calibration) -- a couple of minutes each -- but guarantees every arm
+    # sees IDENTICAL calibration, dates and spans, so the only difference
+    # between two arms is the mechanism being tested.
+    for _name, _extra in ARMS:
+        # the arm's strategy params = the plain base plus this arm's additions
+        MID_BASE = dict(MID_BASE_PLAIN, **_extra)
+        # tag the arm so its rows and filenames identify themselves
+        ARM_NAME = _name
+        # announce which arm is starting
+        print("\n" + "#" * 78)
+        print(f"# ARM: {_name}   extra params: {_extra or '(none -- plain)'}")
+        print("#" * 78, flush=True)
+        # run it, keeping the span frame for the comparison
+        _results[_name] = main()
+
+    # ---- CROSS-ARM COMPARISON: the whole point of the run ----
+    print("\n" + "=" * 78)
+    print("CROSS-ARM COMPARISON (same dates, same calibration, same spans)")
+    print("=" * 78)
+    # header
+    print(f"{'arm':>14s} {'pnl_total':>12s} {'quoting':>12s} {'capture':>12s} "
+          f"{'markout':>12s} {'haircut':>10s} {'flat_rate':>10s}")
+    # the plain arm is the baseline every other arm is measured against
+    _base = None
+    # one row per arm, in the order they ran
+    for _name, _ in ARMS:
+        _sd = _results.get(_name)
+        # skip an arm that produced no spans
+        if _sd is None or not len(_sd):
+            print(f"{_name:>14s}  (no spans)")
+            continue
+        # this arm's totals
+        _p = _sd.pnl_total.sum()
+        # remember the plain arm as the baseline
+        if _base is None:
+            _base = _p
+        print(f"{_name:>14s} {_p:>12,.0f} {_sd.quoting.sum():>12,.0f} "
+              f"{_sd.q_capture.sum():>12,.0f} {_sd.q_markout.sum():>12,.0f} "
+              f"{_sd.flatten_haircut.sum():>10,.0f} "
+              f"{_sd.sameday_flat_rate.mean():>10.2f}")
+    # the deltas that answer the question
+    print("\nDELTA vs the plain arm (what each mechanism is worth on futures):")
+    # walk the arms after the first
+    for _name, _ in ARMS[1:]:
+        _sd = _results.get(_name)
+        # only if this arm produced spans and we have a baseline
+        if _sd is None or not len(_sd) or _base is None:
+            continue
+        # the money difference
+        _d = _sd.pnl_total.sum() - _base
+        print(f"  {_name:>14s}  {_d:>+12,.0f} PKR"
+              + (f"   ({100*_d/abs(_base):+.1f}% of |plain|)" if _base else ""))
+    # the reading rule, stated before the numbers are seen
+    print("\nREAD: the spot book gains +1.18 bps from the lean and ~+0.66 bps/day")
+    print("from the throttle. If 'full_spot' does not beat 'plain' here, the spot")
+    print("recipe does NOT transfer to futures and the thread closes. If it does,")
+    print("the per-arm rows say WHICH of the three mechanisms did the work.")
+    print("\nCAUTION: capture going NEGATIVE under the lean is the A.2 signature")
+    print("(cheap-tick spot names: capture +1.64 -> -1.79 bps). Check q_capture")
+    print("per arm before believing any P&L improvement.")
