@@ -54,34 +54,60 @@ if not PARSED_ROOT:
 if not RESULTS_ROOT:
     RESULTS_ROOT = "/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results"
 
-# >>> VERIFY THIS MAP BEFORE RUNNING <<<
-# My best-guess PSX sector grouping of your 38 names. Names I am NOT confident
-# about are in UNCLASSIFIED -- assign them (or leave them out). Only sectors with
-# >= 2 names are screened (leader + >=1 follower). The LEADER is auto-selected by
-# traded value in Step 0, so you only need the GROUPING right, not the leader.
+# PSX OFFICIAL SECTORS, parsed from the exchange's daily quotation sheet
+# (Section 4, MARKET IN DETAIL) for 2026-09-14. All 113 production names
+# matched exactly -- no guesses, no UNCLASSIFIED bucket. Only sectors with
+# >= 2 names appear (leader + at least one follower); singletons are listed
+# in SINGLETON_SECTORS below so nothing looks silently dropped.
 SECTORS = {
-    # commercial banks
-    "banks": ["HBL", "UBL", "MEBL", "NBP", "BAFL", "AKBL", "BOP"],
-    # cement
-    "cement": ["LUCK", "DGKC", "MLCF", "PIOC", "THCCL"],
-    # oil & gas exploration & production (E&P) -- one driver (crude/reserves)
-    "oil_gas_ep": ["OGDC", "PPL", "MARI"],
-    # refineries -- different driver from E&P; keep separate
-    "refinery": ["ATRL", "NRL"],
-    # oil marketing companies (OMC)
-    "omc": ["PSO", "HASCOL"],
-    # power generation / IPPs
-    "power": ["HUBC", "KEL", "NPL", "NCPL"],
-    # technology
-    "tech": ["SYS", "TRG"],
+    # Commercial Banks -- 12 names, 12 with a deliverable future
+    "banks": ["AKBL", "BAFL", "BAHL", "BML", "BOP", "FABL", "HBL", "HMB", "MCB", "MEBL", "NBP", "UBL"],
+    # Cement -- 11 names, 10 with a deliverable future
+    "cement": ["CHCC", "DCL", "DGKC", "FCCL", "FECTC", "KOHC", "LUCK", "MLCF", "PIOC", "POWER", "THCCL"],
+    # Technology & Communication -- 11 names, 8 with a deliverable future
+    "tech": ["AIRLINK", "AVN", "HUMNL", "NETSOL", "PTC", "SYS", "TELE", "TPL", "TRG", "WTL", "ZAL"],
+    # Food & Personal Care Products -- 10 names, 7 with a deliverable future
+    "food": ["BBFL", "BNL", "FCEPL", "FFL", "NATF", "PREMA", "QUICE", "TOMCL", "TREET", "UNITY"],
+    # Chemical -- 6 names, 4 with a deliverable future
+    "chemical": ["EPCL", "GCIL", "GCWL", "GGL", "LCI", "LOTCHEM"],
+    # Engineering -- 6 names, 4 with a deliverable future
+    "engineering": ["AGHA", "ASL", "BECO", "CSAP", "ISL", "MUGHAL"],
+    # Pharmaceuticals -- 6 names, 4 with a deliverable future
+    "pharma": ["AGP", "BFBIO", "CPHL", "GLAXO", "HALEON", "SEARL"],
+    # Power Generation & Distribution -- 6 names, 5 with a deliverable future
+    "power": ["HUBC", "KAPCO", "KEL", "NCPL", "NPL", "SGPL"],
+    # Automobile Assembler -- 5 names, 3 with a deliverable future
+    "auto_assembler": ["DFML", "GAL", "GHNI", "HCAR", "SAZEW"],
+    # Oil & Gas Marketing Companies -- 5 names, 3 with a deliverable future
+    "omc": ["APL", "HASCOL", "PSO", "SNGP", "SSGC"],
+    # Fertilizer -- 4 names, 3 with a deliverable future
+    "fertilizer": ["AHCL", "EFERT", "FATIMA", "FFC"],
+    # Inv. Banks / Inv. Cos. / Securities Cos. -- 4 names, 2 with a deliverable future
+    "inv_banks": ["ENGROH", "FNEL", "PIAHCLA", "PSX"],
+    # Oil & Gas Exploration Companies -- 4 names, 4 with a deliverable future
+    "oil_gas_ep": ["MARI", "OGDC", "POL", "PPL"],
+    # Refinery -- 4 names, 3 with a deliverable future
+    "refinery": ["ATRL", "CNERGY", "NRL", "PRL"],
+    # Cable & Electrical Goods -- 3 names, 3 with a deliverable future
+    "cable_electrical": ["FCL", "PAEL", "WAVES"],
+    # Property -- 3 names, 3 with a deliverable future
+    "property": ["JVDC", "PACE", "TPLP"],
+    # Textile Composite -- 3 names, 2 with a deliverable future
+    "textile_composite": ["ILP", "KOIL", "NML"],
+    # Automobile Parts & Accessories -- 2 names, 1 with a deliverable future
+    "auto_parts": ["LOADS", "TBL"],
+    # Transport -- 2 names, 2 with a deliverable future
+    "transport": ["PIBTL", "SLGL"],
 }
-# names I could not confidently place -- ASSIGN these into SECTORS above (or drop):
-#   FFC (fertilizer), ENGROH (Engro Holdings/conglomerate), NML (Nishat Mills/textile),
-#   SEARL (pharma), PTC (telecom/PTCL), PAEL (Pak Elektron), SAZEW (autos?),
-#   TOMCL (?), TPL (?), PACE (real estate?), PIBTL (port/logistics),
-#   PIAHCLA (airline holding), FNEL (?)
-UNCLASSIFIED = ["FFC", "ENGROH", "NML", "SEARL", "PTC", "PAEL", "SAZEW",
-                "TOMCL", "TPL", "PACE", "PIBTL", "PIAHCLA", "FNEL"]
+# Sectors holding only ONE of our names -- no follower, so not screenable.
+SINGLETON_SECTORS = {
+    "apparel": "IMAGE",   # Apparel
+    "glass_ceramics": "TGL",   # Glass & Ceramics
+    "insurance": "AICL",   # Insurance
+    "leather": "SGF",   # Leather & Tanneries
+    "paper": "CEPB",   # Paper, Board & Packaging
+    "textile_spinning": "KOSM",   # Textile Spinning
+}
 
 # lag grid in MILLISECONDS to scan for the HY lead-lag peak. Positive = leader
 # leads follower. Range/step chosen for a human venue (sub-second to ~30s).
@@ -340,8 +366,20 @@ def selftest():
     ax.set_xlabel("candidate lag (ms; +=leader leads)"); ax.set_ylabel("HY correlation")
     ax.set_title("HY lead-lag curve: peak at the true lag, flat for independent assets")
     ax.legend(fontsize=8); fig.tight_layout()
-    fig.savefig("/home/claude/leadlag_selftest.png", dpi=130)
-    print("saved leadlag_selftest.png")
+    # write beside every other result, not to a hardcoded absolute path (the
+    # original pointed at /home/claude, which exists only in the sandbox the
+    # file was written in -- the self-test PASSED and then crashed on save)
+    import os
+    # the leadlag output folder, created if this is the first run
+    _out_dir = os.path.join(RESULTS_ROOT, "leadlag")
+    # make sure it exists
+    os.makedirs(_out_dir, exist_ok=True)
+    # the self-test figure's full path
+    _png = os.path.join(_out_dir, "leadlag_selftest.png")
+    # save it
+    fig.savefig(_png, dpi=130)
+    # say where it went
+    print(f"saved {_png}")
 
 # ----------------------------------------------------------------------------
 # (real-data run + smoke omitted from the offline demo path; wired for your Mac)

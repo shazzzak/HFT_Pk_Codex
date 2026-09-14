@@ -5,9 +5,34 @@
 #   3. the ob_updates stream: same event vocabulary as spot? (build_events reuse)
 #   4. spread distribution in bps (is there enough spread to make a market?)
 #   5. which contract is the "active month" on any given date (front-month roll)
+#
+# 2026-09-15: the hardcoded PARSED path was stale -- the store moved under
+# "~/HFT Data/Pakistan/" and every query raised IOException "No files found".
+# Now resolved from config_pk, with the current literal only as a fallback.
 from pathlib import Path
 import duckdb, pandas as pd, numpy as np
-PARSED = "/Users/shazzak/Capital Stake - Parsed"
+
+# --- PARSED STORE: one source of truth, never a literal in this file ---------
+try:
+    # the project's central path module (same one mm_harness/config use)
+    import config_pk
+    # accept either spelling the module may expose
+    _P = getattr(config_pk, "PARSED_ROOT", None) or getattr(config_pk, "PARSED", None)
+    # as a string for the f-string globs below
+    PARSED = str(_P) if _P else ""
+except Exception:
+    # config_pk not importable from this working directory
+    PARSED = ""
+# fallback to the CURRENT literal only if config_pk did not supply one
+if not PARSED:
+    PARSED = "/Users/shazzak/HFT Data/Pakistan/Capital Stake - Parsed"
+# fail loudly and immediately rather than inside a DuckDB glob 40 lines later
+if not Path(PARSED).is_dir():
+    raise SystemExit(f"PARSED store not found: {PARSED}\n"
+                     f"  set PARSED_ROOT in config_pk.py to the real location.")
+# say which store this run read, so the output is self-describing
+print(f"parsed store: {PARSED}\n")
+
 con = duckdb.connect(); pd.set_option("display.width",160,"display.max_columns",30)
 TRADES=f"{PARSED}/trades/date=*/*.parquet"; OBUPD=f"{PARSED}/ob_updates/date=*/*.parquet"
 
@@ -56,6 +81,47 @@ SELECT symbol, COUNT(*) AS snaps,
 FROM snap WHERE bb>0 AND ba>0 AND ba>=bb GROUP BY symbol ORDER BY snaps DESC
 """
 print(con.execute(q).df().to_string(index=False))
+
+# --- 4b. THE DECISIVE NUMBER FOR THE LEAN -----------------------------------
+# The lean shifts BOTH quotes 2 ticks. On a book only 1-2 ticks wide that walks
+# the quote through the opposite side and INVERTS capture (A.2 on KEL/PIBTL/TPL:
+# capture +1.64 -> -1.79 bps). bps is not the unit that decides this -- TICKS is.
+# This reports the spread in WHOLE TICKS, and the share of time the book is wide
+# enough for a 2-tick shift to still leave the quote inside the opposite touch.
+print("\n4b. SPREAD in TICKS: is there room for a 2-TICK LEAN? (the A.2 test)")
+q=f"""
+WITH d AS (SELECT MAX(date) dd FROM read_parquet('{TRADES}')
+           WHERE market='STOCK_DEL_FUT' AND symbol LIKE 'BOP-%'),
+tick AS (
+  -- the minimum observed price increment = the tick, measured not assumed
+  SELECT MIN(ABS(a.price-b.price)) AS t FROM
+    (SELECT DISTINCT price FROM read_parquet('{TRADES}')
+     WHERE market='STOCK_DEL_FUT' AND symbol LIKE 'BOP-%') a,
+    (SELECT DISTINCT price FROM read_parquet('{TRADES}')
+     WHERE market='STOCK_DEL_FUT' AND symbol LIKE 'BOP-%') b
+  WHERE a.price>b.price
+),
+snap AS (
+  SELECT s.symbol, s.orig_time,
+         MAX(CASE WHEN entry_type='BID' AND level=1 THEN px END) AS bb,
+         MIN(CASE WHEN entry_type='OFFER' AND level=1 THEN px END) AS ba
+  FROM read_parquet('{PARSED}/ob_snapshot/date=*/*.parquet') s, d
+  WHERE s.market='STOCK_DEL_FUT' AND s.symbol LIKE 'BOP-%' AND s.date=d.dd
+        AND s.phase='CONTINUOUS_AUCTION'
+  GROUP BY s.symbol, s.orig_time
+)
+SELECT snap.symbol, COUNT(*) AS snaps,
+       ROUND(MEDIAN((ba-bb)/tick.t),2)  AS med_spread_ticks,
+       ROUND(AVG((ba-bb)/tick.t),2)     AS mean_spread_ticks,
+       ROUND(100.0*AVG(CASE WHEN (ba-bb)/tick.t >= 3 THEN 1 ELSE 0 END),1) AS pct_ge_3_ticks,
+       ROUND(100.0*AVG(CASE WHEN (ba-bb)/tick.t >= 5 THEN 1 ELSE 0 END),1) AS pct_ge_5_ticks
+FROM snap, tick WHERE bb>0 AND ba>0 AND ba>=bb
+GROUP BY snap.symbol ORDER BY snaps DESC
+"""
+print(con.execute(q).df().to_string(index=False))
+print("  READ: a 2-tick lean needs the book at least ~3 ticks wide to stay inside")
+print("  the opposite touch. If med_spread_ticks is 1-2, the lean will invert")
+print("  capture exactly as it did on the cheap-tick spot names -- do not run the sweep.")
 
 print("\n5. ACTIVE-MONTH ROLL: which BOP contract is most liquid each month?")
 q=f"""
