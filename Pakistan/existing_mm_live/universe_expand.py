@@ -114,29 +114,35 @@ NAMES = ['AGHA', 'AGP', 'AHCL', 'AICL', 'AIRLINK', 'AKBL', 'APL', 'ASL',
 # so one cohort can be rerun under the current calibration without recomputing
 # the rest. Applied here, before anything reads NAMES, so the preflight, the
 # work list and every printed count reflect the reduced set.
-# STRATIFIED 30-NAME SUBSET for the graded-skew sweep. NOT a random sample and
-# NOT the top 30 by P&L -- either would bias the answer. The strata span the
-# RESPONSE SURFACE of the QT_2t-minus-OBI edge measured on the 113-name run, so
-# the sweep is asked the question on names where more skew should help, on names
-# where it already hurts, and on names where it does nothing:
-#   12 strong QT_2t winners  (t_diff +6.3 to +13.8) -- does MORE lean pay more?
-#    8 OBI winners           (t_diff -2.1 to -7.1)  -- does a stricter gate
-#                                                      rescue them, or is the
-#                                                      whole mechanism wrong
-#                                                      for these books?
-#   10 indifferent           (|t_diff| < 1.0)       -- is the null a real null,
-#                                                      or just an under-powered
-#                                                      threshold?
-# Coverage: 29.9% of the book's QT_2t PKR and 32.6% of the total QT_2t-OBI edge.
-# KEL/PIBTL/TPL are deliberately ABSENT: A.2 settled them (t = +4.61 for OBI).
+# GATE-0.20 CONFIRMATION COHORT: the 113 names of the production book MINUS the
+# three cheap-tick blacklisted names (KEL, PIBTL, TPL). They are dropped rather
+# than excluded because this run carries a SINGLE arm: HONOUR_CHEAP_EXCLUDED
+# would force them to plain OBI and they would then be written out under the
+# QT_2t@20 label -- an OBI result wearing a skew name. Their config is already
+# settled (A.2: OBI wins, t = +4.61), so there is nothing to learn from them here.
+# Derived as the union of the two production PERNAME parquets under the corrected
+# calibration: universe_expand_PERNAME_20260913_1818 (38) and _1253 (75),
+# overlap 0, union exactly 113.
 RUN_ONLY = [
-    # --- strong QT_2t winners: the magnitude question ---
-    'NRL', 'NBP', 'ENGROH', 'NPL', 'MLCF', 'NCPL',
-    'DGKC', 'NML', 'PPL', 'SEARL', 'AIRLINK', 'LUCK',
-    # --- OBI winners: the threshold question ---
-    'FNEL', 'TELE', 'TBL', 'TPLP', 'HASCOL', 'SLGL', 'LOADS', 'PACE',
-    # --- indifferent: the power question ---
-    'TREET', 'UNITY', 'FFL', 'AICL', 'BECO', 'DFML', 'CEPB', 'FCL', 'BNL', 'FCCL',
+    'AGHA', 'AGP', 'AHCL', 'AICL', 'AIRLINK', 'AKBL',
+    'APL', 'ASL', 'ATRL', 'AVN', 'BAFL', 'BAHL',
+    'BBFL', 'BECO', 'BFBIO', 'BML', 'BNL', 'BOP',
+    'CEPB', 'CHCC', 'CNERGY', 'CPHL', 'CSAP', 'DCL',
+    'DFML', 'DGKC', 'EFERT', 'ENGROH', 'EPCL', 'FABL',
+    'FATIMA', 'FCCL', 'FCEPL', 'FCL', 'FECTC', 'FFC',
+    'FFL', 'FNEL', 'GAL', 'GCIL', 'GCWL', 'GGL',
+    'GHNI', 'GLAXO', 'HALEON', 'HASCOL', 'HBL', 'HCAR',
+    'HMB', 'HUBC', 'HUMNL', 'ILP', 'IMAGE', 'ISL',
+    'JVDC', 'KAPCO', 'KOHC', 'KOIL', 'KOSM', 'LCI',
+    'LOADS', 'LOTCHEM', 'LUCK', 'MARI', 'MCB', 'MEBL',
+    'MLCF', 'MUGHAL', 'NATF', 'NBP', 'NCPL', 'NETSOL',
+    'NML', 'NPL', 'NRL', 'OGDC', 'PACE', 'PAEL',
+    'PIAHCLA', 'PIOC', 'POL', 'POWER', 'PPL', 'PREMA',
+    'PRL', 'PSO', 'PSX', 'PTC', 'QUICE', 'SAZEW',
+    'SEARL', 'SGF', 'SGPL', 'SLGL', 'SNGP', 'SSGC',
+    'SYS', 'TBL', 'TELE', 'TGL', 'THCCL', 'TOMCL',
+    'TPLP', 'TREET', 'TRG', 'UBL', 'UNITY', 'WAVES',
+    'WTL', 'ZAL',
 ]
 # apply the filter immediately
 if RUN_ONLY is not None:
@@ -215,65 +221,27 @@ HONOUR_CHEAP_EXCLUDED = True
 # parquets, and the checkpoint journal. Change it for a side experiment so the
 # results land in their own file series instead of the main one, and so the
 # journal cannot collide with the production run's.
-OUT_STEM = "gate_sweep"
-# ---- GRADED-SKEW SWEEP, GATE-PRIMARY (2026-09-14) ----
-# Eight arms. The PRIMARY axis is the GATE (queue_skew_thresh), not the
-# magnitude. Rationale:
-#   * The gate has never been swept. It has been 0.15 since the mechanism was
-#     built; every sweep since has moved ticks with the gate held fixed.
-#   * The magnitude axis is already well characterised: the 113-name run made
-#     QT_1t the efficiency winner and QT_2t the money winner, so the tick count
-#     is probably peaked at 2 and 3/4 ticks were testing the known axis.
-#   * obi_throttle_thresh is ALSO 0.15, so today the defensive throttle and the
-#     queue skew fire on the SAME ticks -- a confound that has never been
-#     separated. A 0.10 gate makes the skew fire on a band where the throttle
-#     is not engaged, decoupling the two mechanisms for the first time.
+OUT_STEM = "gate20_confirm"
+# ---- GATE-0.20 CONFIRMATION (2026-09-14) ----
+# ONE arm. The 30-name gate sweep put QT_2t@20 ahead of the incumbent QT_2t@15 on
+# bps (+0.148, t=+3.33), Sharpe (19.1 vs 17.7) and maxDD (-67k vs -113k), with PKR
+# flat. This run extends ONLY the new cell to the rest of the book.
 #
-#   thr  label      ticks  gate   what it isolates
-#   ---  ---------  -----  -----  --------------------------------------------
-#    0   OBI          -      -    control: no skew at all
-#    1   QT_2t@15     2    0.15   incumbent -- also the run's ANCHOR
-#    2   QT_2t@10     2    0.10   gate DOWN: fires more often, same lean
-#    3   QT_2t@20     2    0.20   gate UP
-#    4   QT_2t@25     2    0.25   gate UP further
-#    5   QT_3t@15     3    0.15   magnitude probe, gate held
-#    6   STAIR_LO   2/3/4  0.10   graded ladder from the low base
-#    7   STAIR_HI   2/3/4  0.15   graded ladder from the incumbent base
+# WHY NOT ALSO RUN OBI AND QT_2t@15: both already exist for all 113 under this
+# exact calibration, in the two production PERNAME parquets. Re-running them would
+# cost ~7h to reproduce numbers already on disk. Every contrast (@20 - @15,
+# @20 - OBI, paired by day) is computed against those files afterwards.
 #
-# Arms 1-4 form a clean FOUR-POINT GATE CURVE at fixed magnitude, so the gate
-# response is identifiable rather than inferred. The previous design's QT_3t@20
-# arm is deliberately GONE: it moved ticks and gate together, so any difference
-# it showed could not be attributed to either. Arms 6-7 earn their place only by
-# beating every flat arm on their own base, not merely by beating the incumbent.
+# THE ANCHOR: 30 of these 110 names were in the gate sweep. Their QT_2t@20 totals
+# must reproduce gate_sweep_PERNAME_20260914_0202 TO THE CENT. That is a genuine
+# calibration-and-engine anchor bought for zero extra compute -- if it fails, the
+# other 80 names are not trustworthy either, and nothing downstream should be used.
 THROTTLE_MODES = [
-    # thr=0 -- control. No skew. Every paired diff is measured against this.
-    dict(_OBI),
-    # thr=1 -- incumbent QT_2t. Fixed-tick path (NOT a one-rung stair), so it
-    # stays byte-identical to the production arm and reconciles against it.
-    dict(_OBI, queue_skew_ticks=2.0, queue_skew_thresh=0.15),
-    # thr=2 -- GATE DOWN. Same 2-tick lean, fires on |imb-0.5| > 0.10. Expect
-    # materially more fills; the A.2 lesson is that more fills are only a win if
-    # CAPTURE holds up, so this arm is judged on the decomposition, not on PKR.
-    dict(_OBI, queue_skew_ticks=2.0, queue_skew_thresh=0.10),
-    # thr=3 -- GATE UP. Same lean, fires only past 0.20.
+    # thr=0 -- QT_2t@20. There is no in-run control; see the anchor note above.
     dict(_OBI, queue_skew_ticks=2.0, queue_skew_thresh=0.20),
-    # thr=4 -- GATE UP further: rarer, more selective.
-    dict(_OBI, queue_skew_ticks=2.0, queue_skew_thresh=0.25),
-    # thr=5 -- MAGNITUDE probe. Gate held at the incumbent 0.15, 3 ticks. One
-    # point is enough to keep the axis alive alongside the known 1t/2t results.
-    dict(_OBI, queue_skew_ticks=3.0, queue_skew_thresh=0.15),
-    # thr=6 -- STAIR_LO. Ladder from the low base. rungs[0][0] MUST equal
-    # queue_skew_thresh; micro_mm __init__ raises if not, so a typo here fails
-    # in seconds rather than after hours of compute.
-    dict(_OBI, queue_skew_stairs=[(0.10, 2.0), (0.15, 3.0), (0.20, 4.0)],
-         queue_skew_thresh=0.10),
-    # thr=7 -- STAIR_HI. The original ladder, from the incumbent base.
-    dict(_OBI, queue_skew_stairs=[(0.15, 2.0), (0.20, 3.0), (0.25, 4.0)],
-         queue_skew_thresh=0.15),
 ]
-# short labels; these land in the CSV/parquet 'throttle' column
-THROTTLE_LABELS = ["OBI", "QT_2t@15", "QT_2t@10", "QT_2t@20", "QT_2t@25",
-                   "QT_3t@15", "STAIR_LO", "STAIR_HI"]
+# short label; lands in the CSV/parquet 'throttle' column
+THROTTLE_LABELS = ["QT_2t@20"]
 def _cfg_lab(thr):
     return THROTTLE_LABELS[thr]
 def _cfg_thr(thr):
