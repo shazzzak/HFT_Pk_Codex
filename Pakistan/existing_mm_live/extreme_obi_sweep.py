@@ -109,12 +109,31 @@ BOOST_MULT = 1.5
 # imbalance level measured -- 2.08 bps at the extreme, 3.35 bps in the middle --
 # so there is no reason the boost should wait until 0.40 to fire. It may want to
 # start far earlier, and a single guessed threshold cannot find that out.
-# 0.05 = obi_1 0.10, 0.40 = obi_1 0.80
-BOOST_THRESHES = [0.05, 0.10, 0.15, 0.25, 0.40]
-# the throttle is ALREADY live at 0.15; sweep where a DEEPER cut should start
+# THE BOOST FAMILY IS CUT TO ONE ARM (2026-09-15, after run d86e4f22).
+# The five-threshold sweep answered the boost question at the MECHANISM level and
+# the answer did not depend on the threshold: every boost arm put 15-35% more
+# shares at risk and every one earned essentially the SAME margin per PKR traded
+# (day-as-unit change in bps: +0.09 to +0.29, none with |t| above 2). More volume
+# at an unchanged rate is a capital-and-risk decision, not an edge, so sweeping
+# the threshold further only spends statistical power on a question already
+# settled. One arm is kept as a live control; 0.10 is kept because it was the
+# strongest of the five, which makes it the hardest test of "the boost is inert".
+BOOST_THRESHES = [0.10]
+# the throttle is ALREADY live at thresh 0.15, frac 0.5. BOTH now sweep.
 THROTTLE_THRESHES = [0.15, 0.25, 0.40]
-# how deep the deeper cut goes (production is 0.5)
-THROTTLE_DEEP_FRAC = 0.25
+# WHY FRAC IS NOW A DIMENSION. thr0.25@0.40 was the best arm in run d86e4f22
+# (+669 PKR/day, margin +0.59 bps pooled) but it changes TWO things at once, and
+# the label "deeper cut" was wrong about one of them. micro_mm has a SINGLE
+# throttle threshold, so raising it from 0.15 to 0.40 does not deepen the cut in
+# the middle -- it REMOVES the cut entirely between |imb-0.5| 0.15 and 0.40 and
+# applies the deeper one only above 0.40. So that arm is really:
+#     stop throttling at moderate imbalance  +  cut to quarter at extreme
+# Those two have opposite signs on size and cannot be told apart from one arm.
+# frac 0.50 at the same thresholds isolates the FIRST component at production
+# depth; the pair then decomposes the effect.
+THROTTLE_FRACS = [0.25, 0.50]
+# the production depth, whose (frac, thresh) = (0.50, 0.15) arm IS the baseline
+PROD_FRAC, PROD_THRESH = 0.50, 0.15
 # where the lean band should close, once micro_mm supports it
 BAND_THRESHES = [0.25, 0.40]
 # names and dates for --smoke
@@ -195,12 +214,24 @@ ARMS = {"baseline": {}}
 for _t in BOOST_THRESHES:
     ARMS[f"boost@{_t:.2f}"] = dict(size_boost_mult=BOOST_MULT,
                                    size_boost_thresh=_t)
-# DEEPER THROTTLE swept over where the deeper cut starts. 0.15 is the shipped
-# trigger, so that arm is "same trigger, cut twice as hard"; the others move the
-# trigger up so the deeper cut applies only in the more extreme states.
-for _t in THROTTLE_THRESHES:
-    ARMS[f"thr{THROTTLE_DEEP_FRAC:.2f}@{_t:.2f}"] = dict(
-        throttle_frac=THROTTLE_DEEP_FRAC, obi_throttle_thresh=_t)
+# THROTTLE, swept on BOTH of its knobs: how deep the cut is (frac) and where it
+# starts (thresh). Because micro_mm has only ONE threshold, raising it does two
+# things at once -- it turns the cut OFF below the new threshold and applies the
+# chosen depth above it -- so the frac dimension is what separates them.
+for _f in THROTTLE_FRACS:
+    for _t in THROTTLE_THRESHES:
+        # (0.50, 0.15) IS production, so it would be a duplicate of baseline and
+        # is skipped: an arm identical to the control adds nothing and costs a
+        # multiple-testing slot.
+        if abs(_f - PROD_FRAC) < 1e-9 and abs(_t - PROD_THRESH) < 1e-9:
+            continue
+        ARMS[f"thr{_f:.2f}@{_t:.2f}"] = dict(
+            throttle_frac=_f, obi_throttle_thresh=_t)
+# THROTTLE OFF ENTIRELY. The one control never run: production has thrown this
+# switch since before the fill study, and "is the throttle earning its keep at
+# all" has never been tested against not having it. Without this arm, every
+# throttle comparison is relative to a setting that was itself never validated.
+ARMS["throttle_off"] = dict(obi_throttle=False)
 # LEAN BAND, only if this engine can express it
 if HAS_BAND:
     for _t in BAND_THRESHES:
@@ -221,18 +252,71 @@ if not HAS_BAND:
 #
 # The tag is now computed in resolve_tag() AFTER the names and dates are known,
 # because those are not known at import time.
+#
+# THE SCHEMA IS PART OF THE IDENTITY TOO. The journal is appended to, so a run
+# that writes MORE columns than the existing file has produces a ragged CSV that
+# pandas either refuses to read or reads wrongly. Adding shares/notional changed
+# the schema, so the schema goes in the hash: an old journal simply gets a
+# different tag and is left alone, and a fresh file is started. Nothing is
+# overwritten and nothing is silently mixed.
+JOURNAL_COLS = ("arm", "symbol", "date", "pnl", "fills", "shares", "notional")
+
+
 def resolve_tag(names, dates):
-    """Hash arms + names + dates, so any change to the run starts a new journal."""
+    """Hash arms + names + dates + schema, so any change starts a new journal."""
     # the arm definitions
     sig = {"arms": {k: sorted(v.items()) for k, v in ARMS.items()},
            # the exact symbols, order-independent
            "names": sorted(names),
+           # the columns this version writes
+           "cols": list(JOURNAL_COLS),
            # the exact dates, order-independent
            "dates": sorted(str(d) for d in dates)}
     # a short stable digest of the whole run definition
     return hashlib.sha1(json.dumps(sig, sort_keys=True).encode()).hexdigest()[:8]
 
 print(f"  arms ({len(ARMS)}): {', '.join(ARMS)}")
+
+
+# the column names the fills frame might use for size and price, best guess
+# first. Looked up by NAME rather than hard-coded, because a KeyError here would
+# fire on the very first cell and take down a run that is otherwise fine -- and
+# the size columns are a diagnostic, not the result.
+_QTY_NAMES = ("qty", "size", "quantity", "shares", "fill_qty")
+_PX_NAMES = ("px", "price", "fill_px", "fill_price")
+# warn once, not once per cell
+_SIZE_WARNED = []
+
+
+def fill_size(fills):
+    """Total shares and total PKR traded in a day's fills.
+
+    Returns (0.0, 0.0) for an empty day and warns ONCE if the frame does not
+    carry recognisable size/price columns, so a missing diagnostic degrades to
+    zeros with a message instead of crashing a multi-hour run.
+    """
+    # an empty day traded nothing
+    if fills is None or len(fills) == 0:
+        return 0.0, 0.0
+    # the first recognised quantity column
+    qc = next((c for c in _QTY_NAMES if c in fills.columns), None)
+    # the first recognised price column
+    pc = next((c for c in _PX_NAMES if c in fills.columns), None)
+    # no quantity column means no size diagnostic is possible at all
+    if qc is None:
+        # say it once, naming what the frame actually has
+        if not _SIZE_WARNED:
+            _SIZE_WARNED.append(1)
+            print(f"  WARNING: fills frame has no size column "
+                  f"(looked for {_QTY_NAMES}); it has {list(fills.columns)}. "
+                  f"The shares/notional mechanism check will be empty.")
+        return 0.0, 0.0
+    # shares traded
+    q = pd.to_numeric(fills[qc], errors="coerce").fillna(0.0)
+    # PKR traded, when a price column is available
+    n = float((q * pd.to_numeric(fills[pc], errors="coerce").fillna(0.0)).sum()) \
+        if pc is not None else 0.0
+    return float(q.sum()), n
 
 
 def per_name_setting(assignment_path):
@@ -402,16 +486,26 @@ def run(n_names, n_days):
                 # an unrunnable symbol-day returns None
                 if dr is None:
                     continue
-                # the day's P&L for this arm
+                # SHARES AND NOTIONAL, not just fill count. A SIZE lever changes
+                # shares per fill, not the number of fills: multiplying a quote by
+                # 1.5 puts more shares behind it, and an aggressor sweeping through
+                # produces one fill either way. thr0.25@0.40 made this visible --
+                # it moved P&L by +669 PKR/day on a 0.0% change in fill COUNT, so
+                # the whole effect was in size and the fill column was blind to it.
+                sh, no = fill_size(dr.fills)
+                # the day's P&L and the size actually put at risk
                 rows.append({"arm": arm, "symbol": sym, "date": d,
                              "pnl": float(dr.pnl() or 0.0),
-                             "fills": int(len(dr.fills))})
+                             "fills": int(len(dr.fills)),
+                             "shares": sh, "notional": no})
         # journal what is done so a crash does not lose the day, THEN report a
         # CUMULATIVE count. The first version printed len(rows) after clearing
         # the buffer each date, so it showed the per-date count and looked stuck.
         n_new = len(rows)
         if rows:
-            pd.DataFrame(rows).to_csv(
+            # fixed column ORDER as well as a fixed set, because the file is
+            # appended to and a reordered header would misalign every later row
+            pd.DataFrame(rows)[list(JOURNAL_COLS)].to_csv(
                 JOURNAL, mode="a", header=not JOURNAL.exists(), index=False)
             done |= {(r["arm"], r["symbol"], r["date"]) for r in rows}
             rows = []
@@ -432,6 +526,13 @@ def run(n_names, n_days):
 def report(df):
     """Day-as-unit comparison of each arm against the baseline."""
     print("\n=== RESULT ===")
+    # THE MECHANISM COLUMNS. A journal written before these columns existed can
+    # still be reported on -- it just cannot answer the size question.
+    have_size = {"shares", "notional"}.issubset(df.columns)
+    # say so rather than silently printing zeros that look like "no effect"
+    if not have_size:
+        print("  NOTE: this journal has no shares/notional columns, so the size")
+        print("        mechanism cannot be checked. Re-run to rebuild it.")
     # total PKR per arm, the headline
     tot = df.groupby("arm").pnl.sum().sort_values(ascending=False)
     print("\n  total PKR by arm:")
@@ -445,12 +546,66 @@ def report(df):
     # the baseline column must exist for any comparison to mean anything
     if "baseline" not in daily.columns:
         print("\n  no baseline arm in the results -- cannot compare"); return
-    # fills per arm, so the mechanism is visible and not just its P&L: the boost
-    # MUST raise fill count or it is not doing what it claims to do
+    # ---- the three mechanism aggregates, summed over every cell in the arm ----
+    # how many times the arm traded
     fills = df.groupby("arm").fills.sum()
+    # HOW MANY SHARES it put at risk. THIS is the column a SIZE lever moves.
+    # Fill COUNT is nearly blind to size: multiplying a quote by 1.5 puts more
+    # shares behind it, and an aggressor sweeping through produces ONE fill
+    # either way. thr0.25@0.40 made that visible -- +669 PKR/day on a 0.0%
+    # change in fill count, so the entire effect was in shares per fill and the
+    # old column could not see the mechanism it was supposed to be checking.
+    shares = df.groupby("arm").shares.sum() if have_size else None
+    # PKR traded, which is what turns P&L into a rate rather than a level
+    notional = df.groupby("arm").notional.sum() if have_size else None
+    # total P&L per arm, aligned to the same index for the bps arithmetic
+    pnl_tot = df.groupby("arm").pnl.sum()
+
+    def _pct(series, arm):
+        """This arm's total as a percent change from the baseline's."""
+        # no column -> no number
+        if series is None:
+            return float("nan")
+        # the control's total
+        b = float(series.get("baseline", 0.0))
+        # a zero control makes the ratio undefined rather than infinite
+        if b == 0:
+            return float("nan")
+        # percent change
+        return 100.0 * (float(series.get(arm, 0.0)) / b - 1.0)
+
+    def _bps(arm):
+        """P&L as basis points of the PKR this arm actually traded."""
+        # no notional column -> no rate
+        if notional is None:
+            return float("nan")
+        # PKR traded by this arm
+        n = float(notional.get(arm, 0.0))
+        # a zero denominator is not a zero margin
+        if n == 0:
+            return float("nan")
+        # basis points of traded notional
+        return 1e4 * float(pnl_tot.get(arm, 0.0)) / n
+    # the control's margin, which every arm's margin is read against
+    bps_base = _bps("baseline")
+    # DAILY MARGIN, so the margin claim gets a TEST and not just a level. The
+    # pooled bps above is one ratio over the whole panel, which is dominated by
+    # the biggest-notional symbol-days -- a single heavy day on OGDC or CPHL can
+    # set it. One margin per DAY, then the same paired test used for P&L, says
+    # whether a margin difference survives being looked at day by day.
+    if have_size:
+        # P&L and PKR traded per (arm, day)
+        _dp = df.groupby(["arm", "date"]).pnl.sum().unstack(0)
+        _dn = df.groupby(["arm", "date"]).notional.sum().unstack(0)
+        # margin in bps per arm per day; a zero-notional day becomes NaN
+        bps_daily = 1e4 * _dp / _dn.replace(0, np.nan)
+    else:
+        bps_daily = None
+
     print(f"\n  paired against baseline, day-as-unit, {len(daily)} days:")
-    print(f"    {'arm':<18} {'mean diff PKR/day':>18} {'t':>8} {'days>0':>8} "
-          f"{'fills vs base':>14}")
+    # LEVEL on the left (did P&L move), RATE and SIZE on the right (how)
+    print(f"    {'arm':<18} {'PKR/day':>10} {'t':>6} {'days>0':>8} "
+          f"{'shares%':>9} {'bps':>7} {'d_bps':>7} {'d_bps t':>8}")
     out = []
     # report in threshold order within each family, so the curve reads left to right
     for a in sorted(daily.columns, key=lambda s: (s.split("@")[0], s)):
@@ -466,12 +621,61 @@ def report(df):
         t = float(d.mean() / (d.std(ddof=1) / np.sqrt(len(d)))) \
             if d.std(ddof=1) > 0 else np.nan
         # how much this arm changed the number of fills
-        fd = 100.0 * (fills.get(a, 0) / max(fills.get("baseline", 1), 1) - 1)
-        print(f"    {a:<18} {d.mean():>18,.0f} {t:>8.2f} "
-              f"{int((d>0).sum()):>5}/{len(d)} {fd:>13.1f}%")
+        fd = _pct(fills, a)
+        # how much it changed the SHARES traded -- the real size mechanism
+        sd = _pct(shares, a)
+        # and the PKR traded
+        nd = _pct(notional, a)
+        # margin per PKR traded, pooled over the whole panel, and its change
+        bps_a = _bps(a)
+        db = bps_a - bps_base
+        # THE SAME MARGIN CHANGE, TESTED DAY BY DAY. A pooled ratio has no error
+        # bar; this one does, and it is the number that decides whether a margin
+        # improvement is real or is one heavy trading day.
+        db_day, db_t = float("nan"), float("nan")
+        if bps_daily is not None and a in bps_daily.columns \
+                and "baseline" in bps_daily.columns:
+            # per-day margin difference, on days both arms produced a margin
+            _b = (bps_daily[a] - bps_daily["baseline"]).dropna()
+            # need at least three days for a t to mean anything
+            if len(_b) >= 3:
+                # the mean daily margin change
+                db_day = float(_b.mean())
+                # its paired t across days
+                db_t = float(_b.mean() / (_b.std(ddof=1) / np.sqrt(len(_b)))) \
+                    if _b.std(ddof=1) > 0 else float("nan")
+        print(f"    {a:<18} {d.mean():>10,.0f} {t:>6.2f} "
+              f"{int((d>0).sum()):>5}/{len(d)} {sd:>8.1f}% {bps_a:>7.3f} "
+              f"{db_day:>+7.3f} {db_t:>8.2f}")
         out.append({"arm": a, "mean_diff_pkr_day": d.mean(), "t": t,
                     "days": len(d), "days_positive": int((d > 0).sum()),
-                    "fills_pct_vs_baseline": fd})
+                    "fills_pct_vs_baseline": fd,
+                    "shares_pct_vs_baseline": sd,
+                    "notional_pct_vs_baseline": nd,
+                    "bps_of_notional": bps_a,
+                    "bps_vs_baseline_pooled": db,
+                    "bps_vs_baseline_dayunit": db_day,
+                    "bps_vs_baseline_t": db_t})
+
+    # ===================================================================
+    # THE MECHANISM CHECK -- does the lever actually DO anything?
+    # ===================================================================
+    # An arm whose shares barely move has not exercised its lever, so whatever
+    # P&L difference it shows is the backtest's own path noise, not the setting.
+    # This check is what separates "the boost did not help" from "the boost never
+    # fired", and those two have opposite implications for what to try next.
+    if have_size and out:
+        print("\n  mechanism check -- did each lever move the SIZE it controls?")
+        for r in out:
+            # a lever that moved shares by less than 1% is not binding
+            inert = abs(r["shares_pct_vs_baseline"]) < 1.0 \
+                if r["shares_pct_vs_baseline"] == r["shares_pct_vs_baseline"] \
+                else True
+            # name it either way, so an inert arm cannot be read as a null result
+            print(f"    {r['arm']:<18} shares {r['shares_pct_vs_baseline']:+7.1f}%"
+                  f"   {'LEVER NOT BINDING -- P&L diff is noise' if inert else 'lever active'}")
+        print("    ^ an arm marked NOT BINDING tested nothing. Its P&L difference")
+        print("      comes from backtest path noise, not from the setting.")
     # THE THRESHOLD CURVE. The point of sweeping is to see the SHAPE, not to pick
     # the best cell -- with this many arms the best one is partly luck. A real
     # effect is monotone or single-peaked across thresholds; noise is ragged.
@@ -495,11 +699,54 @@ def report(df):
         p = OUT_DIR / f"extreme_obi_summary_{STAMP}.csv"
         pd.DataFrame(out).to_csv(p, index=False)
         print(f"\n  wrote {p}")
+    # ===================================================================
+    # THE THROTTLE DECOMPOSITION -- what the frac pair is for
+    # ===================================================================
+    # thr0.50@T and thr0.25@T differ ONLY in how deep the cut is above T. Both
+    # turn the cut OFF between 0.15 and T, because micro_mm has one threshold.
+    # So: thr0.50@T measures "stop throttling the middle" on its own, and the
+    # gap between the two measures what the deeper cut above T adds.
+    if out:
+        o2 = pd.DataFrame(out)
+        # the arms that carry a frac and a threshold in their label
+        o2 = o2[o2.arm.str.startswith("thr0.")]
+        if len(o2):
+            print("\n  throttle decomposition (PKR/day vs baseline):")
+            print(f"    {'thresh':>8} {'frac 0.50':>12} {'frac 0.25':>12} "
+                  f"{'deeper cut adds':>16}")
+            # index by (frac, thresh) for the pairwise read
+            m = {a: v for a, v in zip(o2.arm, o2.mean_diff_pkr_day)}
+            for _t in THROTTLE_THRESHES:
+                # the production-depth arm at this threshold
+                a50 = m.get(f"thr0.50@{_t:.2f}")
+                # the deep arm at this threshold
+                a25 = m.get(f"thr0.25@{_t:.2f}")
+                # the production cell is the baseline itself, so it reads 0
+                v50 = 0.0 if (abs(_t - PROD_THRESH) < 1e-9) else a50
+                # the difference the extra depth buys
+                gap = (a25 - v50) if (a25 is not None and v50 is not None) \
+                    else float("nan")
+                print(f"    {_t:>8.2f} "
+                      f"{(v50 if v50 is not None else float('nan')):>12,.0f} "
+                      f"{(a25 if a25 is not None else float('nan')):>12,.0f} "
+                      f"{gap:>16,.0f}")
+            print("    ^ a column that moves with THRESH and a gap near zero means")
+            print("      the gain is from NOT throttling the middle, not from")
+            print("      cutting harder at the extreme -- and the opposite reading")
+            print("      if the gap carries it.")
     print("\n  READ: the PRIOR was that lean_band wins -- negative capture means")
     print("  the quote is crossing the touch, and cutting size only scales that")
     print("  loss down rather than removing its cause. If throttle beats lean_band,")
     print("  that prior was wrong and the problem is size, not placement.")
     print("  |t| > 2 with most days positive is the bar; anything less is noise.")
+    # MULTIPLE TESTING, stated with the result rather than argued after it.
+    print(f"\n  MULTIPLE TESTING: {max(len(out), 1)} arms were tested. Under the")
+    print("  null that none of them does anything, the LARGEST |t| among that")
+    print("  many independent tests is expected to land near 1.8-2.2 on its own.")
+    print("  So a single best arm at |t| ~ 2 is what chance produces here, not")
+    print("  evidence. What is NOT explained by chance: a consistent SIGN across")
+    print("  a family, a shape that tracks the threshold, and a margin (d_bps)")
+    print("  that moves in the same direction as the P&L.")
 
 
 if __name__ == "__main__":
