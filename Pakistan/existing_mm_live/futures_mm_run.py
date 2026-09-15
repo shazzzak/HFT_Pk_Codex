@@ -47,9 +47,26 @@ from micro_mm import MicrostructureMM
 # heartbeat formatter
 import confirm_micro_vs_naive as C
 
-# raw store + results
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
-RESULTS = Path("/Users/shazzak/Capital Stake - Results")
+# ---- PATHS: from config_pk, never a literal in this file -------------------
+# The two literals that were here pointed at the OLD store location. When the
+# data moved under "~/HFT Data/Pakistan/" this module stopped finding anything,
+# and because ALL THREE futures runners import it, that killed the whole futures
+# track rather than just this file -- the visible symptom was
+# "missing session_segments_*.csv" from load_segments() below.
+# A path literal is a defect: it is valid syntax, so nothing warns you, and it
+# fails deep inside a run instead of at the top. config_pk is the one source.
+from config_pk import PARSED_ROOT, RESULTS_ROOT
+# push the parsed store onto the driver module, as every other script does
+R.PARSED_ROOT = PARSED_ROOT
+# where result CSVs and calibration files are read from and written to
+RESULTS = RESULTS_ROOT
+# fail here, with the path named, rather than inside a DuckDB glob later
+if not PARSED_ROOT.is_dir():
+    raise SystemExit(f"PARSED store not found: {PARSED_ROOT}")
+# the results folder holds session_segments_*.csv; without it newest() returns
+# nothing and load_segments() dies with a message that names no path
+if not RESULTS.is_dir():
+    raise SystemExit(f"RESULTS folder not found: {RESULTS}")
 # the futures feature store (built by build_feature_store_futures.py) -- scoring
 # now routes through the ENGINE'S OWN mids here, not a local reimplementation
 FS_FUT = RESULTS / "feature_store_fut"

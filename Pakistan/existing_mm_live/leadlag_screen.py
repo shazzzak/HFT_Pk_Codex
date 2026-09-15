@@ -110,9 +110,27 @@ SINGLETON_SECTORS = {
 }
 
 # lag grid in MILLISECONDS to scan for the HY lead-lag peak. Positive = leader
-# leads follower. Range/step chosen for a human venue (sub-second to ~30s).
-LAG_GRID_MS = [-30000, -15000, -10000, -5000, -3000, -2000, -1000, -500, -250, 0,
-               250, 500, 1000, 2000, 3000, 5000, 10000, 15000, 30000]
+# leads follower.
+#
+# WIDENED 2026-09-15. The previous grid ran 0, 250, 500, 1000, 2000, 3000, 5000,
+# 10000, 15000, 30000 -- only THREE sample points between 3 and 15 seconds. PSX
+# is quoted by people, not by machines, so the propagation scale to expect here
+# is SECONDS, and the old grid sampled that band more thinly than any other.
+#
+# That is not cosmetic. If the true lag is, say, 7 s, each day's peak lands on
+# either 5000 or 10000 depending on noise and flips between them day to day.
+# That MANUFACTURES sign instability and INFLATES peak_lag_se -- which are two of
+# the gates the screen failed on. A coarse grid in the band of interest can
+# depress the very statistics used to declare the result noise.
+#
+# Now 1-second resolution out to 15 s, where a human-speed lead would live, then
+# coarser to 30 s for the tail. 39 points against 19, so expect roughly double
+# the runtime (the 20-day pass took about 7 minutes).
+LAG_GRID_MS = [-30000, -25000, -20000, -15000, -12000, -10000, -9000, -8000,
+               -7000, -6000, -5000, -4000, -3000, -2500, -2000, -1500, -1000,
+               -500, -250, 0,
+               250, 500, 1000, 1500, 2000, 2500, 3000, 4000, 5000, 6000, 7000,
+               8000, 9000, 10000, 12000, 15000, 20000, 25000, 30000]
 # round-trip fee (bps) -- the economic hurdle in Step 4
 FEE_BPS = 1.554
 # min trades per symbol-day to attempt HY (too few -> unstable)
@@ -121,6 +139,25 @@ MIN_TRADES = 100
 MAX_DAYS = 20
 # workers
 WORKERS = 6
+# MINIMUM DAYS a pair must survive before it is reported at all. The whole screen
+# is day-as-unit -- peak_lag_se is a standard error across days -- so a pair with
+# fewer than this has no error bar worth printing. Was a bare 3 inline; named here
+# because --smoke must respect it or it silently produces an empty result.
+MIN_PAIR_DAYS = 3
+# How many names per sector take a turn as the leader, ranked by MEDIAN DAILY
+# TRADED VALUE (PKR), not share volume. 2 means the largest and second-largest
+# are both tested, which is the only way to find out whether the size prior
+# ("largest free-float leads") actually holds -- on PSX the largest name is often
+# the most index-driven, which can make it the FOLLOWER of sector news that
+# surfaces first in a mid-cap with concentrated informed flow.
+# COST: this roughly doubles the number of pairs, so the multiple-testing burden
+# doubles with it. Judge a candidate on the full acceptance rule printed at the
+# end of a run, never on the best t-statistic in the table.
+N_LEADERS = 2
+# days used by --smoke. MUST be >= MIN_PAIR_DAYS or every pair is skipped and the
+# run ends with an empty frame. The old value was 2, which could never produce a
+# single row.
+SMOKE_DAYS = 5
 
 def _ts():
     # log stamp
@@ -256,11 +293,15 @@ def daily_traded_value(sym, date):
 # STEPS
 # ----------------------------------------------------------------------------
 def pick_leaders(dates):
-    # Step 0: leader per sector = highest MEDIAN daily traded value across `dates`.
+    # Step 0: the top N_LEADERS names per sector by MEDIAN DAILY TRADED VALUE.
+    # Value, not share volume: daily_traded_value() reads MAX(cum_value), the
+    # exchange's own cumulative traded VALUE in PKR. Share count would rank a
+    # 1.28 PKR name above a 450 PKR one on identical economic activity.
+    # Returns {sector: [leader1, leader2, ...]} ordered most-traded first.
     leaders = {}; tv_table = []
     # each sector
     for sec, names in SECTORS.items():
-        # need at least a leader + one follower
+        # need at least one leader + one follower
         if len(names) < 2:
             continue
         # median daily traded value per name
@@ -270,9 +311,13 @@ def pick_leaders(dates):
             vals = [v for v in vals if v > 0]
             med[sym] = float(np.median(vals)) if vals else 0.0
             tv_table.append({"sector": sec, "symbol": sym, "median_traded_value": med[sym]})
-        # the leader is the max-traded-value name
-        leader = max(med, key=med.get)
-        leaders[sec] = leader
+        # rank by traded value, descending, and keep the top N that actually traded
+        ranked = [s for s in sorted(med, key=med.get, reverse=True) if med[s] > 0]
+        # a sector with one tradeable name cannot form a pair
+        if len(ranked) < 2:
+            continue
+        # take the top N, but never more leaders than leaves a follower behind
+        leaders[sec] = ranked[:min(N_LEADERS, len(ranked) - 1)]
     return leaders, pd.DataFrame(tv_table)
 
 def update_rate(sym, date):
@@ -394,55 +439,120 @@ def run_real(max_days=MAX_DAYS, workers=WORKERS):
     leaders, tv = pick_leaders(dates)
     print(_ts() + "leaders (by median traded value):")
     print(tv.sort_values(['sector','median_traded_value'], ascending=[True,False]).to_string(index=False))
-    print(_ts() + f"selected leaders: {leaders}")
+    # show the top N per sector in rank order, and how many pairs that implies
+    print(_ts() + f"selected top-{N_LEADERS} leaders per sector (by traded value):")
+    for _sec, _ls in sorted(leaders.items()):
+        print(f"    {_sec:>18}: " + ", ".join(f"#{i+1} {s}" for i, s in enumerate(_ls)))
+    # the unordered pair count, which is what the multiple-testing burden scales with
+    _npairs = sum(len({frozenset((l, f)) for l in _ls
+                       for f in SECTORS[_sec] if f != l})
+                  for _sec, _ls in leaders.items())
+    print(_ts() + f"{_npairs} unordered pairs to test "
+                  f"(each pair runs once -- the HY curve is antisymmetric in lag)")
     rows = []
-    # each sector's leader vs each follower
-    for sec, leader in leaders.items():
-        followers = [s for s in SECTORS[sec] if s != leader]
-        for foll in followers:
-            per_day = []
-            for d in dates:
-                # Step 1 activity
-                lm, ln = update_rate(leader, d); fm, fn = update_rate(foll, d)
-                if ln < MIN_TRADES or fn < MIN_TRADES:
+    # pairs already measured, as unordered {A,B} sets. The HY curve is
+    # ANTISYMMETRIC in lag: testing A->B across the lag grid already contains the
+    # B->A answer as its mirror image. Running both adds no information and
+    # doubles the multiple-testing burden, so each unordered pair runs once.
+    seen_pairs = set()
+    # each sector's leaders vs every other name in the sector
+    for sec, sec_leaders in leaders.items():
+        # each of the top N traded-value names takes a turn as the leader
+        for leader in sec_leaders:
+            # every other name in the sector is a candidate follower -- INCLUDING
+            # the sector's other leader, because "does the largest name actually
+            # lead the second largest" is the direct test of the size prior and
+            # is the single most informative pair in the sector
+            followers = [s for s in SECTORS[sec] if s != leader]
+            for foll in followers:
+                # the unordered identity of this pair
+                key = (sec, frozenset((leader, foll)))
+                # already measured from the other direction
+                if key in seen_pairs:
                     continue
-                tX, pX = load_trades(leader, d); tY, pY = load_trades(foll, d)
-                res = hy_leadlag_curve(tX, pX, tY, pY, LAG_GRID_MS)
-                if res is None:
+                seen_pairs.add(key)
+                # this pair's per-day results
+                per_day = []
+                # every sampled date
+                for d in dates:
+                    # Step 1 activity
+                    lm, ln = update_rate(leader, d); fm, fn = update_rate(foll, d)
+                    # both legs must have enough trades for HY to be stable
+                    if ln < MIN_TRADES or fn < MIN_TRADES:
+                        continue
+                    tX, pX = load_trades(leader, d); tY, pY = load_trades(foll, d)
+                    res = hy_leadlag_curve(tX, pX, tY, pY, LAG_GRID_MS)
+                    # no overlapping quotes -> nothing to measure this day
+                    if res is None:
+                        continue
+                    lags, corr, rvx, rvy = res
+                    pk_lag, pk_corr, at0 = peak_leadlag(lags, corr)
+                    ind_bps = hy_beta_bps(pk_corr, rvx, rvy, tX, pX)
+                    per_day.append(dict(date=d, leader_med_ms=lm, foll_med_ms=fm,
+                                        peak_lag_ms=pk_lag, peak_corr=pk_corr,
+                                        corr0=at0, ind_bps=ind_bps))
+                # a pair needs enough days to carry a day-as-unit error bar
+                if len(per_day) < MIN_PAIR_DAYS:
                     continue
-                lags, corr, rvx, rvy = res
-                pk_lag, pk_corr, at0 = peak_leadlag(lags, corr)
-                ind_bps = hy_beta_bps(pk_corr, rvx, rvy, tX, pX)
-                per_day.append(dict(date=d, leader_med_ms=lm, foll_med_ms=fm,
-                                    peak_lag_ms=pk_lag, peak_corr=pk_corr, corr0=at0,
-                                    ind_bps=ind_bps))
-            if len(per_day) < 3:
-                continue
-            pdd = pd.DataFrame(per_day)
-            # day-as-unit aggregation (Steps 1,3,4)
-            rows.append(dict(
-                sector=sec, leader=leader, follower=foll, n_days=len(pdd),
-                # Step 1: is the leader faster? (median inter-trade time)
-                leader_ms=pdd.leader_med_ms.median(), foll_ms=pdd.foll_med_ms.median(),
-                leader_faster=bool(pdd.leader_med_ms.median() < pdd.foll_med_ms.median()),
-                # Step 2/3: peak lag mean +/- SE, sign stability
-                peak_lag_mean=pdd.peak_lag_ms.mean(),
-                peak_lag_se=pdd.peak_lag_ms.std(ddof=1)/np.sqrt(len(pdd)),
-                frac_leader_leads=float((pdd.peak_lag_ms > 0).mean()),
-                peak_corr_mean=pdd.peak_corr.mean(),
-                corr0_mean=pdd.corr0.mean(),
-                # Step 4: indicative anticipatable bps vs the fee hurdle
-                ind_bps_median=pdd.ind_bps.median(),
-                clears_fee=bool(pdd.ind_bps.median() > FEE_BPS)))
+                pdd = pd.DataFrame(per_day)
+                # day-as-unit aggregation (Steps 1,3,4)
+                rows.append(dict(
+                    sector=sec, leader=leader, follower=foll,
+                    # which traded-value rank this leader holds in its sector, so
+                    # the output can be read as "did the #2 name beat the #1"
+                    leader_rank=sec_leaders.index(leader) + 1,
+                    n_days=len(pdd),
+                    # Step 1: is the leader faster? (median inter-trade time)
+                    leader_ms=pdd.leader_med_ms.median(),
+                    foll_ms=pdd.foll_med_ms.median(),
+                    leader_faster=bool(pdd.leader_med_ms.median()
+                                       < pdd.foll_med_ms.median()),
+                    # Step 2/3: peak lag mean +/- SE, sign stability
+                    peak_lag_mean=pdd.peak_lag_ms.mean(),
+                    peak_lag_se=pdd.peak_lag_ms.std(ddof=1)/np.sqrt(len(pdd)),
+                    frac_leader_leads=float((pdd.peak_lag_ms > 0).mean()),
+                    peak_corr_mean=pdd.peak_corr.mean(),
+                    corr0_mean=pdd.corr0.mean(),
+                    # Step 4: indicative anticipatable bps vs the fee hurdle
+                    ind_bps_median=pdd.ind_bps.median(),
+                    clears_fee=bool(pdd.ind_bps.median() > FEE_BPS)))
     out = pd.DataFrame(rows)
     import os; os.makedirs(os.path.join(RESULTS_ROOT, "leadlag"), exist_ok=True)
     p = os.path.join(RESULTS_ROOT, "leadlag", "leadlag_screen.parquet")
-    out.to_parquet(p, index=False)
     print(_ts() + "\n=== LEAD-LAG SCREEN (day-as-unit) ===")
-    cols = ["sector","leader","follower","n_days","leader_faster","peak_lag_mean",
-            "peak_lag_se","frac_leader_leads","peak_corr_mean","corr0_mean",
-            "ind_bps_median","clears_fee"]
-    print(out[cols].to_string(index=False))
+    # EMPTY-RESULT GUARD. An empty frame has no columns, so selecting the report
+    # columns from it raises a bare KeyError that says nothing about the cause.
+    # Every cause is a data-sufficiency problem, so name them instead of crashing.
+    if len(out) == 0:
+        print("  NO PAIRS SURVIVED -- nothing to report. In order of likelihood:")
+        print(f"    1. days sampled ({max_days}) < MIN_PAIR_DAYS ({MIN_PAIR_DAYS}). "
+              "A pair needs that many usable days before it gets an error bar.")
+        print(f"    2. too few symbol-days cleared MIN_TRADES ({MIN_TRADES} trades).")
+        print("    3. the HY curve returned None on most days (no overlapping quotes).")
+        print("  Nothing was written. Re-run with more days.")
+        return out
+    # only write a frame that has content
+    out.to_parquet(p, index=False)
+    cols = ["sector","leader","leader_rank","follower","n_days","leader_faster",
+            "peak_lag_mean","peak_lag_se","frac_leader_leads","peak_corr_mean",
+            "corr0_mean","ind_bps_median","clears_fee"]
+    # sort so each sector's #1 leader is read before its #2
+    print(out.sort_values(["sector","leader_rank","follower"])[cols]
+             .to_string(index=False))
+    # the direct test of the size prior: does the #1 name lead the #2, or trail it?
+    top2 = out[out.follower.isin([l for ls in leaders.values() for l in ls])
+               & out.leader.isin([l for ls in leaders.values() for l in ls])]
+    if len(top2):
+        print("\n  #1 vs #2 IN EACH SECTOR -- the direct test of "
+              "'the largest name leads':")
+        print(top2.sort_values("sector")[
+            ["sector","leader","leader_rank","follower","peak_lag_mean",
+             "peak_lag_se","frac_leader_leads","peak_corr_mean"]
+        ].to_string(index=False))
+        # a positive peak lag means the named leader genuinely leads
+        _lead_wins = int((top2[top2.leader_rank == 1].peak_lag_mean > 0).sum())
+        _n1 = int((top2.leader_rank == 1).sum())
+        print(f"    the #1 name leads its #2 in {_lead_wins} of {_n1} sectors")
     print(_ts() + f"wrote {p}")
     print(_ts() + "READ: a candidate is only worth an engine throttle test if ALL hold: "
                   "leader_faster=True, |peak_lag_mean| clears its SE, frac_leader_leads>~0.7 "
@@ -462,4 +572,6 @@ if __name__ == "__main__":
     elif a.run:
         run_real(max_days=(a.days or None), workers=a.workers)
     elif a.smoke:
-        run_real(max_days=2, workers=1)
+        # SMOKE_DAYS, not 2: the old value was below MIN_PAIR_DAYS, so every pair
+        # was skipped and the run died printing an empty frame
+        run_real(max_days=SMOKE_DAYS, workers=1)

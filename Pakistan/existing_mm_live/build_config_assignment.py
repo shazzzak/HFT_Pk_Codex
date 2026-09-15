@@ -60,6 +60,8 @@
 #   caffeinate -is python build_config_assignment.py
 # ============================================================================
 
+# os.replace / os.fsync for the atomic write of the assignment CSV
+import os
 # frames
 import pandas as pd
 # numeric
@@ -117,7 +119,12 @@ MIN_PKR_PER_DAY = 0.0
 REFIT_DAYS = 91
 
 # OPTIONAL: the previous assignment, for hysteresis. None on the first run.
-PRIOR_ASSIGNMENT = None
+# SET on 2026-09-15 to the shipped three-bucket assignment. With this set, a name
+# only changes setting when its effect size clears the band by more than D_EXIT,
+# so the config stops churning between refits on noise. Leaving this at None on a
+# refit is not a crash -- it silently re-decides every name from scratch, which is
+# why the run prints which file it compared against.
+PRIOR_ASSIGNMENT = RESULTS_ROOT / "config_assignment_20260915_0043.csv"
 
 # the settings, in the order they are reported, and what each means in plain words
 SETTINGS = ["QT_2t@15", "QT_2t@20", "OBI", "DROP"]
@@ -409,12 +416,29 @@ def main():
     # a fresh timestamped destination; never overwrites
     out = EX.safe_out("config_assignment", "csv")
     # the columns the harness needs plus the evidence behind each decision
-    P.reset_index()[["symbol", "cohort", "assigned_config", "setting",
-                     "skew_ticks", "skew_thresh", "reason",
-                     "d_eff", "t_diff", "obi_pkr", "lean15_pkr", "lean20_pkr",
-                     "obi_bps", "lean15_bps", "lean20_bps", "capacity_flag", "days",
-                     "prior_config", "changed", "as_of", "refit_due"]
-                    ].to_csv(out, index=False)
+    table = P.reset_index()[["symbol", "cohort", "assigned_config", "setting",
+                             "skew_ticks", "skew_thresh", "reason",
+                             "d_eff", "t_diff", "obi_pkr", "lean15_pkr", "lean20_pkr",
+                             "obi_bps", "lean15_bps", "lean20_bps", "capacity_flag",
+                             "days", "prior_config", "changed", "as_of", "refit_due"]]
+    # ATOMIC WRITE. Writing a file is not instantaneous: for a moment the file on
+    # disk holds only the first N lines. live_config.py re-reads the assignment
+    # every 3 minutes, so if a refit runs during a session it can read the file
+    # mid-write and see a partial universe -- every missing name would be logged
+    # as an ORPHAN, an alarming message that clears itself on the next cycle.
+    # Nothing breaks, but it costs an hour chasing a ghost. So: write to a temp
+    # file beside the destination, then RENAME it into place. A rename is atomic
+    # at the OS level, so a reader sees either the whole old file or the whole
+    # new one, never half of either.
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    # write the full table to the temporary name
+    table.to_csv(tmp, index=False)
+    # force the bytes out of the OS cache onto the disk BEFORE the rename, so a
+    # crash cannot leave a renamed-but-empty file
+    with open(tmp, "rb+") as _fh:
+        os.fsync(_fh.fileno())
+    # the instantaneous swap; os.replace overwrites atomically on POSIX and Windows
+    os.replace(tmp, out)
     # say where it went
     print(f"\nwrote {out}")
 
