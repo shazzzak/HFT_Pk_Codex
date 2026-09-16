@@ -298,6 +298,53 @@ class Venue(ABC):
         specification, and it must never be guessed: assuming an amendment is
         supported when it is not produces rejects on every reprice, and
         assuming it is not costs a round trip on every reprice forever.
+
+        WHETHER IT KEEPS QUEUE POSITION IS A SEPARATE QUESTION, answered by
+        the three properties below. Sending one message instead of two is a
+        latency saving; keeping your place in the line is worth far more, and
+        the two do not come together.
+        """
+
+    # ---- what an amendment does to queue position -------------------------
+    # Three separate rules, because venues split them three ways: a venue that
+    # keeps priority on a size reduction will usually still strip it on a
+    # reprice. The simulated exchange reads these to decide whether an amended
+    # order carries its place in the line or rejoins at the back, so one wrong
+    # answer makes every fill downstream of a reprice wrong in the same
+    # direction.
+    #
+    # THESE ARE FACTS ABOUT THE VENUE, published in its rulebook. They are not
+    # tuning knobs. They are properties rather than constants so a second venue
+    # can answer differently without a line of engine code changing.
+
+    @property
+    @abstractmethod
+    def replace_price_keeps_priority(self) -> bool:
+        """Does amending the PRICE keep our place in the queue?
+
+        Almost universally no: a different price is a different queue, and a
+        position held at the old price cannot mean anything at the new one. A
+        venue answering True wants its citation beside the answer.
+        """
+
+    @property
+    @abstractmethod
+    def replace_qty_up_keeps_priority(self) -> bool:
+        """Does amending the size UPWARD keep our place in the queue?
+
+        Normally no. Growing an order without losing priority would let anyone
+        hold a place in the line with one share and inflate it the moment the
+        queue became valuable.
+        """
+
+    @property
+    @abstractmethod
+    def replace_qty_down_keeps_priority(self) -> bool:
+        """Does amending the size DOWNWARD keep our place in the queue?
+
+        Normally yes, and this is the case worth exploiting. Reducing takes
+        nothing from anyone behind us -- they move up -- so venues generally
+        amend the resting order in place.
         """
 
     @property

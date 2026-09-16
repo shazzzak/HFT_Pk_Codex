@@ -535,6 +535,14 @@ def main():
                     "buffer_qty": float(_eod.get("buffer_qty") or 0.0),
                     # what it was bought at; NaN when there was no buffer
                     "buffer_px": float(_eod.get("buffer_px") or np.nan),
+                    # the touch at that instant, so the acquisition is auditable
+                    "buffer_bid": float(_eod.get("buffer_bid") or np.nan),
+                    "buffer_ask": float(_eod.get("buffer_ask") or np.nan),
+                    # WHAT THE FREE ACQUISITION IS WORTH: the extra PKR a real
+                    # market buy would have paid, price and fee together. NaN
+                    # when the book was one-sided and there was no ask.
+                    "buffer_acq_understated_pkr": float(
+                        _eod.get("buffer_acq_understated_pkr") or np.nan),
                     # the closing mid it was marked back at
                     "mid_at_close": float(_eod.get("mid_at_close") or np.nan),
                     # how much was traded, for a bps view
@@ -640,6 +648,37 @@ def main():
         print("  that is actually held, the gap is the dominant exposure.")
         # the fee the model charges every day but reality pays once
         rt = 2.0 * FEE_TOTAL_PCT * cap
+        # ---- what the free acquisition is worth ------------------------
+        # The buffer is handed to us at the first print, whichever side that
+        # print was on. A real market buy pays the ask. This is the gap.
+        und = buf["buffer_acq_understated_pkr"].dropna()
+        # only report it when at least one day had a two-sided book
+        if len(und):
+            print(f"  FREE ACQUISITION WORTH: the buffer is booked at the first")
+            print(f"  print, not the ask. A market buy would have paid")
+            print(f"  {und.mean():,.2f} PKR/day more on average "
+                  f"(worst {und.max():+,.2f}, best {und.min():+,.2f}),")
+            print(f"  totalling {und.sum():,.2f} PKR over {len(und)} "
+                  f"symbol-days. That is a cost long_buffer never pays.")
+            # the spread it implies, so the number is interpretable
+            sp = (buf["buffer_ask"] - buf["buffer_bid"]).dropna()
+            # only when both sides were present
+            if len(sp):
+                print(f"  (spread at acquisition: {sp.mean():.4f} PKR mean, "
+                      f"{sp.max():.4f} widest -- the open is the wide part")
+                print(f"   of the day, which is why this is the worst moment")
+                print(f"   in the session to anchor an acquisition price to.)")
+            # days where the print was AT OR WORSE than the ask
+            n_neg = int((und <= 0).sum())
+            # say so plainly rather than hiding it in the mean
+            if n_neg:
+                print(f"  On {n_neg} of {len(und)} days the value is <= 0: the")
+                print(f"  print was at or above the ask, so the model paid MORE")
+                print(f"  than a market order would have. Not clamped.")
+        else:
+            print(f"  FREE ACQUISITION WORTH: not measurable -- the book was")
+            print(f"  one-sided at every acquisition, so there was no ask to")
+            print(f"  compare against. Nothing is assumed in its place.")
         print(f"  ROUND-TRIP FEE OVERSTATED: the buffer is re-bought and")
         print(f"  re-sold every day, costing {rt:,.2f} PKR/day in fees. A")
         print(f"  buffer that is held pays that ONCE. Over {len(buf)} "

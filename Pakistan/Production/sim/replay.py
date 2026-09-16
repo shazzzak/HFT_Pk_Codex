@@ -58,6 +58,22 @@ class EngineReplay(Backtester):
         self._adapter = adapter
         # the production order manager under test
         self._oms = oms
+        # ONE SOURCE OF TRUTH FOR WHAT AN AMENDMENT COSTS. The venue publishes
+        # the three priority rules; the engine carries its own three flags with
+        # the same meaning. Wiring them here means the simulated exchange can
+        # never disagree with the venue the live engine is configured against.
+        # A disagreement would make every fill downstream of a reprice wrong in
+        # the same direction, and it would never surface as an error -- just as
+        # a P&L that quietly does not match.
+        _venue = getattr(oms, "_venue", None)
+        # a harness constructed without a venue keeps Backtester's own defaults
+        if _venue is not None:
+            # a reprice: does the amended order keep its place in the queue?
+            self.cfo_price_keeps_priority = _venue.replace_price_keeps_priority
+            # a size increase: same question
+            self.cfo_qty_up_keeps_priority = _venue.replace_qty_up_keeps_priority
+            # a size reduction: the one case venues usually allow in place
+            self.cfo_qty_down_keeps_priority = _venue.replace_qty_down_keeps_priority
         # the instrument
         self._symbol = symbol
         # Backtester identifies our orders by an integer oid; the production
@@ -69,6 +85,17 @@ class EngineReplay(Backtester):
         # new ClOrdID on a cancel and the exchange's reply quotes that one, not
         # the order's
         self._cancel_cl_by_oid: Dict[int, str] = {}
+        # the client order id of the amendment in flight, keyed by the NEW oid
+        # the amended generation will carry. Separate from the cancel map
+        # because an amendment and a cancel are different messages with
+        # different replies, and conflating them is how a reject gets applied
+        # to the wrong order.
+        self._amend_cl_by_oid: Dict[int, str] = {}
+        # oids that left self.work because they were AMENDED, not cancelled.
+        # _activate_until reports any disappearance as a cancellation, which is
+        # right under cancel-plus-new and wrong under an amendment: the order
+        # did not go away, it became a new generation of itself.
+        self._amended_away: set = set()
         # counters this harness adds, kept separate from Backtester's stats so
         # nothing it reports is altered
         self.engine_stats = {
@@ -80,9 +107,12 @@ class EngineReplay(Backtester):
             "halted_requotes": 0,
             # actions the risk gateway refused
             "gateway_rejections": 0,
-            # amendments emitted. MUST BE ZERO for a reconcile run: Backtester
-            # has no amendment path, so a ReplaceOrder cannot be honoured here.
+            # amendments emitted by the order manager and scheduled here
             "replace_actions": 0,
+            # amendments that landed on an order that had already gone -- the
+            # exchange's Order Cancel Reject, and the real cost of the one
+            # message: until it lands the OLD terms are still matchable
+            "replace_rejected_stale": 0,
         }
 
     # ---- the book, in the production engine's units -----------------------
@@ -177,25 +207,73 @@ class EngineReplay(Backtester):
 
     def _dispatch(self, action, ts_know) -> None:
         """One production action -> one message on Backtester's scheduler."""
-        # AN AMENDMENT CANNOT BE HONOURED HERE. Backtester has no amendment
-        # path: an order is cancelled and a new one is sent. The order manager
-        # defaults to that behaviour for exactly this reason, so a ReplaceOrder
-        # arriving means use_replace was turned on -- and the run would silently
-        # stop being comparable.
+        # AN AMENDMENT. One message, scheduled exactly as Backtester's own CFO
+        # path schedules it, so the two runs are comparable message for
+        # message. What the amendment does to QUEUE POSITION when it lands is
+        # not decided here -- it is decided by the venue's three
+        # replace_*_keeps_priority answers, which the engine reads.
         if isinstance(action, ReplaceOrder):
+            # count it
             self.engine_stats["replace_actions"] += 1
-            raise ValueError(
-                "EngineReplay received a ReplaceOrder. mm_backtest has no "
-                "amendment path, so a run using amendments is not comparable "
-                "with any measured result. Construct the OrderManager with "
-                "use_replace=False (the default).")
+            # find the working order this amendment targets, by the PRODUCTION
+            # identity rather than the exchange id: an order that has already
+            # been amended once carries a new exchange id, and the production
+            # side still knows it by its original client order id.
+            for side_str, cur in list(self.work.items()):
+                # the production id of whatever is resting on this side
+                if self._cl_by_oid.get(cur.oid) != action.orig_cl_ord_id:
+                    continue
+                # NEVER AMEND SOMETHING ALREADY BEING CANCELLED, and never
+                # stack a second amendment on one already in flight. Both are
+                # the order manager's job to prevent; this is the belt.
+                if cur.cancel_at is not None or cur.amend_at is not None:
+                    return
+                # one send-latency draw, because this is one message
+                a_out = self.lat.draw_out()
+                # when the amendment reaches the exchange
+                t_land = ts_know + a_out
+                # the amended generation gets its own engine id
+                self._oid += 1
+                # an outbound message, for the rate statistics
+                self._msg_ts.append(ts_know)
+                # counted the way Backtester counts it, so the message totals
+                # of the two runs line up
+                self.stats["n_orders_sent"] += 1
+                # remember which production message the exchange is answering
+                self._amend_cl_by_oid[self._oid] = action.cl_ord_id
+                # schedule it, carrying the target generation so an amendment
+                # that loses a race to a fill is rejected, not misapplied
+                self._push(t_land, "AMEND",
+                           (side_str, cur.oid, action.price_minor / 100.0,
+                            action.quantity, self._oid))
+                # MARK IT IN FLIGHT. This deliberately does NOT gate fills the
+                # way cancel_at does: the old terms stay matchable until the
+                # amendment lands, which is the real exposure of the one
+                # message and the thing it costs you.
+                cur.amend_at = t_land
+                # done
+                return
+            # nothing matched: the target filled or was already gone, which the
+            # exchange answers with an Order Cancel Reject
+            self.engine_stats["replace_rejected_stale"] += 1
+            # tell the order manager, so the order does not sit in
+            # PENDING_REPLACE for the rest of the session
+            self._oms.on_cancel_rejected(action.cl_ord_id,
+                                         "nothing to amend")
+            return
         # A CANCEL. Find the working order it targets and start its cancel,
         # exactly as _requote does.
         if isinstance(action, CancelOrder):
             # which side, from the order manager's own record
             for side_str, cur in list(self.work.items()):
-                # match on the exchange id, which is the oid as a string
-                if str(cur.oid) != action.exchange_order_id:
+                # MATCH ON THE PRODUCTION IDENTITY, not the exchange id. An
+                # order that has been amended carries a NEW engine id while the
+                # order manager still knows it by its original client order id,
+                # so matching on the exchange id would fail to find it and the
+                # cancel would be silently dropped. The exchange id is still
+                # checked as a fallback for an order that was never amended.
+                if (self._cl_by_oid.get(cur.oid) != action.orig_cl_ord_id
+                        and str(cur.oid) != action.exchange_order_id):
                     continue
                 # never stack a second cancel on an order already being
                 # cancelled -- the order manager's in-flight rule should
@@ -279,6 +357,54 @@ class EngineReplay(Backtester):
             # the order would have crossed. A real reject, not a lost message.
             self._oms.on_rejected(cl_ord_id, "post-only reject: would cross")
 
+    def _amend(self, t, payload):
+        """An amendment reached the exchange. Keep the order manager in step.
+
+        Backtester's _amend replaces self.work[side] with a NEW MyOrder that
+        carries a new engine id -- because for priority purposes a re-queued
+        amendment is a new order. The production side does no such thing: the
+        order manager keeps ONE Order object and applies the new terms to it.
+        Reconciling those two views is all this override does.
+        """
+        # what this amendment was aimed at, and what it will become
+        side, oid, new_px, new_qty, new_oid = payload
+        # the production id of the amendment MESSAGE, which is what the
+        # exchange's reply quotes
+        amend_cl = self._amend_cl_by_oid.pop(new_oid, None)
+        # the production id of the ORDER, which survives the amendment
+        order_cl = self._cl_by_oid.get(oid)
+        # let Backtester apply it, or refuse it as stale
+        super()._amend(t, payload)
+        # what is resting now
+        after = self.work.get(side)
+        # THE AMENDMENT WAS REFUSED: the target had already filled or gone, so
+        # the engine left the book untouched and counted it.
+        if after is None or after.oid != new_oid:
+            # count it on this harness's own ledger too
+            self.engine_stats["replace_rejected_stale"] += 1
+            # tell the order manager, so the order comes back out of
+            # PENDING_REPLACE instead of being stuck there
+            if amend_cl is not None:
+                self._oms.on_cancel_rejected(amend_cl,
+                                             "amendment target already gone")
+            # nothing else to do
+            return
+        # IT LANDED. The engine gave the amended generation a new id, so carry
+        # the production identity onto it -- every later fill and cancel is
+        # matched through this map.
+        if order_cl is not None:
+            self._cl_by_oid[new_oid] = order_cl
+        # the OLD generation left self.work by being amended, NOT cancelled.
+        # _activate_until reports disappearances as cancellations, so record
+        # this one to stop it being reported as something it was not.
+        self._amended_away.add(oid)
+        # tell the order manager the new terms are live. The amendment's own
+        # id is what the exchange quotes, and the order manager aliases it back
+        # to the original order.
+        if amend_cl is not None:
+            self._oms.on_replaced(amend_cl, int(round(new_px * 100)),
+                                  int(new_qty))
+
     def _fill(self, side, price, qty, t_exch, reason):
         """One of our orders executed. Tell the order manager how much."""
         # the order being filled, and its size before
@@ -324,10 +450,19 @@ class EngineReplay(Backtester):
         super()._activate_until(t_exch)
         # which are still there
         after = {order.oid for order in self.work.values()}
-        # anything that left was cancelled
+        # anything that left was cancelled -- unless it was AMENDED, in which
+        # case the order did not go away, it became a new generation of itself
+        # and _amend has already told the order manager so.
         for oid in before.values():
             # still working
             if oid in after:
+                continue
+            # left because an amendment replaced it, not because a cancel
+            # landed. Reporting this as a cancellation would move the
+            # production order to CANCELLED while it is still resting.
+            if oid in self._amended_away:
+                # consume the marker; each amendment is reported once
+                self._amended_away.discard(oid)
                 continue
             # the CANCEL's own client order id, which is what the exchange's
             # reply quotes and what the order manager is waiting to hear about

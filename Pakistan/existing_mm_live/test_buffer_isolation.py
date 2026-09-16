@@ -254,6 +254,74 @@ print(f"      entry fee {fee_in:,.2f} + exit fee {fee_out:,.2f} + spread "
 print(f"      A BUFFER THAT IS ACTUALLY HELD PAYS THIS ONCE, not daily.")
 
 # ---------------------------------------------------------------------------
+# 3b. the acquisition instrumentation: how much is the free execution worth?
+# ---------------------------------------------------------------------------
+# A KNOWN BOOK, SO THE ANSWER IS ARITHMETIC AND NOT A GUESS.
+# bid 299.98 / ask 300.02, and the first print lands at 299.98 -- i.e. the
+# print was a seller hitting the bid. The model hands us 500 shares at 299.98
+# with no queue and no wait; a real market buy pays 300.02.
+b = build(500.0, 299.98, 5000)
+# replace the book with the exact touch this case needs
+b.book.o.clear()
+b.book.o["B1"] = Order("BUY", 299.98, 5000)
+b.book.o["A1"] = Order("SELL", 300.02, 5000)
+# the first print, at the bid
+first_print(b, 299.98)
+# the touch was captured as it stood at that instant
+check("the touch at acquisition was recorded",
+      b.buffer_bid == 299.98 and b.buffer_ask == 300.02)
+# the understatement, computed here from first principles
+expect = 500.0 * (300.02 - 299.98) \
+    + (fee_for(300.02, 500.0) - fee_for(299.98, 500.0))
+# and as the engine reports it
+_raw, _ex, _unf, _vwap, _mid = eod_numbers(b)
+# the engine's own expression, reached the same way the EOD block does
+got = b.buffer_qty * (b.buffer_ask - b.buffer_px) \
+    + (fee_for(b.buffer_ask, abs(b.buffer_qty))
+       - fee_for(b.buffer_px, abs(b.buffer_qty)))
+# they must agree exactly
+check("free-acquisition value == qty x (ask - print) + the fee difference",
+      abs(got - expect) < 1e-9)
+# and it must be positive here, because the print was below the ask
+check("positive when the print was below the ask", got > 0)
+# print it, so the run states the size of the thing rather than implying it
+print(f"      bid 299.98 / ask 300.02, print at the bid: a market buy would")
+print(f"      have paid {got:,.2f} PKR more for 500 shares. Per day.")
+
+# THE OTHER DIRECTION. The print lands AT the ask, so the model paid what a
+# market order would have and the value is (bar the fee term) zero. This is
+# the case that must not be clamped away.
+b = build(500.0, 299.98, 5000)
+b.book.o.clear()
+b.book.o["B1"] = Order("BUY", 299.98, 5000)
+b.book.o["A1"] = Order("SELL", 300.02, 5000)
+# a print at the ask: a buyer lifted the offer
+first_print(b, 300.02)
+# the value is zero, because print and ask are the same price
+got2 = b.buffer_qty * (b.buffer_ask - b.buffer_px) \
+    + (fee_for(b.buffer_ask, abs(b.buffer_qty))
+       - fee_for(b.buffer_px, abs(b.buffer_qty)))
+# exactly zero, not approximately
+check("zero when the print was AT the ask (nothing was given away)",
+      abs(got2) < 1e-9)
+
+# A ONE-SIDED BOOK HAS NO ANSWER, and the engine must not invent one.
+b = build(500.0, 299.98, 5000)
+b.book.o.clear()
+# bids only: no ask to compare against
+b.book.o["B1"] = Order("BUY", 299.98, 5000)
+# the first print
+first_print(b, 299.98)
+# the ask is None, so the measurement is unavailable rather than wrong
+check("one-sided book -> no ask recorded, nothing assumed",
+      b.buffer_ask is None and b.buffer_bid == 299.98)
+# and the buffer was still bought and paid for -- a missing ask must not stop
+# the acquisition itself, only the measurement of what it was worth
+check("one-sided book still books the buffer at the print",
+      b.buffer_px == 299.98
+      and abs(b.cash - (-500.0 * 299.98 - fee_for(299.98, 500.0))) < 1e-9)
+
+# ---------------------------------------------------------------------------
 # 4. an arm with no buffer is untouched
 # ---------------------------------------------------------------------------
 # no opening inventory: the original behaviour

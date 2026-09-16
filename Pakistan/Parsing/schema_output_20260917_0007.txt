@@ -1,0 +1,146 @@
+==============================================================================
+PARSED STORE SCHEMA -- read from the parquet footers
+==============================================================================
+generated : 2026-09-17 00:07:14
+store     : /Users/shazzak/HFT Data/Pakistan/Capital Stake - Parsed
+nulls     : yes (data read)
+
+This file is GENERATED. Do not hand-edit it, and do not trust
+any copy that does not name the partition it was read from.
+
+TWO SCHEMAS, BOTH CORRECT. The store is hive-partitioned, so a
+DATASET read of <table>/** synthesises the partition keys below
+as ordinary columns, while a direct read of the FILE does not
+have them. The column lists here are the FILE schema; the
+partition keys are named per table so the difference is stated
+rather than discovered by a crash.
+
+==============================================================================
+Table: trades
+  tick-level trades (UA202 ExecType=F)
+  source file : 2026-06-30_trades.parquet
+  full path   : /Users/shazzak/HFT Data/Pakistan/Capital Stake - Parsed/trades/date=2026-06-30/2026-06-30_trades.parquet
+  rows        : 418,794
+  columns     : 20  (in the FILE)
+  partition   : date = 2026-06-30  (from the PATH, not the footer)
+  -> a hive-partitioned dataset read shows 21 columns: these 20 plus date.
+
+ i      column_name           column_type  pct_null  all_null
+ 0    transact_time timestamp[us, tz=UTC]      0.00     False
+ 1     sending_time timestamp[us, tz=UTC]      0.00     False
+ 2       capture_ts timestamp[us, tz=UTC]      0.00     False
+ 3          msg_seq                 int64      0.00     False
+ 4         appl_seq                 int64      0.00     False
+ 5          channel                 int64      0.00     False
+ 6          segment                string      0.00     False
+ 7           market                string      0.00     False
+ 8   exec_type_code                string      0.00     False
+ 9        exec_type                string      0.00     False
+10        exec_inst                string     95.38     False
+11           symbol                string      0.00     False
+12            price                double      0.00     False
+13              qty                double      0.00     False
+14          buy_ref                 int64      0.00     False
+15         sell_ref                 int64      0.00     False
+16      resting_ref                 int64      0.64     False
+17 resting_order_id                string     72.45     False
+18        initiator                string      0.05     False
+19   aggressor_side                string      0.05     False
+
+==============================================================================
+Table: ob_updates
+  order adds and cancels (UA201, UA202 ExecType=4)
+  source file : 2026-06-30_ob_updates.parquet
+  full path   : /Users/shazzak/HFT Data/Pakistan/Capital Stake - Parsed/ob_updates/date=2026-06-30/2026-06-30_ob_updates.parquet
+  rows        : 2,153,287
+  columns     : 22  (in the FILE)
+  partition   : date = 2026-06-30  (from the PATH, not the footer)
+  -> a hive-partitioned dataset read shows 23 columns: these 22 plus date.
+
+ i    column_name           column_type  pct_null  all_null
+ 0  transact_time timestamp[us, tz=UTC]      0.00     False
+ 1   sending_time timestamp[us, tz=UTC]      0.00     False
+ 2     capture_ts timestamp[us, tz=UTC]      0.00     False
+ 3        msg_seq                 int64      0.00     False
+ 4       appl_seq                 int64      0.00     False
+ 5        channel                 int64      0.00     False
+ 6        segment                string      0.00     False
+ 7         market                string      0.00     False
+ 8          event                string      0.00     False
+ 9 exec_type_code                string     60.23     False
+10      exec_type                string     60.23     False
+11      exec_inst                string    100.00      True
+12         symbol                string      0.00     False
+13      side_code                string      0.00     False
+14           side                string      0.00     False
+15          price                double      0.18     False
+16            qty                double      0.00     False
+17       order_id                string      0.18     False
+18        buy_ref                 int64     60.23     False
+19       sell_ref                 int64     60.23     False
+20    resting_ref                 int64     60.23     False
+21    raw_last_px                double     60.23     False
+
+==============================================================================
+Table: ob_snapshot
+  full order-book snapshots (35=W)
+  source file : 2026-06-30_ob_snapshot.parquet
+  full path   : /Users/shazzak/HFT Data/Pakistan/Capital Stake - Parsed/ob_snapshot/date=2026-06-30/2026-06-30_ob_snapshot.parquet
+  rows        : 33,044,340
+  columns     : 27  (in the FILE)
+  partition   : date = 2026-06-30  (from the PATH, not the footer)
+  -> a hive-partitioned dataset read shows 28 columns: these 27 plus date.
+
+ i       column_name           column_type  pct_null  all_null
+ 0     snapshot_time timestamp[us, tz=UTC]      0.00     False
+ 1         orig_time timestamp[us, tz=UTC]      0.00     False
+ 2        capture_ts timestamp[us, tz=UTC]      0.00     False
+ 3           msg_seq                 int64      0.00     False
+ 4           channel                 int64      0.00     False
+ 5           segment                string      0.00     False
+ 6            market                string      0.00     False
+ 7            symbol                string      0.00     False
+ 8    trading_status                string      0.00     False
+ 9             phase                string      0.00     False
+10 suspended_all_day                  bool      0.38     False
+11      break_reason                string     99.93     False
+12        prev_close                double      0.00     False
+13        num_trades                 int64      0.00     False
+14        cum_volume                double      0.00     False
+15         cum_value                double      0.00     False
+16   entry_type_code                string      0.00     False
+17        entry_type                string      0.00     False
+18             level                 int64      0.38     False
+19                px                double      0.00     False
+20               qty                double      0.38     False
+21 n_orders_at_level                 int64      0.38     False
+22 n_orders_detailed                 int64     54.53     False
+23         order_ids                string     54.53     False
+24        order_qtys                string     54.53     False
+25   visible_qty_sum                double     54.53     False
+26  is_xf_tick_floor                  bool     96.47     False
+
+==============================================================================
+Table: other/misc
+  heartbeats, session status, news, everything else
+  source file : 2026-06-30_misc.parquet
+  full path   : /Users/shazzak/HFT Data/Pakistan/Capital Stake - Parsed/misc/date=2026-06-30/2026-06-30_misc.parquet
+  rows        : 404,086
+  columns     : 12  (in the FILE)
+  partition   : date = 2026-06-30  (from the PATH, not the footer)
+  -> a hive-partitioned dataset read shows 13 columns: these 12 plus date.
+
+ i    column_name           column_type  pct_null  all_null
+ 0     capture_ts timestamp[us, tz=UTC]      0.00     False
+ 1   sending_time timestamp[us, tz=UTC]      0.00     False
+ 2      orig_time timestamp[us, tz=UTC]     90.55     False
+ 3        msg_seq                 int64      0.00     False
+ 4       msg_type                string      0.00     False
+ 5        channel                 int64      0.82     False
+ 6        segment                string     93.55     False
+ 7      n_streams                 int64     90.55     False
+ 8  appl_last_seq                 int64     64.60     False
+ 9 end_of_channel                 int64    100.00      True
+10 heartbeat_time timestamp[us, tz=UTC]     64.60     False
+11            raw                string      0.00     False
+

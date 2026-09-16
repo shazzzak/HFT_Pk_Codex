@@ -778,6 +778,17 @@ class Backtester:
         self.buffer_qty = self.pos
         # the price it was acquired at; None until the first print sets it
         self.buffer_px = None
+        # THE TOUCH AT THE MOMENT OF ACQUISITION. Recorded so the claim "this
+        # acquisition is better than any real execution" becomes a number
+        # instead of an assertion. The buffer is booked at the PRINT price,
+        # whichever side that print was on; a real market buy pays the ASK.
+        # The gap between them, times the size, is what the model hands us for
+        # free every day. None on a one-sided book, where there is no ask to
+        # compare against and the honest answer is "not measurable here".
+        # best bid at the instant the buffer was paid for
+        self.buffer_bid = None
+        # best ask at that instant -- the price a market buy would have paid
+        self.buffer_ask = None
         self.cash = 0.0  # our running cash in PKR (signed). Fills add/subtract price*qty and deduct fees.
         self.fills, self.equity = [], []  # accounting logs: fills = every trade we got; equity = mark-to-market curve (one row per event). Returned as DataFrames by run().
         self.eod = None        # EOD book-walk liquidation report (filled once, at session end).
@@ -1302,6 +1313,12 @@ class Backtester:
         # price is not known until the market has printed something. Charged
         # like any other purchase: cash out at the price, plus the per-side fee.
         if self._buffer_unpaid:
+            # THE TOUCH, READ BEFORE THE CASH MOVES. This is the pre-event
+            # book: run() calls _on_market_trade before applying the trade to
+            # the book, so bbo() here is the book the print hit, which is the
+            # book a real order would have faced. Read first so nothing below
+            # can disturb it.
+            _bbid, _, _bask, _ = self.book.bbo()
             # cash moves opposite to the position, at the first traded price
             self.cash -= self.pos * _px_now
             # and the buy pays the same fee schedule every other fill pays
@@ -1309,6 +1326,10 @@ class Backtester:
             # remember WHAT WE PAID, so the sweep can strip out the stock's
             # move afterwards and leave the quoting result behind
             self.buffer_px = _px_now
+            # and what the market was showing at that instant, so the size of
+            # the free lunch can be measured rather than argued about
+            self.buffer_bid = _bbid
+            self.buffer_ask = _bask
             # paid for; never again
             self._buffer_unpaid = False
         # ARRIVAL-RATE: log this trade (ts, aggressor side, qty) for the recent-rate
@@ -1823,6 +1844,32 @@ class Backtester:
                         # None if the buffer was never paid for, which can only
                         # happen if the session produced no continuous print.
                         "buffer_px": self.buffer_px,
+                        # The touch at that instant, carried through so the
+                        # acquisition can be audited rather than trusted.
+                        "buffer_bid": self.buffer_bid,
+                        "buffer_ask": self.buffer_ask,
+                        # WHAT THE FREE ACQUISITION IS WORTH, in PKR. A real
+                        # market buy pays the ask and the fee on the ask; the
+                        # model pays the print and the fee on the print. Both
+                        # terms are included -- the fee is ad-valorem, so a
+                        # cheaper price is also a cheaper fee, and leaving that
+                        # out would understate the understatement.
+                        #
+                        # A NEGATIVE VALUE IS NOT A BUG. It means the print was
+                        # at or above the ask, so the model paid MORE than a
+                        # market order would have. That happens and it is worth
+                        # seeing, so it is not clamped at zero.
+                        #
+                        # None on a one-sided book: there is no ask to compare
+                        # against, and inventing one would be the exact kind of
+                        # silent interpolation this file exists to avoid.
+                        "buffer_acq_understated_pkr": (
+                            self.buffer_qty * (self.buffer_ask - self.buffer_px)
+                            + (fee_for(self.buffer_ask, abs(self.buffer_qty))
+                               - fee_for(self.buffer_px, abs(self.buffer_qty)))
+                            if (self.buffer_qty and self.buffer_px is not None
+                                and self.buffer_ask is not None)
+                            else None),
                         # THE DIRECTIONAL TERM: what the buffer made or lost
                         # purely because the stock moved between the first print
                         # and the close. Marked at the CLOSING MID, not at the

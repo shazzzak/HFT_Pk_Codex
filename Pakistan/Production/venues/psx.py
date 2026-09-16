@@ -200,11 +200,51 @@ class PSXVenue(Venue):
         #
         # NOTE ON WHAT THIS DOES AND DOES NOT BUY. It removes the round trip in
         # which we have cancelled and not yet replaced -- a window where we are
-        # not quoting at all. It does NOT necessarily preserve queue position:
-        # most venues send an order to the back of the queue when the price
-        # changes or the size increases, and this specification does not say
-        # what PSX does. Treat the latency saving as real and the queue saving
-        # as unverified until it is measured in UAT.
+        # not quoting at all. It does NOT buy queue position; see the three
+        # properties below, which the rulebook answers explicitly.
+        return True
+
+    # ---- what an amendment does to queue position -------------------------
+    # PSX Regulations, 8.5.2. The rulebook splits the cases, and so do these.
+    #
+    # 8.5.1(d) makes Change Former Order the ONLY modification path: 8.12.1
+    # says "the terms of an Order placed in the Trading System can only be
+    # modified through the CFO option", and 8.12.2 that it "can only modify
+    # price and volume of an unfilled/outstanding Order in whole or in parts".
+    # So there is no amend-without-CFO and no partial exemption to find.
+    #
+    # THE ONE CARVE-OUT IS A QUANTITY REDUCTION. Everything else -- any price
+    # change, any increase -- is accepted as a single message and then placed
+    # at the back of the FIFO queue for the price level it lands on. The
+    # message count halves; the priority does not survive.
+
+    @property
+    def replace_price_keeps_priority(self) -> bool:
+        # PUBLISHED, 8.5.2. A price change strips time priority: the amended
+        # order joins the back of the queue at the new price level. This is
+        # also the only answer consistent with 8.4.1's price-then-time
+        # priority -- a reprice that kept its place would let an order buy
+        # priority at a price it never queued at.
+        return False
+
+    @property
+    def replace_qty_up_keeps_priority(self) -> bool:
+        # PUBLISHED, 8.5.2. Only REDUCTION is carved out, so an increase is
+        # treated like any other modification and re-queues at the back. The
+        # asymmetry is deliberate on the exchange's part: letting size grow
+        # without cost would make a one-share order a cheap option on the
+        # front of the queue.
+        return False
+
+    @property
+    def replace_qty_down_keeps_priority(self) -> bool:
+        # PUBLISHED, 8.5.2, and consistent with 8.4.4 (a partial fill keeps
+        # priority on the remainder -- which is a reduction the market made
+        # rather than one we asked for). Reducing takes nothing from anyone
+        # behind us, so the order is amended in place and keeps its position.
+        #
+        # THIS IS THE ONLY CASE WHERE THE AMENDMENT IS FREE, and it is the
+        # reason to have the path at all.
         return True
 
     @property
