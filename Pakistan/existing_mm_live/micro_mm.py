@@ -1,6 +1,31 @@
 import math
 from collections import deque
-from mm_backtest import FEE_TOTAL_PCT
+
+# --- CHANGED 2026-09-16 -----------------------------------------------------
+# WAS:  from mm_backtest import FEE_TOTAL_PCT
+#
+# WHY:  importing mm_backtest pulls the entire backtest dependency tree into
+#       whatever process imports this file. That is free in a backtest and
+#       unacceptable in the live engine, which must start fast, hold no pandas,
+#       and have nothing on its import path that can read a results directory.
+#
+# HOW:  the import is now allowed to fail. In the backtest it succeeds and the
+#       default fee is exactly what it always was -- byte-identical behaviour.
+#       In the live engine it fails harmlessly, and the adapter passes fee_pct
+#       in explicitly from PSXVenue. If a live caller ever forgets, the
+#       constructor raises rather than inventing a fee floor (see __init__).
+#
+# CHECK: FEE_TOTAL_TREC = LAGA 0.000035 + SECP 0.0000065 + IPF 0.0000062
+#        + clearing 0.00003 = 0.0000777 per side = 0.777 bps = 1.554 bps round
+#        trip, which is what PSXVenue.fee_bps_per_side carries. A test in the
+#        production tree asserts the two still agree.
+try:
+    # the same schedule the backtester charges on fills, when it is available
+    from mm_backtest import FEE_TOTAL_PCT as _BACKTEST_FEE_TOTAL_PCT
+except ImportError:
+    # not importable -- the caller must supply fee_pct (the live path)
+    _BACKTEST_FEE_TOTAL_PCT = None
+# ---------------------------------------------------------------------------
 
 
 # ============================ TRIGGER DEFAULTS (cfg-ready) ====================
@@ -153,6 +178,35 @@ class MicrostructureMM:
                  # from imbalance to convert 'through' pick-offs into 'at_queue').
                  micro_lambda=None,
                  soft_inv=None,
+                 # ---- SHORT-SALE POLICY (added 2026-09-16) ----------------
+                 # WHY THIS EXISTS. PSX Regulations 10.15 prohibits a Blank
+                 # Sale -- selling what you do not own, without Pre-Existing
+                 # Interest and without an SLB borrow -- for a Securities
+                 # Broker's own account, except a Designated Market Maker in
+                 # its Assigned Security. This strategy quotes two-sided from
+                 # flat, so it sells what it does not own. Every measured
+                 # result was produced under "unrestricted", which is the one
+                 # setting that may not be permissible.
+                 #
+                 #   "unrestricted" default. Go short freely. What was measured.
+                 #   "no_short"     never go net short: the ask is capped at the
+                 #                  shares actually held and is not quoted at all
+                 #                  when flat.
+                 #   "long_buffer"  same quoting rule; the run starts with an
+                 #                  opening long position (set on the ENGINE via
+                 #                  cfg["opening_inventory"], not here).
+                 #   "slb_uptick"   short selling allowed, but a fill that takes
+                 #                  us net short only occurs on an Uptick or
+                 #                  Zero-Plus Tick (10.16.1(a)). Enforced by the
+                 #                  ENGINE at fill time, because we cannot choose
+                 #                  the tick our resting quote executes on.
+                 short_policy="unrestricted",
+                 # Per-symbol, from NCCPL's Category A SLB-eligible list
+                 # (10.17). Only meaningful under "slb_uptick": a name that is
+                 # NOT eligible cannot be short sold at all, so it falls back to
+                 # "no_short". Default False so an unset name is treated as
+                 # ineligible rather than silently shorted.
+                 slb_eligible=False,
                  # --- EOD / LOCK triggers (OFF by default: PPL/UBL runs are
                  # unaffected unless a config explicitly enables them) ---
                  enable_eod_trigger=False, enable_lock_trigger=False,
@@ -362,6 +416,25 @@ class MicrostructureMM:
         # side that ADDS to the position, so fills can only reduce it. None disables
         # the band. Sweep {100, 150, 200}.
         self.soft_inv = soft_inv
+        # which short-sale regime this run is under; see the constructor note
+        self.short_policy = short_policy
+        # whether THIS symbol is on NCCPL's Category A SLB-eligible list
+        self.slb_eligible = bool(slb_eligible)
+        # refuse a policy nobody has implemented, at construction rather than
+        # silently quoting under the wrong regime for a whole run
+        if short_policy not in ("unrestricted", "no_short", "long_buffer",
+                                "slb_uptick"):
+            raise ValueError(
+                f"micro_mm: unknown short_policy {short_policy!r}; expected "
+                f"one of unrestricted / no_short / long_buffer / slb_uptick")
+        # THE EFFECTIVE QUOTING RULE. long_buffer quotes exactly like no_short
+        # -- the buffer is an opening position on the engine, not a different
+        # quote. And under slb_uptick a name that is not SLB-eligible cannot be
+        # short sold at all, so it also falls back to no_short. Resolved once
+        # here so the hot path reads one boolean.
+        self._cap_ask_at_position = (
+            short_policy in ("no_short", "long_buffer")
+            or (short_policy == "slb_uptick" and not self.slb_eligible))
         # Directional-pricing toggle: True = imbalance microprice (Ch 3.3); False =
         # plain mid (neutral, like naive). The microprice is the confirmed cause of
         # the short drift, so this exists to test/disable it.
@@ -386,7 +459,24 @@ class MicrostructureMM:
         # Fee floor for quoting decisions. Defaults to the SAME schedule the
         # backtester charges on fills -- one source of truth. Pass explicitly
         # only to run what-if scenarios (e.g. MM-programme fee relief).
-        self.fee_pct = FEE_TOTAL_PCT if fee_pct is None else fee_pct
+        # --- CHANGED 2026-09-16: was a one-liner reading FEE_TOTAL_PCT directly.
+        # See the note at the top of the file. Behaviour in the backtest is
+        # unchanged; the live engine, where mm_backtest is not importable, must
+        # pass fee_pct and gets a clear error if it forgets.
+        # an explicit fee always wins
+        if fee_pct is not None:
+            self.fee_pct = fee_pct
+        # otherwise fall back to the backtest's schedule, when it is importable
+        elif _BACKTEST_FEE_TOTAL_PCT is not None:
+            self.fee_pct = _BACKTEST_FEE_TOTAL_PCT
+        # and refuse to guess. This number is the floor the viability gate and
+        # BOTH exit fee-floors are computed from, so a wrong one does not fail
+        # loudly -- it quietly quotes inside cost all day.
+        else:
+            raise ValueError(
+                "micro_mm: fee_pct must be passed explicitly when mm_backtest "
+                "is not importable (the live engine). There is no safe default "
+                "for the fee floor -- pass PSXVenue.fee_bps_per_side / 1e4.")
         # Extra edge demanded above fees before quoting at all.
         self.min_edge_pct = min_edge_pct
         # Price grid.
@@ -1798,7 +1888,14 @@ class MicrostructureMM:
             out["BUY"] = (round(px, 2), size_buy)
         # Offer unless: trigger-killed, short at the hard cap, or short past the
         # soft band (past -soft_inv we stop selling so only the bid remains).
-        if (not trig["kill_sell"]) and pos > -eff_max \
+        # NEVER SELL WHAT WE DO NOT HOLD. Under no_short / long_buffer, and
+        # under slb_uptick for a name that is not SLB-eligible, a sale is only
+        # permissible against shares we actually own (10.15). Flat or short ->
+        # no ask at all.
+        if self._cap_ask_at_position and pos <= 0:
+            # skip the whole sell branch: nothing we may legally offer
+            pass
+        elif (not trig["kill_sell"]) and pos > -eff_max \
                 and (self.soft_inv is None or pos > -self.soft_inv):
             # Ceil onto the tick grid (again, never more aggressive).
             px = math.ceil((reservation + half_sell) / self.tick) * self.tick
@@ -1855,6 +1952,12 @@ class MicrostructureMM:
             # skew, and the OBI widen identically -- nothing can cross the bid.
             px = max(px, bb + self.tick)
             # SIZE THROTTLE: cut SELL clip while throttled (>=1 share).
+            # THE CAP, applied before every other size adjustment so nothing
+            # below can push it back above what we hold. Safe under one order
+            # per side: a partial fill reduces our position and the order's
+            # remaining size by the SAME amount, so an ask sized at the
+            # position stays sized at the position.
+            size = min(size, float(pos)) if self._cap_ask_at_position else size
             size_sell = max(1.0, round(size * self.throttle_frac)) \
                 if sell_throttled else size
             # SIZE SKEW: boost the favorable ask when not throttled (throttle wins).

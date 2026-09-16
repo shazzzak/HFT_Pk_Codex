@@ -50,9 +50,9 @@ from collections import deque
 # typing only
 from typing import Callable, Deque, Optional, Sequence
 # the shared domain
-from core.model import Action, PlaceOrder, Side
+from core.model import Action, OrderRequest, Side
 # venue rules and price bands
-from core.venue import PriceBand, Venue
+from core.venue import MarketPhase, PriceBand, SecurityPhase, Venue
 
 
 # ---------------------------------------------------------------------------
@@ -238,15 +238,36 @@ class KillSwitchCheck(RiskCheck):
 
 
 class TradingWindowCheck(RiskCheck):
-    """SECP s7. No algorithmic orders outside continuous trading.
+    """Quote only while the exchange is actually matching, continuously.
 
-    The venue owns the session definition, including any mid-day break, so this
-    control is venue-agnostic.
+    TWO SOURCES, AND THE EXCHANGE'S OWN WINS.
+
+    A CALENDAR is a guess about the future written down in advance. It cannot
+    know that the market halted two minutes ago, or that this particular
+    security is suspended for the day. It will report the market open while the
+    exchange has stopped matching, and the engine will quote into a market that
+    is not there.
+
+    THE PUBLISHED PHASE is the exchange saying what it is doing. PSX puts it in
+    TradingPhaseCode (tag 8538) on the Trading Session Status message every
+    three seconds, and on every snapshot -- so it also covers halts, resumptions
+    and per-security suspensions, none of which a calendar contains.
+
+    So: when a phase provider is wired in, it decides. The calendar remains as
+    the fallback for a replay harness or a session where the feed is absent.
+
+    AN UNKNOWN PHASE IS A REJECTION, NOT A PASS. Before the first Trading
+    Session Status arrives we do not know what the market is doing, and "we have
+    not been told" is not a reason to start quoting. That means the engine will
+    not quote for up to three seconds after connecting, which is correct.
     """
 
-    def __init__(self, venue: Venue):
-        # the venue whose calendar decides the answer
+    def __init__(self, venue: Venue,
+                 phase_provider: Optional[Callable[[str], "SecurityPhase"]] = None):
+        # the venue whose calendar is the fallback
         self._venue = venue
+        # returns the exchange's published state for a symbol, when we have it
+        self._phase_provider = phase_provider
 
     @property
     def name(self) -> str:
@@ -254,13 +275,37 @@ class TradingWindowCheck(RiskCheck):
         return "trading_window"
 
     def evaluate(self, action: Action, ctx: RiskContext) -> RiskDecision:
-        # ask the venue whether continuous trading is open right now
+        # THE EXCHANGE'S OWN STATEMENT, where we have it
+        if self._phase_provider is not None:
+            # what it says about this instrument right now
+            state = self._phase_provider(action.symbol)
+            # no state yet means we have not been told, which is not permission
+            if state is None:
+                return RiskDecision.reject(
+                    self.name, f"no trading phase received for {action.symbol} "
+                               f"yet; not quoting until the exchange says the "
+                               f"market is open")
+            # a suspended security cannot trade however open the market is
+            if state.suspended_all_day:
+                return RiskDecision.reject(
+                    self.name, f"{action.symbol} is suspended for the day")
+            # anything but continuous matching
+            if not state.phase.is_tradeable:
+                # name the break reason when the exchange gave one
+                extra = f" ({state.break_reason})" if state.break_reason else ""
+                return RiskDecision.reject(
+                    self.name, f"market phase is {state.phase.value}{extra}, "
+                               f"not continuous matching")
+            # the exchange says it is matching
+            return RiskDecision.allow(self.name,
+                                      f"phase {state.phase.value}")
+        # FALLBACK: the calendar, for a replay or a feedless session
         if not self._venue.is_continuous(ctx.date, ctx.timestamp_ms):
             return RiskDecision.reject(
                 self.name, f"{ctx.timestamp_ms} is outside continuous trading "
-                           f"on {ctx.date}")
-        # inside the session
-        return RiskDecision.allow(self.name)
+                           f"on {ctx.date} (calendar; no live phase feed)")
+        # inside the session according to the calendar
+        return RiskDecision.allow(self.name, "calendar; no live phase feed")
 
 
 class PriceBandCheck(RiskCheck):
@@ -289,8 +334,9 @@ class PriceBandCheck(RiskCheck):
         return "price_band"
 
     def evaluate(self, action: Action, ctx: RiskContext) -> RiskDecision:
-        # only order placements carry a price
-        if not isinstance(action, PlaceOrder):
+        # only order requests carry a price -- an AMENDMENT is one, and
+        # is judged exactly as a new order is
+        if not isinstance(action, OrderRequest):
             return RiskDecision.allow(self.name)
         # the exchange's published limits, if it has published any
         band: Optional[PriceBand] = self._venue.price_band(action.symbol)
@@ -337,8 +383,8 @@ class OrderValueCheck(RiskCheck):
         return "order_value"
 
     def evaluate(self, action: Action, ctx: RiskContext) -> RiskDecision:
-        # only placements have a value
-        if not isinstance(action, PlaceOrder):
+        # only order requests have a value; an amendment can raise it
+        if not isinstance(action, OrderRequest):
             return RiskDecision.allow(self.name)
         # price x size against the ceiling
         if action.notional_minor > self._max:
@@ -365,8 +411,8 @@ class OrderQuantityCheck(RiskCheck):
         return "order_quantity"
 
     def evaluate(self, action: Action, ctx: RiskContext) -> RiskDecision:
-        # only placements have a size
-        if not isinstance(action, PlaceOrder):
+        # only order requests have a size; an amendment can raise it
+        if not isinstance(action, OrderRequest):
             return RiskDecision.allow(self.name)
         # compare against the ceiling
         if action.quantity > self._max:
@@ -399,8 +445,9 @@ class PositionLimitCheck(RiskCheck):
         return "position_limit"
 
     def evaluate(self, action: Action, ctx: RiskContext) -> RiskDecision:
-        # only placements can change inventory
-        if not isinstance(action, PlaceOrder):
+        # only order requests change inventory; an amendment that
+        # increases quantity does so exactly as a new order would
+        if not isinstance(action, OrderRequest):
             return RiskDecision.allow(self.name)
         # where the position lands if this order fills entirely
         worst_case = ctx.position + action.side.sign * action.quantity

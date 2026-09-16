@@ -120,13 +120,28 @@ position is close to the whole game.
 repost it. **It is set to 0.0 in the production config.** No hysteresis at all: any recomputation
 that moves the desired price by one paisa cancels and reposts.
 
-And here is why this has gone unnoticed. **A backtest whose fill model does not simulate queue
-position cannot see this cost at all.** Ours does not. In the backtest, a quote resting for ten
-minutes and a quote posted one millisecond ago fill identically. Live, they do not. So the
-backtest is structurally incapable of charging us for churn — and the measured edge is
-capture-driven, which is exactly the kind of edge an optimistic fill model flatters.
+> **CORRECTED 2026-09-16. The three paragraphs that stood here were wrong.** They said the
+> backtest's fill model does not simulate queue position and therefore cannot charge us for
+> churn. They were written without opening `mm_backtest.py`.
+>
+> `MyOrder.ahead` is an order-id → qty dict of everything resting at our price when we arrived,
+> built from order-level data and maintained event by event: `_on_market_cancel` removes an order
+> that pulls ahead of us, `_on_market_trade` drains the pool (surgically, by `rest_oid`, when the
+> trade names its resting victim), and `_on_snapshot_queue_reset` rebuilds it conservatively after
+> a snapshot. A two-leg stochastic `LatencyModel` keeps an order fillable until its cancel lands.
+> A quote resting ten minutes and one posted a millisecond ago do **not** fill identically.
+>
+> So the queue cost of `tol_ticks = 0.0` **is already in every measured result**. It also follows
+> that the `log_fill_state` sentence below was wrong twice: that switch records `ahead_qty` — the
+> queue we wait behind — so it is logging over a queue the engine already tracks, not the other
+> side of a missing mechanism.
+>
+> **Checked and settled 2026-09-16:** `run_legacy_mm.CFG` sets
+> `at_price_mode="queue"`, and `mm_harness` builds every run from it. The exact queue is engaged.
+> The correction above stands with no caveat. See `PSX_DOC_AUDIT_20260916.md` §3.
 
-That is the same gap as the unaddressed `log_fill_state` item (C.18), seen from the other side.
+The churn ratio is still worth knowing — for the broker's session message limit, which is a real
+unknown — but not for the reason this section originally gave.
 
 ### How this is handled in the code
 
@@ -139,7 +154,11 @@ normal ratio even is.
 The reading travels in the approval's `details`, so every order that goes out records what the
 ratio was at the moment it was sent — no separate reporting path.
 
-### The measurement, which is still the right next step
+### The measurement — still worth an hour, for a different reason
+
+**Reframed 2026-09-16.** Not because the backtest is blind to churn (it is not), but because a
+broker or exchange session message cap is the one real ceiling that exists and we have not been
+told what it is.
 
 The backtest holds every quote the strategy wanted; the ratio of desired quote changes to fills
 is computable from data we already have, at no risk and with no new dependency. What the answer
@@ -235,7 +254,7 @@ Each phase is gated: it does not start until the previous one is demonstrably tr
 |---|---|---|---|
 | **0** | Measure quote churn from the existing backtest | a number, with a decision attached | nothing |
 | **1** | Risk gateway + kill switch, as pure functions | unit tests incl. every rejection path; kill switch tested from a live-ish state | nothing — **DONE** |
-| **2** | OMS state machine + **simulated exchange** replaying the parsed store | engine reproduces backtest P&L on the same days, within a stated tolerance | 1 |
+| **2** | OMS state machine + **replay harness**, run TWICE — once on a constant-latency model where both sides are deterministic (the gate), once on the production stochastic model to price the ack wait. See audit §3a: a seeded RNG only reproduces if the draws happen in the same order, and the engine's cancel-then-place-later changes that order — `sim/replay.py`, which subclasses `mm_backtest.Backtester` and replaces `_requote` only, so the fill model is identical by construction (revised 2026-09-16; was "simulated exchange") | engine reproduces backtest P&L on the same days, within a stated tolerance | 1 |
 | **3** | FIX session layer against UAT | logon, heartbeat, seq recovery, deliberate disconnect → cancel-on-disconnect verified | UAT access, order-entry spec |
 | **4** | The four adverse scenarios through the Phase 2 harness | volatility, volume spike, 113 algos together, connectivity loss — each ends flat, none breaches a limit | 2, 3 |
 | **5** | **One name**, minimum clip, live, watched | a full day with no unexplained order, no breach, fills reconcile to the broker's record | 4 |
@@ -250,8 +269,10 @@ actually planning, and connectivity loss with orders resting is the most dangero
 system can reach. The harness exists from Phase 2 either way; running four scenarios through it
 is nearly free.
 
-Phase 5 is deliberately one name. The measured book is 15.4M PKR across 113 names; a single name
-at minimum clip risks almost nothing and tests every line of the system.
+Phase 5 is deliberately one name: at minimum clip it risks almost nothing and tests every line of
+the system. **Corrected 2026-09-16** — this sentence previously read "the measured book is 15.4M
+PKR across 113 names", which used a P&L figure as though it were capital. The capital at risk in
+Phase 5 is one clip on one name, and it has nothing to do with that number.
 
 ---
 
@@ -304,9 +325,10 @@ not optional after one name goes live, it is the condition for scaling past it.
 2. **Does the broker or the exchange cap session message rate?** One question, and it sets the
    number the rate limiter is coded to. With no regulator setting one, this is the only real
    ceiling that exists.
-3. **Do you want Phase 0 (the churn measurement) before I write the order manager?** My
-   recommendation is yes — it is one number from data we already have, and a bad answer changes
-   where hysteresis has to live in the OMS diff.
+3. ~~**Do you want Phase 0 (the churn measurement) before I write the order manager?**~~
+   **Overtaken 2026-09-16.** The order manager is written, and the urgency behind this question
+   rested on the queue-position error corrected in §3. What replaces it: `mm_harness.py`'s
+   `at_price_mode` (audit §3) and the broker's session message cap (item 2 above).
 
 ---
 
@@ -314,9 +336,13 @@ not optional after one name goes live, it is the condition for scaling past it.
 
 - **`micro_mm.py` `queue_skew_thresh_hi` patch** — still unapplied. It only matters if we return
   to the extreme-OBI question, which I have recommended stopping. Parked, not lost.
-- **`log_fill_state` (item C.18)** — still the most important unaddressed item for believing the
-  backtest P&L, and it becomes *more* important now, because Phase 2 reconciles the live OMS
-  against that same backtest. If the fill model flatters us, Phase 2 will reconcile perfectly
-  against a number that was never real.
-- **The shipped config assignment** (15.4M PKR, three buckets) and **`live_config.py`** are done
-  and are the inputs to [3] and [8] respectively.
+- **`log_fill_state` (item C.18)** — **reason corrected 2026-09-16.** It is not a missing piece
+  of the fill model; it logs `ahead_qty` over a queue the engine already tracks. What stands is
+  the second half: Phase 2 reconciles the engine against the backtest and cannot tell you whether
+  the backtest is right. `log_fill_state` produces every posted quote, filled or not, with the
+  circumstances it was posted into — the dataset that would answer that. Still wanted, for that.
+- **The shipped config assignment** (three buckets, 68 / 13 / 17 / 15 across 113 names) and
+  **`live_config.py`** are done. `live_config.py` has since moved into
+  `Production/venues/psx_config.py` with three changes, all marked in that source.
+  **15.4M PKR corrected 2026-09-16:** the figure verifies (15,366,558, summing each name's
+  assigned-setting P&L) but it is **P&L over 197 days, not a book** — see the audit, §4.

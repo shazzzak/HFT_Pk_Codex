@@ -229,9 +229,18 @@ def build_micro_params(clip, scale, profile, window, segments,
     return p
 
 
-def run_symbol_day(date, sym, dsets, params, want_fs=False):
+def run_symbol_day(date, sym, dsets, params, want_fs=False, cfg_overrides=None):
     # THE single backtest path every runner calls: identical loading, session
     # bounds, latency seed, and fees everywhere, so results cannot diverge.
+    #
+    # cfg_overrides (added 2026-09-16) are ENGINE settings, as distinct from
+    # `params`, which are STRATEGY settings. Needed because the short-sale and
+    # CFO work put some switches on the engine rather than the strategy:
+    #   opening_inventory        shares held at the open (long_buffer policy)
+    #   use_cfo                  one AMEND message instead of CANCEL + NEW
+    #   cfo_*_keeps_priority     the per-venue amendment priority rules
+    # Defaults to None, which reproduces R.CFG exactly, so every existing
+    # caller is unaffected.
     # the day's order-book updates for this symbol
     u = R.read_symbol(dsets["ob_updates"], R.REQ_UPDATES, sym)
     # the day's book snapshots for this symbol
@@ -253,6 +262,10 @@ def run_symbol_day(date, sym, dsets, params, want_fs=False):
     # engine config: same CFG, session bounds, seeded latency (reproducible)
     cfg = dict(R.CFG, session=(t0, t1),
                latency_model=LatencyModel(seed=R.LATENCY_SEED))
+    # engine-level overrides, applied last so a sweep can change the mechanism
+    # without touching the module-level R.CFG that every other runner shares
+    if cfg_overrides:
+        cfg.update(cfg_overrides)
     # build the production strategy with the assembled params
     strat = MicrostructureMM(session_ms=(t0, t1), **params)
     # the engine instance for this run

@@ -18,7 +18,7 @@ from core.risk import (KillSwitch, KillSwitchCheck, MessageRateCheck,
                        OrderValueCheck, PositionLimitCheck, PriceBandCheck,
                        RiskContext, RiskGateway, TradingWindowCheck)
 # the venue interface pieces
-from core.venue import PriceBand, SessionSegment
+from core.venue import MarketPhase, PriceBand, SessionSegment
 # the PSX implementation
 from venues.psx import PSXVenue, static_session_provider
 
@@ -418,3 +418,116 @@ def test_desired_quotes_absence_means_cancel_not_leave_alone():
                         bid=QuoteIntent(Side.BUY, 9_900, 100))
     assert one.side(Side.BUY) is not None
     assert one.side(Side.SELL) is None
+
+
+# --- the exchange's published phase beats any calendar ---------------------
+
+def test_an_unknown_phase_blocks_quoting(venue, ctx):
+    """Before the first Trading Session Status we have not been told anything.
+
+    "Not told" is not permission. The engine stays dark for up to one status
+    interval after connecting, which is correct.
+    """
+    # a provider that has received nothing yet
+    gw = RiskGateway([TradingWindowCheck(venue, phase_provider=lambda s: None)])
+    # nothing goes out
+    assert not gw.authorise(order(), ctx).allowed
+    # and an unrecognised code is treated the same way, never as 'probably open'
+    gw2 = RiskGateway([TradingWindowCheck(
+        venue, phase_provider=lambda s: venue.parse_phase("Z"))])
+    assert not gw2.authorise(order(), ctx).allowed
+
+
+def test_the_published_phase_overrides_the_calendar(venue, ctx):
+    """A halt at 11am is invisible to a calendar and obvious in the feed."""
+    # the calendar says this instant is inside continuous trading
+    assert venue.is_continuous(ctx.date, ctx.timestamp_ms)
+    # but the exchange says the market is halted
+    gw = RiskGateway([TradingWindowCheck(
+        venue, phase_provider=lambda s: venue.parse_phase("H0"))])
+    decision = gw.authorise(order(), ctx)
+    # the exchange wins
+    assert not decision.allowed and "HALTED" in decision.reason
+
+
+def test_a_security_suspended_for_the_day_cannot_be_quoted(venue, ctx):
+    """TradingPhaseCode 1st digit '1', carried per instrument on the snapshot."""
+    # continuous market, but this security is suspended all day
+    gw = RiskGateway([TradingWindowCheck(
+        venue, phase_provider=lambda s: venue.parse_phase("T1"))])
+    decision = gw.authorise(order(), ctx)
+    # refused, naming the reason
+    assert not decision.allowed and "suspended" in decision.reason
+
+
+def test_continuous_matching_is_the_only_tradeable_phase(venue, ctx):
+    """Call auctions accept orders; they do not match continuously."""
+    # every phase the spec defines, with whether we may quote in it
+    cases = {"T0": True, "S0": False, "O0": False, "N0": False, "V0": False,
+             "B02": False, "H0": False, "C0": False, "A0": False, "E0": False}
+    # each one, through the gateway
+    for code, should_pass in cases.items():
+        gw = RiskGateway([TradingWindowCheck(
+            venue, phase_provider=lambda s, c=code: venue.parse_phase(c))])
+        assert gw.authorise(order(), ctx).allowed is should_pass, code
+
+
+def test_the_friday_break_is_named_by_the_exchange_not_inferred(venue, ctx):
+    """'B' with 2nd digit '2' is the Jumu'ah break, straight from the feed."""
+    # the code the exchange publishes during the Friday lunch break
+    state = venue.parse_phase("B02")
+    # parsed into a phase and a human-readable reason
+    assert state.phase is MarketPhase.BREAK
+    assert state.break_reason == "Friday lunch break"
+    # and the rejection says so, so an operator reading the log understands
+    gw = RiskGateway([TradingWindowCheck(
+        venue, phase_provider=lambda s: state)])
+    assert "Friday lunch break" in gw.authorise(order(), ctx).reason
+
+
+# --- price limits: the exchange's "no limit" sentinels ---------------------
+
+def test_an_absent_price_bound_constrains_nothing():
+    """PSX publishes 999999999.9999 for 'no up limit'; None says it honestly."""
+    # a band with no upper bound
+    band = PriceBand(upper_minor=None, lower_minor=9_000)
+    # anything above passes
+    assert band.contains(99_999_999)
+    # but the lower bound still binds
+    assert not band.contains(8_999)
+    # a band with neither bound is not a band, and says so
+    assert PriceBand().is_unbounded
+
+
+# --- feed precision: never truncate a price silently -----------------------
+
+def test_parsing_a_price_refuses_to_truncate(venue):
+    """Silent rounding of a price is the quietest possible way to be wrong."""
+    # ordinary two-decimal prices round-trip exactly
+    assert venue.parse_price("100.00") == 10_000
+    assert venue.parse_price("288.68") == 28_868
+    # the feed's four- and six-decimal padding is harmless when it is zeros
+    assert venue.parse_price("288.6800") == 28_868
+    assert venue.parse_price("0.010000") == 1
+    # but real precision the minor unit cannot hold is an ERROR, not a rounding
+    with pytest.raises(ValueError):
+        venue.parse_price("100.0001")
+    # and so is a malformed value
+    with pytest.raises(ValueError):
+        venue.parse_price("1.2.3")
+    with pytest.raises(ValueError):
+        venue.parse_price("")
+    # a round trip through format_price is exact
+    for minor in (1, 70, 9_901, 10_000, 28_868):
+        assert venue.parse_price(venue.format_price(minor)) == minor
+
+
+if __name__ == "__main__":
+    # A pytest file is not a script: there is no runner, and the project root is
+    # not on the import path. Say so rather than failing with ModuleNotFoundError.
+    raise SystemExit(
+        "This is a pytest file, not a script.\n"
+        "Run the suite from the Production directory:\n"
+        "    python -m pytest -q\n"
+        "or one file:\n"
+        "    python -m pytest tests/test_audit.py -q")

@@ -15,7 +15,8 @@ the first time anyone notices is when it turns out to be wrong.
 # typing only
 from typing import Callable, Dict, Optional, Sequence
 # the venue interface and its value objects
-from core.venue import PriceBand, SessionSegment, Venue
+from core.venue import (MarketPhase, PriceBand, SecurityPhase,
+                        SessionSegment, Venue)
 
 
 class PSXVenue(Venue):
@@ -127,6 +128,116 @@ class PSXVenue(Venue):
             return None
         # the live published limits for this symbol
         return self._band_provider(symbol)
+
+    # ---- what the exchange says the market is doing -----------------------
+    # PUBLISHED. PSX FIX Market Data Interface Specification v1.05 (2 Apr 2024),
+    # TradingPhaseCode (tag 8538), published every 3 seconds on the Trading
+    # Session Status message and carried on every snapshot.
+    _PHASE_0 = {
+        # before the market opens
+        "S": MarketPhase.STARTING,
+        # pre-open call auction, morning
+        "O": MarketPhase.PRE_OPEN,
+        # pre-open call auction, afternoon after the Friday lunch break
+        "N": MarketPhase.PRE_OPEN,
+        # pre-open call auction when trading resumes after a halt
+        "V": MarketPhase.PRE_OPEN,
+        # continuous auction -- the only phase we quote in
+        "T": MarketPhase.CONTINUOUS,
+        # a scheduled break, including the Friday prayer break
+        "B": MarketPhase.BREAK,
+        # an unscheduled halt or a security suspension
+        "H": MarketPhase.HALTED,
+        # pre-close call auction (the spec marks this reserved)
+        "C": MarketPhase.PRE_CLOSE,
+        # after-hours trading
+        "A": MarketPhase.POST_CLOSE,
+        # shut
+        "E": MarketPhase.CLOSED,
+    }
+    # the 2nd digit, revealed only when the market is on a break
+    _BREAK_REASON = {
+        "1": "after pre-open",
+        "2": "Friday lunch break",
+        "3": "after the afternoon pre-open on Friday",
+        "4": "market close before post-close",
+    }
+
+    def parse_phase(self, code: str) -> SecurityPhase:
+        # a missing code is not an open market
+        if not code:
+            return SecurityPhase(phase=MarketPhase.UNKNOWN)
+        # 0th digit: what the market as a whole is doing. An unrecognised
+        # letter maps to UNKNOWN, which the risk gateway treats as closed --
+        # a code we cannot read is never assumed to mean 'open'.
+        phase = self._PHASE_0.get(code[0], MarketPhase.UNKNOWN)
+        # 1st digit: '1' means THIS SECURITY is suspended for the whole day.
+        # Carried on the snapshot, so it is per instrument, not per market.
+        suspended = len(code) > 1 and code[1] == "1"
+        # 2nd digit: why the break, revealed only when the 0th digit is 'B'
+        reason = (self._BREAK_REASON.get(code[2])
+                  if phase is MarketPhase.BREAK and len(code) > 2 else None)
+        # the complete state of this instrument
+        return SecurityPhase(phase=phase, suspended_all_day=suspended,
+                             break_reason=reason)
+
+    @property
+    def feed_price_decimals(self) -> int:
+        # PUBLISHED. Market Data spec v1.05, Data Dictionary: Price is N13(4)
+        # and MDEntryPx is N18(6). The regular market's TICK is 0.01, so equity
+        # prices arrive with trailing zeros -- but the FIELD carries more, and
+        # index values use the full six. parse_price() refuses to truncate
+        # anything the minor unit cannot hold rather than rounding it away.
+        return 6
+
+    # ---- what the wire will and will not accept ---------------------------
+    @property
+    def supports_replace(self) -> bool:
+        # PUBLISHED. PSX FIX Specification v1.2, "Order Cancel Replace Request"
+        # (MsgType 'G'): "Cancel/Replace will be used to change any valid
+        # attribute of an open order (i.e. reduce/increase quantity, change
+        # limit price, change instructions, etc.)"
+        #
+        # NOTE ON WHAT THIS DOES AND DOES NOT BUY. It removes the round trip in
+        # which we have cancelled and not yet replaced -- a window where we are
+        # not quoting at all. It does NOT necessarily preserve queue position:
+        # most venues send an order to the back of the queue when the price
+        # changes or the size increases, and this specification does not say
+        # what PSX does. Treat the latency saving as real and the queue saving
+        # as unverified until it is measured in UAT.
+        return True
+
+    @property
+    def requires_account(self) -> bool:
+        # PUBLISHED. PSX FIX Specification v1.2, New Order Single: Account
+        # (tag 1) is Required = Y, and carries the "Client Code" agreed between
+        # broker and exchange. Without it every order is rejected.
+        return True
+
+    @property
+    def prohibited_chars(self) -> frozenset:
+        # PUBLISHED. PSX FIX Specification v1.2, Appendix C. These are rejected
+        # by the FIX engine in Account (1), Symbol (55), ClOrdID (11),
+        # OrderID (37), Price (44), StopPx (99) and LastPx (31).
+        #
+        # The '.' is listed as prohibited WITH AN EXCEPTION: price fields may
+        # carry exactly one. It is therefore excluded from this set and the
+        # single-occurrence rule is enforced in format_price() below, where the
+        # only '.' this engine ever emits is produced.
+        return frozenset(";|`~#^'%*,?")
+
+    def format_price(self, price_minor: int) -> str:
+        # paisa to rupees: the integer is exact, and dividing by 100 by string
+        # surgery rather than by float arithmetic keeps it exact
+        if price_minor < 0:
+            raise ValueError(f"PSX: price_minor must not be negative, got "
+                             f"{price_minor}")
+        # whole rupees
+        major = price_minor // self.minor_per_major
+        # the remainder, zero-padded to the currency's two decimal places
+        minor = price_minor % self.minor_per_major
+        # exactly one '.', which is what Appendix C's exception permits
+        return f"{major}.{minor:02d}"
 
     # ---- order tagging ----------------------------------------------------
     @property

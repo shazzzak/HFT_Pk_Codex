@@ -531,6 +531,13 @@ class MyOrder:
     ahead: dict
     t_active: int
     cancel_at: int = None
+    # AMENDMENT IN FLIGHT (added 2026-09-16). exchange-ms when our in-flight
+    # CFO lands, or None. Deliberately SEPARATE from cancel_at, which gates
+    # fills: a cancel stops the exchange matching us, an amendment does not --
+    # the old terms stay fully live until the new ones arrive. This field
+    # exists only so _requote knows not to send a second amendment for a
+    # reprice that is already on the wire.
+    amend_at: int = None
     oid: int = 0       # unique id: cancels target THIS order, not just the side
     # TAKER FLAG (default False = a normal passive quote). When True AND the
     # engine's allow_taker flag is on, an order that CROSSES the touch executes
@@ -608,6 +615,31 @@ class Backtester:
                    'always' full fill (optimistic upper bound)
                    Run all three to bracket results.
 
+      ---- CHANGE FORMER ORDER (CFO), added 2026-09-16 --------------------
+      use_cfo      False (default) -> a reprice is a CANCEL plus a NEW order,
+                   two messages with two independent latency draws. This is
+                   the original behaviour and is byte-identical when off.
+                   True -> ONE message amends the resting order in place.
+                   PSX Regulations 8.5.1(d) names this order type "Change
+                   Former Order (CFO)"; 8.12.1 makes it the ONLY way to
+                   modify an order's terms.
+
+      WHAT AN AMENDMENT DOES TO QUEUE POSITION IS A PER-VENUE RULE, so it is
+      three flags rather than one. PSX Regulations 8.5.2:
+
+        "Modification of price in CFO shall be subject to fill allocation
+         priorities, however, reduction of bid/offer quantity shall not be
+         subject to the fill allocation priorities."
+
+      cfo_price_keeps_priority     PSX: False. A price change re-queues.
+      cfo_qty_down_keeps_priority  PSX: True.  A size REDUCTION is carved out
+                                   of the priority rule and holds its place.
+      cfo_qty_up_keeps_priority    PSX: False. Only reduction is carved out,
+                                   so an increase re-queues.
+
+      A venue that preserves priority on a reprice is expressed by flipping
+      cfo_price_keeps_priority to True -- nothing else changes.
+
     Internal state:
       work     side -> MyOrder: at most ONE working order per side.
       pending  min-heap of our in-flight messages (t, seq, action, payload);
@@ -632,6 +664,44 @@ class Backtester:
         # with end_reason to give an unbiased fill-probability dataset: every
         # posted quote, filled or not, with the circumstances it was posted into.
         self.log_fill_state = bool(getattr(strategy, "log_fill_state", False))
+        # ---- CFO (Change Former Order), added 2026-09-16 ------------------
+        # Off by default: with use_cfo False nothing below this line executes
+        # and the engine is byte-identical to the cancel-plus-new original.
+        # master switch: one AMEND message instead of a CANCEL plus a NEW.
+        # Absent from cfg -> False -> nothing in the CFO path ever executes.
+        self.use_cfo = bool(cfg.get("use_cfo", False))
+        # ---- SHORT-SALE POLICY, added 2026-09-16 -------------------------
+        # read off the strategy, the same way allow_taker and log_fill_state
+        # are, so ONE variable drives quoting and execution together.
+        self.short_policy = getattr(strategy, "short_policy", "unrestricted")
+        # is this symbol on NCCPL's Category A SLB-eligible list (10.17)?
+        self.slb_eligible = bool(getattr(strategy, "slb_eligible", False))
+        # THE UPTICK GATE IS ON only for an SLB-eligible name under the
+        # slb_uptick policy. Every other combination either forbids shorting
+        # in the quote (no_short / long_buffer / ineligible) or permits it
+        # outright (unrestricted), and in both cases there is nothing to gate.
+        self.enforce_uptick = (self.short_policy == "slb_uptick"
+                               and self.slb_eligible)
+        # last executed price seen on the tape, for the tick test. None until
+        # the first print, and an unknown tick is NOT treated as an uptick.
+        self._last_exec_px = None
+        # direction of the last price CHANGE: +1 up, -1 down, 0 not yet known.
+        # Zero-Plus Tick is defined off this, not off the last trade.
+        self._last_tick_dir = 0
+        # PSX 8.5.2: "Modification of price in CFO shall be subject to fill
+        # allocation priorities" -- a reprice goes to the back of the queue.
+        # False is therefore the PSX default; True is for a venue that holds.
+        self.cfo_price_keeps_priority = bool(
+            cfg.get("cfo_price_keeps_priority", False))
+        # PSX 8.5.2 continued: "...however, reduction of bid/offer quantity
+        # shall not be subject to the fill allocation priorities." A size cut
+        # is explicitly carved out, so it KEEPS its place -> default True.
+        self.cfo_qty_down_keeps_priority = bool(
+            cfg.get("cfo_qty_down_keeps_priority", True))
+        # Only REDUCTION is carved out by 8.5.2, so an increase is subject to
+        # the priority rule like any other modification -> default False.
+        self.cfo_qty_up_keeps_priority = bool(
+            cfg.get("cfo_qty_up_keeps_priority", False))
         # ARRIVAL-RATE buffer (only maintained when log_fill_state is on): a
         # trailing list of (ts_ms, side, qty) for EVERY continuous-market trade,
         # so _arrive can estimate the recent side-signed trade arrival rate the
@@ -672,7 +742,28 @@ class Backtester:
         self.use_ack = 'latency_model' in cfg  # ack-realism gate: only enforce the "don't restack an unconfirmed side" rule in stochastic mode (when a real LatencyModel was given).
         self.pending = []  # min-heap of OUR in-flight messages (orders/cancels traveling to the exchange). Ordered by land-time.
         self._seq = 0  # monotonic counter: breaks ties in the heap FIFO AND stops heapq from ever comparing MyOrder payloads.
-        self.pos = 0.0  # our current position in shares (signed: + long, - short). Updated on every fill.
+        # OPENING INVENTORY. Under the long_buffer policy the day starts with
+        # shares already held, so every sale is a sale of stock we own and no
+        # Blank Sale is ever made (PSX 10.15). 0 everywhere else, which is the
+        # original behaviour.
+        #
+        # CORRECTED 2026-09-16. The first version set this position and left
+        # cash at zero, with a comment claiming that was deliberate. It was
+        # wrong. The engine liquidates the closing position into the book, so
+        # starting with 1,000 shares and never paying for them books the entire
+        # sale proceeds as profit -- about 289,000 PKR of phantom P&L on a
+        # Rs 289 name, which would have made long_buffer look like the best
+        # policy by a mile for a reason having nothing to do with policy.
+        #
+        # THE BUFFER IS BOUGHT, not conjured. It is acquired at the first
+        # market print of the day (see _acquire_buffer), cash is debited and
+        # the fee is charged. That makes the buffer's intraday price move a
+        # real cost carried by the run -- which it is: holding inventory to
+        # stay on the right side of 10.15 is a directional exposure, and a
+        # comparison that hides it is not a comparison.
+        self.pos = float(cfg.get("opening_inventory", 0.0))
+        # True until the buffer has been paid for; False when there is none
+        self._buffer_unpaid = self.pos != 0.0
         self.cash = 0.0  # our running cash in PKR (signed). Fills add/subtract price*qty and deduct fees.
         self.fills, self.equity = [], []  # accounting logs: fills = every trade we got; equity = mark-to-market curve (one row per event). Returned as DataFrames by run().
         self.eod = None        # EOD book-walk liquidation report (filled once, at session end).
@@ -684,7 +775,14 @@ class Backtester:
         self._olog = {}
         # outbound MESSAGE timestamps (order sends + cancel sends) for msgs/sec
         self._msg_ts = []
-        self.stats = {"rejected_crossing": 0, "n_orders_sent": 0, "n_cancels": 0,
+        self.stats = {
+                      # how many short-taking fills the uptick rule refused.
+                      # Declared here rather than beside the other short-sale
+                      # state because self.stats does not exist yet up there.
+                      # A run can then show what the constraint COST in fills,
+                      # not only what it did to P&L.
+                      "short_fills_blocked_by_uptick": 0,
+                      "rejected_crossing": 0, "n_orders_sent": 0, "n_cancels": 0,
                       # diagnostic counters, all start at 0:
                       "stale_cancels_ignored": 0, "requotes_blocked_by_ack": 0,
                       # rejected_crossing = post-only rejects; n_orders_sent/n_cancels = message counts;
@@ -707,6 +805,7 @@ class Backtester:
         event to the gateway, so we assume we lost the race.
 
         ARRIVE -> _arrive() (may still be rejected as crossing)
+        AMEND  -> _amend()  (a CFO; rejected if the target already filled)
         CANCEL -> remove the working order; if a fill already consumed it
                   (self.work.get returns None) the cancel is simply void —
                   which is exactly what an exchange cancel-reject is.
@@ -715,6 +814,12 @@ class Backtester:
             t, _, action, p = heapq.heappop(self.pending)  # pop the earliest message off the heap. Unpack: t = land-time, _ = the _seq tiebreaker (ignored), action = "ARRIVE"/"CANCEL", p = payload.
             if action == "ARRIVE":  # this message is a NEW order reaching the exchange.
                 self._arrive(t,p)  # hand it to _arrive(), which checks if it crosses the book (reject) and otherwise makes it live + snapshots its queue position.
+            # this message is a Change Former Order reaching the exchange: it
+            # modifies a resting order in place rather than replacing it.
+            elif action == "AMEND":
+                # hand it to _amend(), which applies the new price/size and
+                # decides, per the venue's rules, what happens to queue position
+                self._amend(t, p)
             elif action == "CANCEL":  # this message is a CANCEL request reaching the exchange.
                 side, oid = p  # unpack the payload: which side, and the SPECIFIC order id this cancel was meant for.
                 o = self.work.get(side)  # look up our current working order on that side (or None if there isn't one).
@@ -727,6 +832,106 @@ class Backtester:
                         self._olog[oid]["end_reason"] = "cancelled"
                 else:  # no matching order: it was already filled, or already replaced by a newer order.
                     self.stats["stale_cancels_ignored"] += 1  # count a no-op cancel. This mirrors a real exchange CANCEL-REJECT (nothing there to cancel).
+
+    def _amend(self, t, payload):
+        """A Change Former Order reaches the exchange. ONE message, in place.
+
+        PSX Regulations 8.12.1: "The terms of an Order placed in the Trading
+        System can only be modified through the CFO option." 8.12.2: it "can
+        only modify price and volume of an unfilled/outstanding Order in whole
+        or in parts" -- so an order that has partly filled is still amendable
+        on what is left, which is why this works off o.qty (the remainder)
+        rather than the original size.
+
+        WHAT HAPPENS TO QUEUE POSITION is the whole question, and it is a
+        per-venue rule read from the three cfo_*_keeps_priority flags. On PSX
+        (8.5.2) a price change re-queues and a size reduction does not.
+
+        Priority KEPT  -> the ahead dict and t_active carry over untouched.
+                          We are the same order in the same place in the line.
+        Priority LOST  -> ahead is re-snapshotted from the book at the new
+                          price, exactly as a brand-new order's would be in
+                          _arrive. Everything resting there is now in front.
+        """
+        # unpack what _requote scheduled: which side, WHICH order generation
+        # this CFO was aimed at, the new terms, and the id the amended version
+        # will carry from here on.
+        side, oid, new_px, new_qty, new_oid = payload
+        # our current working order on that side, or None if there is none.
+        o = self.work.get(side)
+        # THE TARGET IS GONE -- it filled, or a later message already replaced
+        # it. A real exchange answers that with an Order Cancel Reject; there
+        # is nothing left to modify.
+        if o is None or o.oid != oid:
+            # count it so a run can show how often a CFO raced a fill and lost.
+            self.stats["stale_cfos_ignored"] = self.stats.get("stale_cfos_ignored", 0) + 1
+            # nothing is applied: the book is left exactly as it was.
+            return
+        # did the price move? compared against what is actually resting.
+        price_changed = (new_px != o.price)
+        # is this a REDUCTION? measured against o.qty, the REMAINING size,
+        # because 8.12.2 amends the outstanding part, not the original order.
+        qty_down = (new_qty < o.qty)
+        # is this an INCREASE? kept separate because the two follow different
+        # rules under 8.5.2.
+        qty_up = (new_qty > o.qty)
+        # A PRICE CHANGE IS JUDGED FIRST and overrides the quantity rules: a
+        # reprice moves us to a different price level, where whatever position
+        # we held in the old level's queue means nothing at all.
+        if price_changed:
+            # the venue's rule for a reprice.
+            keeps = self.cfo_price_keeps_priority
+        # same price, bigger size -- the venue's rule for an increase.
+        elif qty_up:
+            # on PSX this is False, because 8.5.2 carves out only reduction.
+            keeps = self.cfo_qty_up_keeps_priority
+        # same price, smaller size -- the carve-out in 8.5.2.
+        elif qty_down:
+            # on PSX this is True: a reduction is not subject to the rule.
+            keeps = self.cfo_qty_down_keeps_priority
+        # neither price nor size moved, so there is nothing to re-queue.
+        else:
+            # a no-op amendment cannot cost priority; _requote should not have
+            # sent one, and the no-churn check above it means it does not.
+            keeps = True
+        # WE HELD OUR PLACE: carry the queue state across unchanged.
+        if keeps:
+            # the same shares are still in front of us, order for order.
+            ahead = o.ahead
+            # and the join time is unchanged, because we never left the line.
+            t_active = o.t_active
+        # WE LOST OUR PLACE: rebuild the queue exactly as a new order would.
+        else:
+            # everything resting at the new price is now ahead of us. This is
+            # the same call _arrive makes for a brand-new order, which is the
+            # point -- a re-queued amendment IS a new order for priority.
+            ahead = self.book.qty_at(side, new_px)
+            # and we joined the line now, not when the original was sent.
+            t_active = t
+        # close the old lifecycle record, if the engine is logging them, so
+        # time-to-fill stays measured per quote VERSION rather than per order.
+        if oid in self._olog:
+            # the old version stopped existing at this instant.
+            self._olog[oid]["t_end"] = t
+            # and it ended by being amended, not filled or cancelled.
+            self._olog[oid]["end_reason"] = "amended"
+        # open a record for the amended version. t_sent and t_live are the same
+        # instant here: unlike a new order, an amendment is live the moment it
+        # lands -- it was already in the book under its previous terms.
+        self._olog[new_oid] = {"oid": new_oid, "side": side, "px": new_px,
+                               "qty": new_qty, "t_sent": t, "t_live": t,
+                               "t_end": None, "end_reason": None}
+        # replace the working order with its amended version. taker is always
+        # False: a CFO modifies a resting order and never crosses.
+        self.work[side] = MyOrder(side, new_px, new_qty, ahead, t_active,
+                                  oid=new_oid, taker=False)
+        # how many amendments actually landed this run.
+        self.stats["n_cfos"] = self.stats.get("n_cfos", 0) + 1
+        # and of those, how many held their place in the queue.
+        if keeps:
+            # if this stays at zero on a PSX run, the reductions are not firing
+            # and the flag is doing no work -- worth noticing rather than not.
+            self.stats["n_cfos_kept_priority"] = self.stats.get("n_cfos_kept_priority", 0) + 1
 
     def _arrive(self, t, o: MyOrder): # called when OUR order o reaches the exchange at time t (after its send latency). o is a MyOrder (side, price, qty, ...).
         """Our new order reaches the exchange. Two things happen:
@@ -958,8 +1163,43 @@ class Backtester:
         changed what followed.
 
         """
-        o = self.work.get(side)                       # fetch our working order on this side (the one being filled).
-        take = min(o.qty, qty)                        # we can only fill up to OUR remaining size; if the incoming qty is larger, we take our whole order, not more. This is the actual fill amount.
+        # fetch our working order on this side (the one being filled).
+        o = self.work.get(side)
+        # we can only fill up to OUR remaining size; if the incoming qty is
+        # larger, we take our whole order, not more. This is the actual fill.
+        take = min(o.qty, qty)
+        # ---- UPTICK GATE, added 2026-09-16 --------------------------------
+        # PSX Regulations 10.16.1(a): a Short Sale must be "made at an Uptick
+        # or Zero-Plus Tick". Only bites when the policy is slb_uptick AND the
+        # name is SLB-eligible; every other configuration either forbids the
+        # short in the quote or permits it outright.
+        if self.enforce_uptick and side == "SELL":
+            # would this fill actually take us NET SHORT? Selling stock we hold
+            # is an ordinary sale and the uptick rule has nothing to say about
+            # it. Only the part that goes below zero is a Short Sale.
+            if (self.pos - take) < 0:
+                # THE TICK OF *OUR* SALE, not of the print that triggered it.
+                # We transact at o.price, never at the print price (price
+                # improvement accrues to the aggressor), so o.price is what the
+                # regulation measures. On a "through" fill the print is above
+                # our ask, so the two genuinely differ and using the print
+                # would be the more permissive, wrong answer.
+                ref = self._last_exec_px
+                # an uptick: our execution price is above the last executed one
+                is_uptick = ref is not None and o.price > ref
+                # a zero-plus tick: equal to the last executed price, where the
+                # last actual move was upward
+                is_zero_plus = (ref is not None and o.price == ref
+                                and self._last_tick_dir == 1)
+                # NOT TOLD IS NOT PERMISSION: before the first print there is
+                # no reference price, so neither test can pass and the short
+                # does not happen.
+                if not (is_uptick or is_zero_plus):
+                    # count what the constraint cost us, in fills
+                    self.stats["short_fills_blocked_by_uptick"] += 1
+                    # the exchange would not have matched a short sale here, so
+                    # neither do we. The order stays resting, unchanged.
+                    return
         sgn = 1 if side == "BUY" else -1              # sign of the position change: a BUY adds shares (+1), a SELL removes them (-1).
         self.pos += sgn * take                        # update our position: +take if we bought, -take if we sold.
         self.cash += -sgn * take * o.price - fee_for(o.price, take)   # update cash: money moves OPPOSITE to position (buying spends cash, selling earns it), always at OUR limit price o.price -- then subtract the fee. Note: fee uses o.price, the price we transacted at.
@@ -1017,6 +1257,43 @@ class Backtester:
         # Auction prints have no continuous-market aggressor -> skip.
         if r.initiator == "AUCTION":
             return
+        # ---- TICK STATE, maintained on every continuous print -------------
+        # Computed BEFORE anything else uses it, because the tick of THIS
+        # trade is defined against the price of the PREVIOUS one.
+        # PSX Regulations, Chapter 1 definitions:
+        #   Uptick         "the price of a Security above the last executed
+        #                   price of that Security transacted through the
+        #                   Trading System"
+        #   Zero-Tick      the price with no difference from the last executed
+        #   Zero-Plus Tick "the price without any difference in the previous
+        #                   price of a trade of a security, WHICH WAS AN UPTICK"
+        # so a zero tick only counts as zero-PLUS when the last actual move
+        # was upward -- which is why the direction is tracked separately.
+        # the price this print executed at
+        _px_now = float(r.price)
+        # the reference the rules measure against: the previous executed price
+        _prev_exec = self._last_exec_px
+        # advance the direction only on an actual change, so a run of equal
+        # prices keeps pointing at whichever way the last real move went
+        if _prev_exec is not None and _px_now > _prev_exec:
+            # this print moved the price up
+            self._last_tick_dir = 1
+        elif _prev_exec is not None and _px_now < _prev_exec:
+            # this print moved the price down
+            self._last_tick_dir = -1
+        # remember this print as the reference for the next one
+        self._last_exec_px = _px_now
+        # ---- PAY FOR THE OPENING BUFFER, once, at the first print ---------
+        # Deferred to here rather than done in __init__ because the acquisition
+        # price is not known until the market has printed something. Charged
+        # like any other purchase: cash out at the price, plus the per-side fee.
+        if self._buffer_unpaid:
+            # cash moves opposite to the position, at the first traded price
+            self.cash -= self.pos * _px_now
+            # and the buy pays the same fee schedule every other fill pays
+            self.cash -= fee_for(_px_now, abs(self.pos))
+            # paid for; never again
+            self._buffer_unpaid = False
         # ARRIVAL-RATE: log this trade (ts, aggressor side, qty) for the recent-rate
         # estimate. Guarded -> off = no buffer maintenance (byte-identical).
         if self.log_fill_state and r.aggressor_side in ("BUY", "SELL"):
@@ -1252,6 +1529,59 @@ class Backtester:
                    cur.price == w[0] and cur.qty == w[1] and cur.cancel_at is None
             # If nothing changed, do nothing (avoid needless cancel/replace spam).
             if same:
+                continue
+            # ---- CFO PATH (use_cfo=True): ONE message instead of two -----
+            # Only when we have a live incumbent that is not already being
+            # cancelled AND we still want a quote on this side. Pulling a side
+            # entirely is a Cancel Order (8.11), not a CFO, so that falls
+            # through to the original path below.
+            # FIVE conditions, and the fifth was missing until the first real
+            # run: the switch is on, there IS an incumbent to modify, it is not
+            # already being cancelled, NO AMENDMENT IS ALREADY IN FLIGHT for
+            # it, and we still want a quote here (pulling a side is a Cancel,
+            # not a CFO).
+            #
+            # WHY THE FOURTH CONDITION IS LOAD-BEARING. Under cancel-plus-new,
+            # setting cur.cancel_at doubles as the in-flight marker: the next
+            # cycle sees it and does not cancel twice. A CFO never sets
+            # cancel_at -- the order stays live at the old terms until the
+            # amendment lands -- so without amend_at the no-churn check still
+            # sees a mismatched price, fires again, and keeps firing every
+            # cycle until the message arrives. The first smoke run showed it:
+            # 11,622 messages against 9,714 on the baseline, when one message
+            # replacing two should have sent FEWER.
+            if self.use_cfo and cur is not None and cur.cancel_at is None \
+                    and cur.amend_at is None and w is not None:
+                # one send-latency draw, because this is one message
+                a_out = self.lat.draw_out()
+                # when the amendment reaches the exchange
+                t_land = ts_know + a_out
+                # the amended version gets its own id, so a later cancel
+                # targets the right generation and the lifecycle log stays
+                # per quote-version
+                self._oid += 1
+                # record the send time so msgs/sec peaks can be computed from
+                # timestamps rather than day totals.
+                self._msg_ts.append(ts_know)
+                # count it as an order sent, so message-rate reporting stays
+                # comparable between the one-message and two-message paths.
+                self.stats["n_orders_sent"] += 1
+                # schedule the amendment to land; the payload carries the
+                # target generation (cur.oid) so a CFO that loses a race to a
+                # fill is recognised and rejected rather than misapplied.
+                self._push(t_land, "AMEND",
+                           (side, cur.oid, w[0], w[1], self._oid))
+                # MARK IT IN FLIGHT. Until this lands, no further amendment is
+                # sent for this order. Note this does NOT gate fills the way
+                # cancel_at does -- the old terms stay matchable, which is the
+                # real exposure of an amendment.
+                cur.amend_at = t_land
+                # THE OLD TERMS STAY LIVE AND FILLABLE UNTIL THIS LANDS. That
+                # is the real exposure of an amendment and the one thing that
+                # differs from cancel-plus-new, where an early-arriving
+                # replacement could cut the old order short.
+                # this side is done for this cycle: one message covers both
+                # the cancel and the replacement, so skip the two-message path.
                 continue
             # If we have a live incumbent not already being cancelled, cancel it.
             if cur is not None and cur.cancel_at is None:

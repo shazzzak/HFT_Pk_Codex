@@ -1,0 +1,33 @@
+symbol,config,reason,set_by,set_at
+# ---------------------------------------------------------------------------
+# HAND-EDITED INTRADAY OVERRIDES. Read at startup and re-read every 3 minutes.
+# Anything listed here WINS over config_assignment_*.csv for that symbol.
+# Normally this file has ZERO data rows. Delete a row to hand the name back to
+# the machine assignment -- clearing the file reverts everything.
+#
+# A row whose symbol cell starts with '#' is a comment and is ignored, so keep
+# the reason in the file rather than in your head.
+#
+# VALID config VALUES (case-insensitive, aliases accepted):
+#   QT_2t@15   aliases LEAN, LEAN15    the lean, fires past 0.15 imbalance
+#   QT_2t@20   aliases LEAN20          the lean, fires past 0.20 imbalance
+#   OBI        aliases OFF, LEANOFF    lean off, quote symmetrically
+#   DROP       aliases STOP, PULL      not quoted
+# Anything else is REJECTED and the whole file is ignored -- the last good
+# config keeps running and the rejection is logged. A typo cannot half-apply.
+#
+# A symbol here that is NOT in the assignment is rejected too. The universe is
+# decided by the refit, not at 14:00.
+#
+# The reason / set_by / set_at columns are ignored by the loader and exist only
+# so the file explains itself afterwards. Fill them in.
+#
+# EXAMPLES -- these are comments, not live rows. Copy one down and edit it.
+# TRG,DROP,earnings after close,SZ,2026-09-15 13:40
+# LUCK,OFF,index rebal, book is one-way,SZ,2026-09-15 11:05
+# BOP,LEAN20,spread widened post-halt,SZ,2026-09-15 14:20
+#
+# REMEMBER: removing a name from the ASSIGNMENT file does not stop it -- it
+# keeps running on its last setting and is logged as an ORPHAN every 3 minutes.
+# To stop a name you must write DROP against it, here or in the assignment.
+# ---------------------------------------------------------------------------

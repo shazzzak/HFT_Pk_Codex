@@ -20,6 +20,8 @@ this abstraction has to survive, drawn from the two markets in scope:
 from abc import ABC, abstractmethod
 # value objects for the session description
 from dataclasses import dataclass
+# enums, so a market phase can never be an arbitrary string
+from enum import Enum
 # typing only
 from typing import Optional, Sequence
 # the shared domain
@@ -46,18 +48,122 @@ class SessionSegment:
         return max(0, self.end_ms - self.start_ms)
 
 
+class MarketPhase(Enum):
+    """What the exchange says the market is doing, right now.
+
+    WHY THIS EXISTS RATHER THAN A CALENDAR. A calendar is a guess about the
+    future written down in advance. The exchange publishes the actual state --
+    PSX does so every three seconds in TradingPhaseCode (tag 8538) on both the
+    Trading Session Status and every snapshot -- and the published state covers
+    things a calendar cannot know: an unscheduled halt, a security suspended for
+    the day, a resumption after a halt.
+
+    A calendar cannot tell you the market halted two minutes ago. It will
+    cheerfully report that trading is open while the exchange has stopped
+    matching, and the engine will quote into a market that is not there.
+    """
+    # before the market opens
+    STARTING = "STARTING"
+    # a call auction: orders accepted, no continuous matching
+    PRE_OPEN = "PRE_OPEN"
+    # continuous matching -- THE ONLY PHASE A MARKET MAKER QUOTES IN
+    CONTINUOUS = "CONTINUOUS"
+    # a scheduled break, including the Friday prayer break
+    BREAK = "BREAK"
+    # an unscheduled halt or suspension
+    HALTED = "HALTED"
+    # a closing auction
+    PRE_CLOSE = "PRE_CLOSE"
+    # after-hours trading
+    POST_CLOSE = "POST_CLOSE"
+    # the market is shut
+    CLOSED = "CLOSED"
+    # we have not been told, or were told something we do not recognise.
+    # TREATED AS 'DO NOT TRADE'. A phase we cannot interpret is not a phase we
+    # may assume is open.
+    UNKNOWN = "UNKNOWN"
+
+    @property
+    def is_tradeable(self) -> bool:
+        """Can a resting limit order be matched right now?"""
+        # continuous matching, and nothing else
+        return self is MarketPhase.CONTINUOUS
+
+
+@dataclass(frozen=True)
+class SecurityPhase:
+    """The full state of one instrument, as the exchange publishes it."""
+    # what the market as a whole is doing
+    phase: MarketPhase = MarketPhase.UNKNOWN
+    # this instrument is suspended for the entire day
+    suspended_all_day: bool = False
+    # why the market is on a break, when it is; venue-specific detail
+    break_reason: Optional[str] = None
+
+    @property
+    def is_tradeable(self) -> bool:
+        """Both conditions have to hold: market open AND security not suspended."""
+        # a suspended security cannot trade however open the market is
+        return self.phase.is_tradeable and not self.suspended_all_day
+
+
 @dataclass(frozen=True)
 class PriceBand:
-    """The exchange's hard price limits for one instrument, right now."""
-    # the highest price the exchange will accept
-    upper_minor: int
-    # the lowest price the exchange will accept
-    lower_minor: int
+    """The exchange's hard price limits for one instrument, right now.
+
+    EITHER BOUND MAY BE ABSENT, and `None` is how that is said. A band built
+    from a sentinel taken literally is arithmetically valid and completely
+    meaningless.
+
+    THE EXCHANGE PUBLISHES BOTH BOUNDS AS ORDINARY PRICES, on every order-book
+    snapshot: MDEntryType `xe` is the upper circuit breaker and `xf` the lower.
+    So a band provider READS them. It does not derive them.
+
+    NEVER COMPUTE A BAND, EVEN THOUGH THE ARITHMETIC LOOKS EASY. On an ordinary
+    day the published pair is exactly +/-10% of the previous close and it is
+    tempting to reconstruct it -- as a cross-check, or as a fallback when a row
+    is missing. Do not. On a stock split or a reverse split the exchange bands
+    off the ADJUSTED close, so a computed band is wrong by the split ratio, on
+    the one day the price is moving and the band decides whether an order is
+    accepted. A missing row means the last published band still stands, not that
+    we should invent one.
+
+    THE TWO SENTINELS ARE NOT SYMMETRICAL, and this docstring previously said
+    they were (corrected 2026-09-16):
+
+      UP LIMIT (`xe`) has a clean sentinel: 999999999.9999 means no rise limit.
+      Null it.
+
+      DOWN LIMIT (`xf`) HAS NO UNIVERSAL SENTINEL. Its no-limit value equals the
+      market's own minimum tick, which varies by market and segment.
+      PSX_Parser_Mac.py is explicit that it "must not be hard-coded/nulled
+      blindly", and does not: it flags a suspicious value (px <= 1.0) and leaves
+      the decision downstream. Follow the parser, not a 0.01 rule -- nulling a
+      real lower band removes the only thing stopping a quote below the floor.
+
+    Both of those are edge-case guards on a value that is normally just a price.
+    """
+    # the highest price the exchange will accept, or None for no upper limit
+    upper_minor: Optional[int] = None
+    # the lowest price the exchange will accept, or None for no lower limit
+    lower_minor: Optional[int] = None
 
     def contains(self, price_minor: int) -> bool:
         """Would the exchange accept an order at this price?"""
-        # inclusive: an order exactly at the band is acceptable
-        return self.lower_minor <= price_minor <= self.upper_minor
+        # an absent bound constrains nothing
+        if self.upper_minor is not None and price_minor > self.upper_minor:
+            return False
+        # likewise below
+        if self.lower_minor is not None and price_minor < self.lower_minor:
+            return False
+        # inside every bound that exists
+        return True
+
+    @property
+    def is_unbounded(self) -> bool:
+        """True when the exchange published no usable limit at all."""
+        # worth surfacing: a band that constrains nothing is not a band
+        return self.upper_minor is None and self.lower_minor is None
 
 
 class Venue(ABC):
@@ -176,6 +282,145 @@ class Venue(ABC):
         Returns None when the venue has not published a band for this symbol
         yet -- at which point the risk gateway falls back to its own house
         band rather than letting an unbounded price through.
+        """
+
+    # ---- what the wire will and will not accept ---------------------------
+    @property
+    @abstractmethod
+    def supports_replace(self) -> bool:
+        """Can a resting order's price or size be amended in one message?
+
+        Where it is available it removes the window in which we have cancelled
+        and not yet replaced -- a window in which we are simply not quoting.
+        Where it is not, the order manager falls back to cancel-then-place.
+
+        This is a capability question with a factual answer in the venue's
+        specification, and it must never be guessed: assuming an amendment is
+        supported when it is not produces rejects on every reprice, and
+        assuming it is not costs a round trip on every reprice forever.
+        """
+
+    @property
+    @abstractmethod
+    def requires_account(self) -> bool:
+        """Must every order carry a client/account code?
+
+        PSX makes Account (tag 1) a required field on New Order Single. An
+        engine that discovers this at go-live discovers it as a reject on every
+        single order, so the order manager refuses to start without one when
+        the venue says it is needed.
+        """
+
+    @property
+    @abstractmethod
+    def prohibited_chars(self) -> frozenset:
+        """Characters the venue refuses inside identifier and text fields.
+
+        Exchanges use these as internal delimiters, so a stray one does not
+        corrupt a value -- it gets the whole message rejected, and the reject
+        arrives at the worst possible moment because the offending character is
+        usually in something generated at runtime.
+        """
+
+    def validate_text(self, value: str, field: str) -> str:
+        """Check a value the venue will see, and fail NOW rather than on reject.
+
+        Called where an identifier is generated, not where it is encoded, so a
+        bad one never reaches an order at all. An exchange reject for a
+        malformed id is recoverable but arrives mid-session; a failure here
+        arrives at startup or in a test.
+        """
+        # a missing identifier is a bug wherever the venue requires one
+        if value is None or value == "":
+            raise ValueError(f"{self.name}: {field} must not be empty")
+        # anything in the venue's prohibited set, named individually
+        bad = sorted({c for c in value if c in self.prohibited_chars})
+        # report every offending character, so one fix clears them all
+        if bad:
+            raise ValueError(
+                f"{self.name}: {field}={value!r} contains prohibited "
+                f"character(s) {bad}; the exchange would reject the message")
+        # non-printable characters are prohibited everywhere on every venue
+        ctrl = sorted({ord(c) for c in value if ord(c) < 32 or ord(c) == 127})
+        # likewise reported by code point, since they do not print
+        if ctrl:
+            raise ValueError(
+                f"{self.name}: {field}={value!r} contains non-printable "
+                f"character(s) at code points {ctrl}")
+        # the value, so this can be used inline where an id is created
+        return value
+
+    @property
+    @abstractmethod
+    def feed_price_decimals(self) -> int:
+        """How many decimal places the MARKET DATA feed carries.
+
+        This is NOT the same as the tick grid and must not be assumed equal to
+        the currency's minor unit. PSX quotes a 0.01 tick on the regular market
+        -- two decimals -- while its market-data Price type is N13(4) and
+        MDEntryPx is N18(6). A parser that assumes two decimals silently
+        truncates anything finer, and silent truncation of a price is the
+        quietest possible way to be wrong.
+        """
+
+    def parse_price(self, text: str) -> int:
+        """Read a feed price into integer minor units, REFUSING to truncate.
+
+        A value the minor unit cannot represent exactly is an error, not
+        something to round. If PSX ever publishes a price with more precision
+        than paisa, this raises and we find out immediately -- rather than
+        trading for a year on prices that were quietly rounded.
+        """
+        # reject anything that is not a plain decimal number
+        t = (text or "").strip()
+        # an empty price is missing data, not a zero
+        if not t:
+            raise ValueError(f"{self.name}: empty price")
+        # exactly one decimal point at most
+        if t.count(".") > 1:
+            raise ValueError(f"{self.name}: malformed price {text!r}")
+        # split into whole and fractional parts
+        whole, _, frac = t.partition(".")
+        # the sign travels with the whole part
+        neg = whole.startswith("-")
+        # digits only from here
+        whole_digits = whole.lstrip("+-")
+        # a non-numeric price is a feed error worth naming
+        if not whole_digits.isdigit() or (frac and not frac.isdigit()):
+            raise ValueError(f"{self.name}: non-numeric price {text!r}")
+        # how many decimals the minor unit can represent
+        scale = len(str(self.minor_per_major)) - 1
+        # anything beyond that must be zero, or precision would be lost
+        if len(frac) > scale and frac[scale:].strip("0"):
+            raise ValueError(
+                f"{self.name}: price {text!r} carries more precision than the "
+                f"minor unit can hold ({scale} decimals); refusing to truncate")
+        # pad or trim the fraction to exactly the minor-unit scale
+        frac_padded = (frac + "0" * scale)[:scale]
+        # the integer value in minor units
+        value = int(whole_digits or "0") * self.minor_per_major + \
+            int(frac_padded or "0")
+        # restore the sign
+        return -value if neg else value
+
+    @abstractmethod
+    def format_price(self, price_minor: int) -> str:
+        """Render an integer price as the venue's wire representation.
+
+        The engine holds prices as integers precisely so that no float ever
+        touches the tick grid. This is the single place that converts one back,
+        and it is the venue's job because the number of decimals, the separator
+        and the permitted characters are all venue rules.
+        """
+
+    # ---- what the exchange says the market is doing -----------------------
+    @abstractmethod
+    def parse_phase(self, code: str) -> "SecurityPhase":
+        """Turn the venue's own trading-phase code into the shared enum.
+
+        The codes are venue vocabulary; the enum is what the engine reasons
+        about. An UNRECOGNISED code maps to UNKNOWN, which is treated as 'do
+        not trade' -- never as 'probably fine'.
         """
 
     # ---- order tagging ----------------------------------------------------
