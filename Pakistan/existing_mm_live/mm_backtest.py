@@ -764,6 +764,20 @@ class Backtester:
         self.pos = float(cfg.get("opening_inventory", 0.0))
         # True until the buffer has been paid for; False when there is none
         self._buffer_unpaid = self.pos != 0.0
+        # ISOLATING THE BUFFER'S DIRECTIONAL BET FROM THE QUOTING POLICY.
+        # The run buys the buffer at the first print and sells it back into the
+        # closing book, so whatever the stock did between those two moments
+        # lands in the P&L. That is a bet on the stock, not a market-making
+        # result. At the two-clip buffer the sweep uses (100 shares) a 1%
+        # intraday move on a Rs 300 name is 300 PKR against a baseline day of
+        # roughly 148 PKR, so the stock is the larger of the two terms. Recording the size and the entry price lets the
+        # sweep subtract the price move afterwards and compare quoting to
+        # quoting. The ENTRY FEE and the EXIT EXECUTION COST are deliberately
+        # NOT recorded for removal: those are real costs of carrying a buffer.
+        # how many shares the buffer is (0.0 when there is none)
+        self.buffer_qty = self.pos
+        # the price it was acquired at; None until the first print sets it
+        self.buffer_px = None
         self.cash = 0.0  # our running cash in PKR (signed). Fills add/subtract price*qty and deduct fees.
         self.fills, self.equity = [], []  # accounting logs: fills = every trade we got; equity = mark-to-market curve (one row per event). Returned as DataFrames by run().
         self.eod = None        # EOD book-walk liquidation report (filled once, at session end).
@@ -1292,6 +1306,9 @@ class Backtester:
             self.cash -= self.pos * _px_now
             # and the buy pays the same fee schedule every other fill pays
             self.cash -= fee_for(_px_now, abs(self.pos))
+            # remember WHAT WE PAID, so the sweep can strip out the stock's
+            # move afterwards and leave the quoting result behind
+            self.buffer_px = _px_now
             # paid for; never again
             self._buffer_unpaid = False
         # ARRIVAL-RATE: log this trade (ts, aggressor side, qty) for the recent-rate
@@ -1798,7 +1815,36 @@ class Backtester:
                             abs(vwap - mid_e) if (vwap is not None and mid_e is not None) else None),
                         # Size the visible book could not absorb -- genuinely unpriceable.
                         "unfilled_sh": unfilled,
+                        # ---- BUFFER ISOLATION FIELDS ----------------------
+                        # Shares of opening buffer this run started with (0.0
+                        # when the policy is not long_buffer).
+                        "buffer_qty": self.buffer_qty,
+                        # What the buffer was bought at (the day's first print).
+                        # None if the buffer was never paid for, which can only
+                        # happen if the session produced no continuous print.
+                        "buffer_px": self.buffer_px,
+                        # THE DIRECTIONAL TERM: what the buffer made or lost
+                        # purely because the stock moved between the first print
+                        # and the close. Marked at the CLOSING MID, not at the
+                        # liquidation vwap, on purpose -- the gap between mid
+                        # and vwap is execution cost, which is a real cost of
+                        # carrying the buffer and stays in the P&L.
+                        "buffer_price_move": (
+                            self.buffer_qty * (
+                                (mid_e if mid_e is not None else self.last_good_mid)
+                                - self.buffer_px)
+                            if (self.buffer_qty and self.buffer_px is not None
+                                and (mid_e is not None or self.last_good_mid is not None))
+                            else 0.0),
                     }
+                    # EQUITY WITH THE STOCK'S MOVE TAKEN OUT. Still carries the
+                    # buffer's entry fee and its exit execution cost, so it is
+                    # not "the buffer for free" -- it is the buffer without the
+                    # coin flip. This is the column the policy comparison should
+                    # be run on; equity_liquidated is the column that answers
+                    # "what would the account have done", buffer bet included.
+                    self.eod["equity_ex_buffer_move"] = (
+                        self.eod["equity_liquidated"] - self.eod["buffer_price_move"])
                     # ---- EMIT LIQUIDATION FILLS (Stage 1) --------------------
                     # The EOD walk flattened the position; book each consumed
                     # level as a real fill so the FIFO decomposition matches it
