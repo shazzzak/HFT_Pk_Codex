@@ -520,7 +520,12 @@ class MyOrder:
                 event (market cancels shrink it, trades at our price drain
                 it) so our queue position is EXACT, not estimated. That
                 precision is a luxury of order-level data.
-    t_active  — exchange-ms when the order became live (after send latency).
+    t_active  — exchange-ms when the order became live (after send latency),
+                or None while it is still on the wire. THE None IS LOAD-BEARING:
+                the order is written into self.work the moment it is SENT, so
+                that the side is reserved and no duplicate goes out, and
+                t_active is what distinguishes "sent" from "matchable". Every
+                fill path tests it and skips an order that has not landed.
     cancel_at — exchange-ms when our in-flight cancel LANDS, or None.
                 Between deciding to cancel and cancel_at, the order remains
                 fully fillable — the in-flight window naive backtests skip.
@@ -529,7 +534,7 @@ class MyOrder:
     price: float
     qty: float
     ahead: dict
-    t_active: int
+    t_active: int | None   # None = sent but not yet landed; set at _arrive
     cancel_at: int = None
     # AMENDMENT IN FLIGHT (added 2026-09-16). exchange-ms when our in-flight
     # CFO lands, or None. Deliberately SEPARATE from cancel_at, which gates
@@ -817,6 +822,13 @@ class Backtester:
         self.work: dict[
             str, MyOrder] = {}  # OUR live orders, keyed by side: {"BUY": MyOrder, "SELL": MyOrder}. At most one per side.
         self._oid = 0  # counter that generates a unique id for each order we send (cancels target a specific oid, not just a side).
+        # DIAGNOSTIC STATE, NO BEHAVIOUR CHANGE. Per side: how many NEW orders
+        # have been sent and have not yet reached the exchange. self.work above
+        # only records an order once it LANDS, so this is the only way to see
+        # the send-to-arrival window from inside _requote. Read and written by
+        # the two diagnostic counters in self.stats; nothing decides anything
+        # on it.
+        self._new_in_flight = {"BUY": 0, "SELL": 0}
         self.ack_until = {"BUY": 0,
                           "SELL": 0}  # per side: exchange-ms until which that side's last cancel is UNCONFIRMED (ack not yet back). 0 = nothing pending.
         self.use_ack = 'latency_model' in cfg  # ack-realism gate: only enforce the "don't restack an unconfirmed side" rule in stochastic mode (when a real LatencyModel was given).
@@ -891,7 +903,31 @@ class Backtester:
                       # diagnostic counters, all start at 0:
                       "stale_cancels_ignored": 0, "requotes_blocked_by_ack": 0,
                       # rejected_crossing = post-only rejects; n_orders_sent/n_cancels = message counts;
-                      "halted_requotes": 0}  # stale_cancels_ignored = cancels for already-gone orders; requotes_blocked_by_ack = requotes skipped by ack guard; halted_requotes = requotes skipped during halts.
+                      "halted_requotes": 0,  # stale_cancels_ignored = cancels for already-gone orders; requotes_blocked_by_ack = requotes skipped by ack guard; halted_requotes = requotes skipped during halts.
+                      # DIAGNOSTIC COUNTERS, NO BEHAVIOUR CHANGE. Added after
+                      # the reconcile gate showed this backtester sending 1,822
+                      # messages where the production engine sent 359, against
+                      # near-equal cancel counts. These two say whether the
+                      # cause is what the arithmetic points at: an order that
+                      # has been SENT is not recorded in self.work until it
+                      # LANDS, so for one network latency the side reads as
+                      # empty and the next requote sends another new order.
+                      # orders_sent_while_new_in_flight counts those extra
+                      # sends; orders_orphaned_by_overwrite counts the resting
+                      # orders that are silently dropped when a duplicate lands
+                      # on top of them.
+                      "orders_sent_while_new_in_flight": 0,
+                      "orders_orphaned_by_overwrite": 0,
+                      # AND THE COUNTERS THE FIX ITSELF ADDED.
+                      # requotes_blocked_in_flight = cycles where a side was
+                      # left alone because its order was still on the wire.
+                      # This should be LARGE: it is the duplicate sends, now
+                      # correctly doing nothing instead of sending.
+                      "requotes_blocked_in_flight": 0,
+                      # stale_arrivals_ignored = an ARRIVE for an order the
+                      # side is no longer holding. The old code applied these
+                      # by overwriting whatever was there.
+                      "stale_arrivals_ignored": 0}
 
 
     # ================= our-order plumbing (EXCHANGE side) =================
@@ -1053,6 +1089,27 @@ class Backtester:
            ahead of us. Captured once here; maintained incrementally by
            the market-event handlers below.
         """
+        # This order has arrived, so it is no longer in the air.
+        if self._new_in_flight.get(o.side, 0) > 0:
+            # one fewer order in the air on this side
+            self._new_in_flight[o.side] -= 1
+        # IDENTITY CHECK. The order was written into self.work when it was
+        # SENT, so the side should still be holding THIS object. If it is
+        # holding something else -- or nothing -- then this arrival belongs to
+        # an order that has already been cancelled, filled or superseded, and
+        # applying it would resurrect a dead order.
+        #
+        # THIS IS THE GUARD THAT REPLACED THE OVERWRITE. The old code assigned
+        # self.work[o.side] = o unconditionally at the end of this method, so
+        # whatever was resting there was silently dropped: never cancelled,
+        # never filled, never closed out in the lifecycle log. The gate
+        # measured 5,205 of those across four symbol-days.
+        if self.work.get(o.side) is not o:
+            # count it: with the in-flight rule in _requote this should be rare
+            # and is worth seeing if it is not
+            self.stats["stale_arrivals_ignored"] += 1
+            # nothing is applied
+            return
         bb, _, ba, _ = self.book.bbo()  # get the CURRENT best bid (bb) and best ask (ba) from the real book. The _ discard the qty fields (bq, aq) -- not needed here. Note: the book may have MOVED during our latency window.
         crosses = ((o.side == "BUY" and ba is not None and o.price >= ba) or  # would our order execute immediately instead of resting? For a BUY: our bid at/above the best ask means we'd cross and take.
                    (o.side == "SELL" and bb is not None and o.price <= bb))  # for a SELL: our ask at/below the best bid means we'd cross and take. (the 'is not None' guards an empty side.)
@@ -1065,15 +1122,22 @@ class Backtester:
             # every other fill in this engine. Off (default) -> falls through to the
             # original post-only reject below, byte-identical.
             if self.allow_taker and getattr(o, "taker", False):
-                # execute the taker and stop (the order never rests)
+                # THE ORDER NEVER RESTS, so the side must be released. It was
+                # reserved at send time; leaving it occupied would block the
+                # side for the rest of the session.
+                self.work.pop(o.side, None)
+                # execute the taker and stop
                 self._taker_fill(t, o)
                 # done
                 return
             self.stats["rejected_crossing"] += 1  # count it as a rejected crossing order.
+            # REJECTED, SO RELEASE THE SIDE. Same reason as the taker path
+            # above: the reservation made at send time has to be undone, or the
+            # next requote sees an occupied side that will never come live.
+            self.work.pop(o.side, None)
             return  # FLAGGED SIMPLIFICATION: reject it (post-only behavior) instead of executing as a taker. The order never enters the book. Exit early.
         o.ahead = self.book.qty_at(o.side, o.price)  # order rests: snapshot our QUEUE POSITION -- {order_id: qty} of every order already resting at our price (all ahead of us under price-time priority).
-        o.t_active = t  # record the exchange-time the order became live (used for timing/diagnostics).
-        self.work[o.side] = o  # store the order as our working order on this side. It's now live and eligible to be filled by incoming flow.
+        o.t_active = t  # record the exchange-time the order became live (used for timing/diagnostics). Until this line runs, t_active is None and every fill path skips the order.
         # LIFECYCLE: the order is now live at the exchange (resting, matchable)
         if o.oid in self._olog:
             self._olog[o.oid]["t_live"] = t
@@ -1428,9 +1492,13 @@ class Backtester:
         passive_side = {"BUY": "SELL", "SELL": "BUY"}.get(aggr)
         # Fetch OUR working order on that passive side (None if we have none).
         o = self.work.get(passive_side)
-        # Skip if no order, OR our in-flight cancel has ALREADY landed (trade time >= cancel_at).
-        # Before cancel_at the order is still fillable -- that is in-flight cancel risk.
-        if o is None or (o.cancel_at is not None and r.ts_exch >= o.cancel_at):
+        # Skip if no order, OR the order has not reached the exchange yet
+        # (t_active is None: it is still on the wire and nothing can hit it),
+        # OR our in-flight cancel has ALREADY landed (trade time >= cancel_at).
+        # Before cancel_at the order is still fillable -- that is in-flight
+        # cancel risk, and it is modelled deliberately.
+        if o is None or o.t_active is None \
+                or (o.cancel_at is not None and r.ts_exch >= o.cancel_at):
             return
         # The trade's execution (print) price.
         px = float(r.price)
@@ -1505,8 +1573,10 @@ class Backtester:
         for side, opp in (("SELL", "BUY"), ("BUY", "SELL")):
             # Fetch OUR working order on this side (None if we have none there).
             o = self.work.get(side)
-            # Skip if we have no order on this side, OR the add is not on the opposing side.
-            if o is None or r.side != opp:
+            # Skip if we have no order on this side, OR the order is still on
+            # the wire and cannot be matched against (t_active is None), OR the
+            # add is not on the opposing side.
+            if o is None or o.t_active is None or r.side != opp:
                 continue
             # Only fill off crossing adds if the config enables this (it is optional/optimistic).
             if self.cfg["fill_on_crossing_adds"]:
@@ -1538,6 +1608,12 @@ class Backtester:
         inside a wide spread are usually alone at their price anyway.
         """
         for o in self.work.values():
+            # An order still on the wire has no queue position yet -- _arrive
+            # snapshots it from the book at the instant it lands, which is the
+            # only moment that snapshot is meaningful. Rebuilding it here would
+            # hand it a position it does not hold.
+            if o.t_active is None:
+                continue
             o.ahead = self.book.qty_at(o.side, o.price)
 
     # ================ strategy plumbing (KNOWLEDGE side) ==================
@@ -1611,8 +1687,11 @@ class Backtester:
             self.stats["halted_requotes"] += 1
             # Cancel every working order that isn't already being cancelled.
             for side, cur in list(self.work.items()):
-                # Skip orders that already have a cancel in flight.
-                if cur.cancel_at is None:
+                # Skip orders that already have a cancel in flight, AND orders
+                # that have not reached the exchange yet -- there is no OrderID
+                # to put in a cancel for one still on the wire. It lands, and
+                # the next requote (still not quotable) pulls it then.
+                if cur.cancel_at is None and cur.t_active is not None:
                     # Draw a send latency for this cancel.
                     a_out = self.lat.draw_out()
                     # The cancel lands (exchange stops matching) at knowledge time + latency.
@@ -1672,6 +1751,24 @@ class Backtester:
             w = want.get(side)
             # Our current working order on this side (or None).
             cur = self.work.get(side)
+            # ---- IN FLIGHT: WAIT --------------------------------------------
+            # THE ORDER HAS BEEN SENT AND HAS NOT REACHED THE EXCHANGE YET
+            # (t_active is None until _arrive sets it). Nothing can be done
+            # with it: it cannot be cancelled, because PSX requires the
+            # exchange's OrderID on a cancel and that only exists once the
+            # order has been acknowledged; it cannot be amended, for the same
+            # reason; and it must not be duplicated, which is exactly what the
+            # old code did every cycle of the latency window.
+            #
+            # This one test is what takes the duplicate-send count from 4,901
+            # to zero. The production order manager expresses the identical
+            # rule as OrderState.is_in_flight.
+            if cur is not None and cur.t_active is None:
+                # count it, so a run can show how much of the session each side
+                # spent waiting on the wire rather than quoting
+                self.stats["requotes_blocked_in_flight"] += 1
+                # nothing to send for this side this cycle
+                continue
             # "same" = we already have exactly this quote live, with no cancel racing -> no churn.
             same = cur is not None and w is not None and \
                    cur.price == w[0] and cur.qty == w[1] and cur.cancel_at is None
@@ -1731,8 +1828,30 @@ class Backtester:
                 # this side is done for this cycle: one message covers both
                 # the cancel and the replacement, so skip the two-message path.
                 continue
-            # If we have a live incumbent not already being cancelled, cancel it.
-            if cur is not None and cur.cancel_at is None:
+            # ---- CANCEL PATH: pull the incumbent, and DO NOT replace it in
+            # the same cycle --------------------------------------------------
+            # THE REPLACEMENT NOW WAITS FOR THE CANCEL TO LAND. The old code
+            # fell straight through to the new-order block below, so a cancel
+            # and its replacement went out together with INDEPENDENT latency
+            # draws. Whenever the replacement's draw was the shorter one it
+            # landed first and overwrote an order that was still resting and
+            # not yet cancelled -- the second source of the 5,205 orphans the
+            # gate measured, and the reason orphans outnumbered duplicate
+            # sends on three of four days.
+            #
+            # Waiting is also what the production order manager does, and it
+            # is what PSX forces anyway: a cancel needs the exchange's OrderID,
+            # which only exists once the order has been acknowledged.
+            #
+            # THIS IS A REAL BEHAVIOUR CHANGE, NOT ONLY A BUG FIX. A reprice
+            # under cancel-plus-new now costs a full round trip instead of
+            # being simultaneous, so fills and P&L will move. Under CFO
+            # (use_cfo=True) the path above handles a reprice in one message
+            # and is unaffected.
+            if cur is not None:
+                # already being cancelled: nothing to send, just wait
+                if cur.cancel_at is not None:
+                    continue
                 # Independent send-latency draw for the cancel.
                 a_out = self.lat.draw_out()  # independent cancel-send draw
                 # Cancel lands (exchange stops matching) at knowledge time + latency.
@@ -1745,8 +1864,22 @@ class Backtester:
                 # In stochastic mode, this side stays unconfirmed until the ack returns.
                 if self.use_ack:  # confirmed only after ack
                     self.ack_until[side] = cur.cancel_at + self.lat.draw_ack()
-            # If the strategy wants a quote on this side, send the replacement order.
+                # the side is now busy until the cancel lands and pops it out
+                # of self.work; the replacement goes out on a later cycle
+                continue
+            # ---- PLACE PATH: the side is genuinely empty ---------------------
+            # If the strategy wants a quote on this side, send it.
             if w is not None:
+                # REGRESSION GUARD. With the order written into self.work at
+                # SEND time and the in-flight rule at the top of this loop,
+                # this can no longer fire. It is kept because it is what
+                # measured the defect in the first place, and a non-zero value
+                # in a later run means the hole has reopened.
+                if self._new_in_flight[side] > 0:
+                    # one more order sent on top of one still in the air
+                    self.stats["orders_sent_while_new_in_flight"] += 1
+                # this side now has one more order in the air
+                self._new_in_flight[side] += 1
                 # Count an order sent.
                 self.stats["n_orders_sent"] += 1
                 # Independent send-latency draw for the new order (separate from the cancel).
@@ -1767,9 +1900,23 @@ class Backtester:
                 # TAKER TAG: the strategy sets want_taker_side to the side it wants to
                 # CROSS with (a deliberate flatten); any other order is a passive quote.
                 _tk = (getattr(self.strat, "want_taker_side", None) == side)
-                # Schedule the new order to arrive; empty {} = queue-ahead filled at _arrive.
-                self._push(t_land, "ARRIVE",
-                           MyOrder(side, w[0], w[1], {}, t_land, oid=self._oid, taker=_tk))
+                # THE ORDER OBJECT, built once and shared. t_active=None is the
+                # marker that it is SENT BUT NOT YET LIVE: every fill path
+                # tests for it and skips, so an order in the air cannot be hit.
+                # _arrive sets it to the landing time, and from that instant the
+                # order is matchable.
+                _o = MyOrder(side, w[0], w[1], {}, None,
+                             oid=self._oid, taker=_tk)
+                # RESERVE THE SIDE NOW, AT SEND TIME. This is the fix. Until
+                # this line existed, self.work[side] stayed empty for one whole
+                # network latency after every send, the next requote read the
+                # side as empty, and sent another order -- 4,901 of them across
+                # four symbol-days. The in-flight rule at the top of the
+                # reconcile loop now sees this entry and waits.
+                self.work[side] = _o
+                # Schedule its arrival; the empty {} is the queue-ahead dict,
+                # filled from the book at _arrive.
+                self._push(t_land, "ARRIVE", _o)
 
     # ============================ main loop ================================
     def run(self, events, snap_groups):
@@ -1868,7 +2015,9 @@ class Backtester:
                         _resting = [
                             (o.side, float(o.price), float(o.qty))
                             for o in self.work.values()
-                            if o.t_active <= ts_exch and o.cancel_at is None]
+                            if o.t_active is not None
+                            and o.t_active <= ts_exch
+                            and o.cancel_at is None]
                         # open the record. mid_after and the exposure are
                         # filled in at the mark-to-market step below, which is
                         # the first moment the post-silence touch exists.

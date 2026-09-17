@@ -18,8 +18,8 @@ mm_backtest = pytest.importorskip(
                           "tests; run from a checkout where it is")
 
 # the production side
-from core.model import (BookLevel, BookSnapshot, DesiredQuotes, QuoteIntent,
-                        Side)
+from core.model import (BookLevel, BookSnapshot, DesiredQuotes, PlaceOrder,
+                        QuoteIntent, Side)
 from core.oms import OrderManager, QuoteTolerance
 from core.risk import KillSwitch, OrderQuantityCheck, RiskGateway
 from core.venue import SessionSegment
@@ -710,6 +710,87 @@ def test_a_one_sided_book_pulls_a_resting_quote():
     # NOT counted as a halt: Backtester does not count one here, because there
     # the strategy declines rather than the gate refusing
     assert replay.stats["halted_requotes"] == 0
+
+
+
+# ---------------------------------------------------------------------------
+# THE DUPLICATE-SEND HOLE
+#
+# Added after the reconcile gate failed with the backtester sending 1,822
+# messages where the engine sent 359. mm_backtest records an order in
+# self.work when it LANDS; for one send latency the side reads as empty and the
+# next requote sends another one. These tests assert the engine does NOT do
+# that, and -- separately -- that the counter which measures it actually
+# counts, so a zero in the gate's output means "did not happen" rather than
+# "was never wired up".
+# ---------------------------------------------------------------------------
+def test_the_engine_does_not_send_twice_into_its_own_latency_window():
+    """Two requote cycles inside one send latency produce ONE order."""
+    # a harness wanting a bid, with 100 ms of constant send latency
+    replay, oms, _ = build()
+    set_book(replay)
+    # first cycle: the order goes out, landing at OPEN_MS + 1_100
+    replay._requote(OPEN_MS + 1_000)
+    # exactly one message in the air
+    assert len(replay.pending) == 1
+    assert replay.stats["n_orders_sent"] == 1
+    # a second cycle BEFORE it lands, wanting exactly the same thing
+    replay._requote(OPEN_MS + 1_050)
+    # STILL one message. The order manager marked it PENDING_NEW at send time
+    # and its in-flight rule holds the side until the exchange answers.
+    assert len(replay.pending) == 1, "the engine sent a duplicate"
+    assert replay.stats["n_orders_sent"] == 1
+    # and the counter agrees it never happened
+    assert replay.stats.get("orders_sent_while_new_in_flight", 0) == 0
+
+
+def test_a_forced_duplicate_is_counted_and_cannot_orphan_the_first_order():
+    """Two things at once: the instrument is live, and the fix holds.
+
+    The counter has to be provably live, because a zero in the gate's output
+    must mean "did not happen" rather than "was never wired up". And the
+    arrival of the duplicate must NOT destroy the order already on the side,
+    which is what the old code did -- silently, 5,205 times across four
+    symbol-days.
+    """
+    # the same harness
+    replay, oms, _ = build()
+    set_book(replay)
+    # one order out through the normal path
+    replay._requote(OPEN_MS + 1_000)
+    # the counter is clean
+    assert replay.stats.get("orders_sent_while_new_in_flight", 0) == 0
+    # the first order is holding the side
+    first = replay.work["BUY"]
+    # now FORCE a second placement on the same side while the first is in the
+    # air, going round the order manager to do it -- this is what mm_backtest
+    # used to do by accident and what the counter exists to catch
+    replay._dispatch(PlaceOrder(symbol="PPL", cl_ord_id="FORCED-1",
+                                side=Side.BUY, price_minor=28900, quantity=50,
+                                account="CLIENT001"),
+                     OPEN_MS + 1_050)
+    # two messages in the air now
+    assert len(replay.pending) == 2
+    # and the counter saw it: the instrument is live
+    assert replay.stats["orders_sent_while_new_in_flight"] == 1
+    # forcing a placement onto a side that is already reserved is itself
+    # counted, so it can never happen unnoticed
+    assert replay.engine_stats["placed_onto_occupied_side"] == 1
+    # land both
+    replay._activate_until(OPEN_MS + 2_000)
+    # THE SIDE HOLDS EXACTLY ONE ORDER, and the arrival that does not match
+    # the reservation is DISCARDED rather than applied over the top of it.
+    # Under the old code both arrivals were applied and the first order became
+    # unreachable: never cancelled, never filled, never closed out.
+    assert replay.stats["orders_orphaned_by_overwrite"] == 0
+    assert replay.stats["stale_arrivals_ignored"] == 1
+    # the survivor is the SECOND order -- the one the side is holding -- and it
+    # is live and matchable
+    assert replay.work["BUY"].t_active is not None
+    assert replay.work["BUY"] is not first
+    # the in-flight count came back to zero, so it cannot drift upward across a
+    # session and turn every later send into a false positive
+    assert replay._new_in_flight["BUY"] == 0
 
 
 if __name__ == "__main__":

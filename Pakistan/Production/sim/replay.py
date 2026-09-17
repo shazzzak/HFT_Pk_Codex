@@ -265,6 +265,13 @@ class EngineReplay(Backtester):
             # been amended once carries a new exchange id, and the production
             # side still knows it by its original client order id.
             for side_str, cur in list(self.work.items()):
+                # AN ORDER STILL ON THE WIRE CANNOT BE AMENDED: PSX requires
+                # the exchange's OrderID on a CFO and it does not exist until
+                # the order is acknowledged. Skipping it here sends this action
+                # down the already-tested "nothing to amend" path, which tells
+                # the order manager rather than leaving it in PENDING_REPLACE.
+                if cur.t_active is None:
+                    continue
                 # the production id of whatever is resting on this side
                 if self._cl_by_oid.get(cur.oid) != action.orig_cl_ord_id:
                     continue
@@ -317,6 +324,12 @@ class EngineReplay(Backtester):
                 # so matching on the exchange id would fail to find it and the
                 # cancel would be silently dropped. The exchange id is still
                 # checked as a fallback for an order that was never amended.
+                # AN ORDER STILL ON THE WIRE CANNOT BE CANCELLED, for the
+                # same reason: no OrderID exists yet. Falls through to the
+                # "nothing to cancel" path below, which answers the order
+                # manager instead of stranding it in PENDING_CANCEL.
+                if cur.t_active is None:
+                    continue
                 if (self._cl_by_oid.get(cur.oid) != action.orig_cl_ord_id
                         and str(cur.oid) != action.exchange_order_id):
                     continue
@@ -349,6 +362,18 @@ class EngineReplay(Backtester):
             return
         # A NEW ORDER.
         if isinstance(action, PlaceOrder):
+            # DIAGNOSTIC, NO BEHAVIOUR CHANGE. The identical counter Backtester
+            # keeps, incremented here so the two runs can be compared like for
+            # like. The order manager marks an order PENDING_NEW the moment it
+            # is sent and its in-flight rule then holds the side until the
+            # exchange answers, so this side of the comparison should stay at
+            # or near zero. If it does not, the order manager has the same hole
+            # the backtester has and this is where it shows.
+            if self._new_in_flight[action.side.value] > 0:
+                # a second new order sent while the first is still in the air
+                self.stats["orders_sent_while_new_in_flight"] += 1
+            # this side now has one more order in the air
+            self._new_in_flight[action.side.value] += 1
             # count it the way Backtester does
             self.stats["n_orders_sent"] += 1
             # independent send-latency draw, separate from any cancel
@@ -374,10 +399,34 @@ class EngineReplay(Backtester):
             # is always False -- kept so the constructed MyOrder is the same
             # shape Backtester builds.
             taker = (getattr(self.strat, "want_taker_side", None) == side_str)
+            # THE ORDER OBJECT. t_active=None marks it as sent but not yet
+            # live: Backtester's fill paths all test for it and skip, and
+            # Backtester._arrive sets it to the landing time.
+            order = MyOrder(side_str, px, action.quantity, {}, None,
+                            oid=self._oid, taker=taker)
+            # RESERVE THE SIDE AT SEND TIME, exactly as Backtester._requote now
+            # does. This harness shares Backtester's _arrive, and that method
+            # requires the side to be holding the very object that is arriving
+            # -- the identity check that replaced the silent overwrite. Without
+            # this line every arrival here would be discarded as stale.
+            #
+            # It changes nothing about the engine's own behaviour: the order
+            # manager already refuses to send a second order while the first is
+            # in flight, which is why engine_dup_sends measured zero.
+            #
+            # PLACING ONTO AN OCCUPIED SIDE IS COUNTED, NOT SILENT. The order
+            # manager should never ask for one: it holds a side while an order
+            # there is in flight, and the side is freed by the landing cancel
+            # or the full fill before it places again. If it ever does ask, the
+            # reservation below replaces what was there, which is the exact
+            # failure just removed from mm_backtest -- so it gets a counter
+            # rather than being invisible.
+            if self.work.get(side_str) is not None:
+                self.engine_stats["placed_onto_occupied_side"] = \
+                    self.engine_stats.get("placed_onto_occupied_side", 0) + 1
+            self.work[side_str] = order
             # schedule the arrival; the empty dict is filled at _arrive
-            self._push(t_land, "ARRIVE",
-                       MyOrder(side_str, px, action.quantity, {}, t_land,
-                               oid=self._oid, taker=taker))
+            self._push(t_land, "ARRIVE", order)
             # done
             return
         # anything else is an action type this harness has not been taught

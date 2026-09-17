@@ -443,6 +443,81 @@ def main():
                 # books the production stack refused to quote against
                 "skipped_crossed_book": rep.engine_stats.get(
                     "skipped_crossed_book", 0),
+                # ---- THE STAND-DOWNS, SIDE BY SIDE -----------------------
+                # ADDED after the first failing run, which showed the two
+                # sides sending 1,822 and 359 new orders against near-equal
+                # cancel counts -- they disagree about when a side is EMPTY,
+                # and these are the counters that say why. Every one of them
+                # is the same key on the same Backtester stats dict, so like
+                # is compared with like.
+                #
+                # A halt, a crossed book or a stale feed all CANCEL
+                # everything, which empties the side, which makes the next
+                # quotable cycle send a NEW order rather than an amendment.
+                # If one side stands down far more often than the other, that
+                # is the whole explanation and it is visible here.
+                "backtest_halted": bt.stats.get("halted_requotes", 0),
+                "engine_halted": rep.stats.get("halted_requotes", 0),
+                "backtest_crossed": bt.stats.get("crossed_book_requotes", 0),
+                "engine_crossed": rep.stats.get("crossed_book_requotes", 0),
+                "backtest_stale": bt.stats.get("stale_feed_requotes", 0),
+                "engine_stale": rep.stats.get("stale_feed_requotes", 0),
+                # one-sided books, which the engine counts and the backtest
+                # does not -- there the strategy declines instead
+                "engine_one_sided": rep.engine_stats.get(
+                    "skipped_one_sided", 0),
+                # amendments the exchange refused because the order had
+                # already gone. A real cost, and a source of divergence if
+                # only one side incurs it.
+                "engine_replace_rejected": rep.engine_stats.get(
+                    "replace_rejected_stale", 0),
+                # and how often each side skipped a reprice because a cancel
+                # was still unacknowledged
+                "backtest_ack_blocked": bt.stats.get(
+                    "requotes_blocked_by_ack", 0),
+                "engine_ack_blocked": rep.stats.get(
+                    "requotes_blocked_by_ack", 0),
+                # ---- THE DUPLICATE-SEND COUNT ----------------------------
+                # THE ARITHMETIC THAT PUT THESE HERE. On MLCF 2026-06-24 the
+                # backtester sent 1,822 messages, of which 66 were amendments,
+                # leaving 1,756 NEW orders. An order can only leave a side by
+                # being cancelled or fully filled: 231 cancels and at most 32
+                # fills is at most 263 departures, plus the two orders that
+                # open the day. The side cannot have been legitimately empty
+                # 1,756 times when only about 265 orders ever left it. The
+                # engine's own figures reconcile: 359 - 87 = 272 new orders
+                # against 234 cancels and at most 24 fills.
+                #
+                # The one way to place a new order on a side that is not empty
+                # is for the side to READ as empty when it is not, and that is
+                # exactly what self.work does in mm_backtest: an order is
+                # recorded there when it LANDS, not when it is SENT. These two
+                # counters measure that directly rather than inferring it.
+                "backtest_dup_sends": bt.stats.get(
+                    "orders_sent_while_new_in_flight", 0),
+                "engine_dup_sends": rep.stats.get(
+                    "orders_sent_while_new_in_flight", 0),
+                # and what those duplicates cost when they land: a resting
+                # order replaced in place, never cancelled, never closed out
+                "backtest_orphaned": bt.stats.get(
+                    "orders_orphaned_by_overwrite", 0),
+                "engine_orphaned": rep.stats.get(
+                    "orders_orphaned_by_overwrite", 0),
+                # ---- WHAT THE FIX PUT IN THEIR PLACE ---------------------
+                # Every duplicate send is now a cycle that does nothing,
+                # because the side is held while its order is on the wire.
+                # This number should be LARGE and should roughly replace the
+                # duplicate count; the duplicate count itself should be zero.
+                "backtest_blocked_in_flight": bt.stats.get(
+                    "requotes_blocked_in_flight", 0),
+                "engine_blocked_in_flight": rep.stats.get(
+                    "requotes_blocked_in_flight", 0),
+                # an arrival for an order the side is no longer holding. The
+                # old code applied these by overwriting whatever was there.
+                "backtest_stale_arrivals": bt.stats.get(
+                    "stale_arrivals_ignored", 0),
+                "engine_stale_arrivals": rep.stats.get(
+                    "stale_arrivals_ignored", 0),
             })
         # progress
         print(f"  [{di}/{len(dates)}] {date} done", flush=True)
@@ -467,34 +542,45 @@ def main():
     print(f"  total difference     : {df['diff'].sum():,.2f} PKR")
     print(f"  worst symbol-day     : {worst['symbol']} {worst['date']} "
           f"{worst['diff']:+,.2f} PKR")
-    # things that must be zero, named individually
-    for col, what in (("gateway_rejections",
-                       "actions the risk gateway refused"),
-                      ("skipped_crossed_book",
-                       "crossed books: the engine refused to quote, "
-                       "mm_backtest quoted anyway")):
-        # the total across the sample
-        n = int(df[col].sum())
-        # only worth a line when non-zero, and then it is the explanation
-        if n:
-            print(f"  !! {col} = {n}  ({what})")
-            print(f"     This changed the run for a reason that is NOT the")
-            print(f"     order manager. Fix it before reading the difference.")
-            # the crossed-book case has a specific explanation and is not a
-            # bug in either program, so say which it is rather than leaving
-            # it as a number to be puzzled over
-            if col == "skipped_crossed_book":
-                print(f"     A CROSSED BOOK -- best bid at or above best ask --")
-                print(f"     cannot exist on a real exchange. It appears in the")
-                print(f"     reconstruction between events, when a trade has")
-                print(f"     been applied and the matching cancel has not. The")
-                print(f"     production engine REFUSES to quote against one,")
-                print(f"     deliberately: quoting inside a spread that does not")
-                print(f"     exist is how an engine crosses itself. mm_backtest")
-                print(f"     has no such check and quotes anyway. The engine is")
-                print(f"     right and the backtest is wrong, so the fix belongs")
-                print(f"     in mm_backtest -- and it changes measured numbers,")
-                print(f"     so it is a decision, not a patch.")
+    # THE ONE THING THAT MUST BE ZERO. A rejection means the risk gateway, not
+    # the order manager, changed the run, and the difference below cannot be
+    # read as a statement about the order manager at all.
+    n = int(df["gateway_rejections"].sum())
+    # only worth a line when non-zero, and then it is the explanation
+    if n:
+        print(f"  !! gateway_rejections = {n}  "
+              f"(actions the risk gateway refused)")
+        print(f"     This changed the run for a reason that is NOT the")
+        print(f"     order manager. Fix it before reading the difference.")
+    # ---- CROSSED BOOKS: A CROSS-CHECK, NOT A WARNING ---------------------
+    # CORRECTED 2026-09-17. This block used to announce that "mm_backtest has
+    # no such check and quotes anyway". That was WRONG, and the gate's own
+    # output disproved it: backtest_crossed and engine_crossed came back
+    # identical on every symbol-day (87/87, 90/90, 5/5, 26/26). mm_backtest
+    # has had the check since the skip_crossed_book flag was added, and the
+    # two programs stand down together.
+    #
+    # What skipped_crossed_book actually counts is the PRODUCTION ADAPTER
+    # refusing a crossed book, one layer above the replay's own check, so it
+    # very nearly duplicates engine_crossed. Printed here as a cross-check
+    # between the two layers rather than as a defect.
+    _adapter = int(df["skipped_crossed_book"].sum())
+    # the replay-level counter on each side of the comparison
+    _bt_x = int(df["backtest_crossed"].sum())
+    _en_x = int(df["engine_crossed"].sum())
+    # a line only when a crossed book was actually seen
+    if _adapter or _bt_x or _en_x:
+        print(f"  crossed books        : backtest {_bt_x}, engine {_en_x}, "
+              f"adapter {_adapter}")
+        # the two REPLAY counters are the ones that must agree; the adapter's
+        # sits at a different layer and is expected to be close, not equal
+        if _bt_x != _en_x:
+            print(f"     !! the two sides did NOT stand down together. That is")
+            print(f"        a divergence in its own right -- read it before")
+            print(f"        reading the P&L difference.")
+        else:
+            print(f"     both sides stood down on the same events, so crossed")
+            print(f"     books contribute nothing to the difference below.")
 
     # EVERY DAY THAT DID NOT MATCH, listed individually. An average would hide
     # the one day that is wrong among nineteen that are right, and the one day
@@ -514,6 +600,49 @@ def main():
         print("  there, not at the P&L. Equal fills with different P&L means")
         print("  the same orders filled at different prices, which points at")
         print("  the queue model rather than the order manager.")
+        # ---- THE STAND-DOWNS, PRINTED SIDE BY SIDE ----------------------
+        # A message-count gap this size has a cause, and it is one of these.
+        # Printed as a second table rather than added to the first, because a
+        # nineteen-column table is unreadable.
+        print("\n  WHY THE TWO SIDES SENT DIFFERENT NUMBERS OF MESSAGES")
+        print("  Each pair is the SAME counter on the SAME kind of object, so")
+        print("  like is compared with like. Read the pair, not the number.")
+        print(bad[["symbol", "date",
+                   # duplicate new orders sent into the latency window
+                   "backtest_dup_sends", "engine_dup_sends",
+                   # resting orders silently replaced when those land
+                   "backtest_orphaned", "engine_orphaned",
+                   # and the cycles that now correctly do nothing instead
+                   "backtest_blocked_in_flight", "engine_blocked_in_flight",
+                   # and the three reasons either side pulls its quote
+                   "backtest_halted", "engine_halted",
+                   "backtest_crossed", "engine_crossed",
+                   "backtest_stale", "engine_stale"]]
+              .to_string(index=False))
+        # the two columns that only exist on one side, so they cannot be
+        # paired and get a line of their own
+        print(f"\n  engine-only: one-sided books skipped "
+              f"{int(bad['engine_one_sided'].sum())}, amendments the exchange "
+              f"refused {int(bad['engine_replace_rejected'].sum())}")
+        # AND THE READING. Say what a large dup_sends figure MEANS, here, where
+        # the number is, rather than leaving it as a column to be puzzled over.
+        if int(bad["backtest_dup_sends"].sum()) > 0:
+            print("\n  !! backtest_dup_sends is NOT zero.")
+            print("     mm_backtest records an order in self.work when it")
+            print("     LANDS at the exchange, not when it is SENT. For one")
+            print("     network latency after every send, that side reads as")
+            print("     empty, and the next requote -- which is event-driven,")
+            print("     so it can fire many times in that window -- sends")
+            print("     ANOTHER new order. backtest_orphaned is what those")
+            print("     duplicates cost: each one that lands overwrites the")
+            print("     order already resting there, which is then never")
+            print("     cancelled, never filled and never closed out.")
+            print("     The production order manager marks an order")
+            print("     PENDING_NEW at SEND time and holds the side until the")
+            print("     exchange answers, which is why its figure is lower.")
+            print("     THE ENGINE IS RIGHT AND THE BACKTEST IS WRONG. Fixing")
+            print("     it changes every measured number this project has")
+            print("     produced, so it is a decision, not a patch.")
 
     # ---- THE MEASUREMENT: what is queue position worth? ------------------
     # This is NOT part of the pass/fail above. The gate asks whether the engine
