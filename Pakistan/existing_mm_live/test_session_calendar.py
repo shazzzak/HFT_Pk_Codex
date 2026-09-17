@@ -604,6 +604,16 @@ if long_gap is not None and long_gap.get("intervals"):
           f"stretches {_tot}s vs traded {long_gap['traded_seconds']}s")
 # but the closing bell is unmoved either way, which is what the classifier
 # keys off
+check("the seconds balance: traded + break + unobserved + other",
+      long_gap is not None
+      and abs(long_gap["open_to_close_seconds"]
+              - (long_gap["traded_seconds"] + long_gap["break_seconds"]
+                 + long_gap["unobserved_seconds"]
+                 + long_gap["other_seconds"]))
+      <= long_gap["continuous_spans"] + 2,
+      f"open-to-close {long_gap['open_to_close_seconds'] if long_gap else None}"
+      f" vs parts "
+      f"{(long_gap['traded_seconds'] + long_gap['break_seconds'] + long_gap['unobserved_seconds'] + long_gap['other_seconds']) if long_gap else None}")
 check("and the closing bell is unmoved by either silence",
       short_gap is not None and long_gap is not None
       and str(short_gap["close_pkt"])[11:19]
@@ -645,7 +655,18 @@ D["is_short"] = ((D["class_median_close"] - D["close_sec"])
 # the date with the FEWEST traded seconds must not be called short
 check("a date that lost feed is NOT called a shortened session",
       not bool(D.loc[D["date"] == "2026-06-23", "is_short"].iloc[0]),
-      "this is how 2026-06-23, a June Tuesday, was labelled RAMADAN_REGULAR")
+      "this is how 2026-06-23, a June Tuesday, was labelled a short session")
+# THE LABELS SAY WHAT WAS MEASURED, NOT A CAUSE. They were RAMADAN_REGULAR
+# and RAMADAN_FRIDAY until the 207-date run caught 2025-09-23 -- a September
+# Tuesday that closed at 14:19 -- and labelled it Ramadan.
+_types = [("SHORT_FRIDAY" if f else "SHORT_DAY") if s
+          else ("REGULAR_FRIDAY" if f else "REGULAR_DAY")
+          for f, s in zip(D["is_friday"], D["is_short"])]
+check("  and the day types name the measurement, not an inferred cause",
+      not any("RAMADAN" in t for t in _types)
+      and set(_types) <= {"SHORT_DAY", "SHORT_FRIDAY", "REGULAR_DAY",
+                          "REGULAR_FRIDAY"},
+      f"got {sorted(set(_types))}")
 # and a real early close must be
 check("a genuine early close IS called a shortened session",
       bool(D.loc[D["date"] == "2026-03-11", "is_short"].iloc[0]))

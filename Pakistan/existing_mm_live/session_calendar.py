@@ -513,6 +513,20 @@ def measure(date, st, session_id=None):
     brk_names = ",".join(sorted(str(x) for x in names))
     # seconds inside the session whose state we never observed
     unknown = int(inside.isna().sum())
+    # ---- THE REMAINDER, WHICH MUST NOT BE ALLOWED TO VANISH ------------
+    # Seconds inside the session that were NOT continuous trading, NOT a
+    # declared break, and NOT unobserved. Until this column existed those
+    # seconds simply disappeared between traded_seconds and break_seconds,
+    # and five dates in the 207 turned out to be missing about 65 minutes
+    # each with nothing in the output to show it: 2026-03-02, 03-09, 03-10,
+    # 04-01 and 04-08, all within nine seconds of 3,885. A market halt would
+    # look exactly like that. The phases are named rather than guessed at.
+    _other = inside[inside.notna()
+                    & ~inside.isin(["CONTINUOUS_AUCTION", "TRADING_BREAK"])]
+    # how much time that accounts for
+    other_secs = int(len(_other))
+    # and which phases they were, so the answer is in the output, not a theory
+    other_phases = ",".join(sorted(str(x) for x in _other.unique()))
     # HOW MANY SEPARATE STRETCHES of continuous trading there were -- 2 on a
     # split Friday, 1 on an ordinary day. Counted as the number of times the
     # series turns continuous having not been continuous the second before.
@@ -579,6 +593,12 @@ def measure(date, st, session_id=None):
         # number here means the capture went quiet and the session boundaries
         # are less certain than they look.
         "unobserved_seconds": float(unknown),
+        # seconds inside the session in some OTHER phase -- not trading, not
+        # a declared break, not missing. These four columns plus
+        # traded_seconds account for open_to_close_seconds exactly.
+        "other_seconds": float(other_secs),
+        # and what those phases were
+        "other_phases": other_phases,
         # whether the exchange itself declared a Friday break
         "exchange_says_friday": bool(friday_break),
         # how many status messages the measurement rests on
@@ -955,11 +975,21 @@ def main():
     D["is_short"] = (
         (D["class_median_close"] - D["close_sec"])
         > SHORT_SESSION_MINUTES * 60.0)
-    # THE FOUR TYPES. "RAMADAN" is the label for a shortened session; it is
-    # named for the cause SZ identified, and the measurement that produced it
-    # is the shortening itself, not a religious calendar.
+    # THE FOUR TYPES, NAMED FOR WHAT WAS MEASURED, NOT FOR A CAUSE.
+    #
+    # These were called RAMADAN_REGULAR and RAMADAN_FRIDAY. What the code
+    # actually measures is a closing bell well before its peers' -- and on the
+    # full 207-date run one of the 22 dates it caught was 2025-09-23, a
+    # September Tuesday that closed at 14:19:18 for some reason of its own.
+    # Labelling that RAMADAN was the same mistake as choosing the Odd Lot
+    # Market: naming a measurement after a cause that was inferred rather than
+    # observed. SHORT_DAY and SHORT_FRIDAY say only what is known.
+    #
+    # That 21 of the 22 form one contiguous block from 2026-02-19 to
+    # 2026-03-19, which is Ramadan 1447, is a fact about the output worth
+    # writing down. It is not a fact the classifier is entitled to assert.
     D["day_type"] = [
-        ("RAMADAN_FRIDAY" if f else "RAMADAN_REGULAR") if s
+        ("SHORT_FRIDAY" if f else "SHORT_DAY") if s
         else ("REGULAR_FRIDAY" if f else "REGULAR_DAY")
         for f, s in zip(D["is_friday"], D["is_short"])]
 
@@ -971,8 +1001,7 @@ def main():
     print(f"\n  {'day type':<18s} {'dates':>6s} {'median open':>12s} "
           f"{'median close':>13s} {'median traded':>14s} {'break':>8s}")
     # one line per type, in a fixed order so the table reads the same each run
-    for t in ("REGULAR_DAY", "REGULAR_FRIDAY", "RAMADAN_REGULAR",
-              "RAMADAN_FRIDAY"):
+    for t in ("REGULAR_DAY", "REGULAR_FRIDAY", "SHORT_DAY", "SHORT_FRIDAY"):
         # that type's dates
         g = D[D["day_type"] == t]
         # a type with no dates still gets a line, so its absence is visible
@@ -994,8 +1023,10 @@ def main():
     short = D[D["is_short"]].sort_values("date")
     # only if there is one
     if len(short):
-        print(f"\n  SHORTENED SESSIONS ({len(short)} dates) -- check this "
-              f"block against the Ramadan calendar")
+        print(f"\n  SHORTENED SESSIONS ({len(short)} dates) -- the bell rang "
+              f"well before its peers'. NO CAUSE IS ASSERTED; a contiguous "
+              f"block is worth\n  checking against the Ramadan calendar, and "
+              f"an isolated date against that day's news.")
         print(f"    {short['date'].iloc[0]} .. {short['date'].iloc[-1]}")
         # each one, so a stray date in the middle is not hidden by a range
         for _, r in short.iterrows():
@@ -1030,6 +1061,53 @@ def main():
         print("      Their open and close are measured, but the capture was")
         print("      quiet for part of the day, so treat them as softer.")
 
+    # ---- TIME INSIDE THE SESSION THAT WAS NEITHER TRADING NOR A BREAK ----
+    # The column that stops these seconds vanishing. On the 207-date run five
+    # dates were each missing about 65 minutes with nothing in the output to
+    # show for it.
+    odd_phase = D[D["other_seconds"] > 600]
+    # named, with the phases the exchange actually reported
+    if len(odd_phase):
+        print(f"\n  {len(odd_phase)} date(s) with more than 10 minutes inside "
+              f"the session in some phase\n  that was NEITHER continuous "
+              f"trading NOR a declared break NOR missing:")
+        # the header
+        print(f"      {'date':<12s} {'seconds':>9s}  phases the exchange "
+              f"reported")
+        # worst first
+        for _, r in odd_phase.sort_values("other_seconds",
+                                          ascending=False).head(20).iterrows():
+            # the row
+            print(f"      {r['date']:<12s} {r['other_seconds']:>8,.0f}s  "
+                  f"{r['other_phases']}")
+        print("      A market halt looks like this. The phases are the")
+        print("      exchange's own words; no cause is asserted here.")
+
+    # ---- THE SECONDS MUST ADD UP -----------------------------------------
+    # traded + break + unobserved + other should equal open-to-close on every
+    # date, give or take one second per continuous stretch (each stretch is
+    # measured inclusively). A date where they do not is a bug in this file,
+    # and is far better found here than by a consumer.
+    _sum = (D["traded_seconds"] + D["break_seconds"]
+            + D["unobserved_seconds"] + D["other_seconds"])
+    # how far off each date is
+    _off = (D["open_to_close_seconds"] - _sum).abs()
+    # anything beyond the inclusive-counting slack
+    _bad = D[_off > (D["continuous_spans"] + 2)]
+    # reported loudly, because it means the accounting is wrong
+    if len(_bad):
+        print(f"\n  ACCOUNTING DOES NOT BALANCE on {len(_bad)} date(s) -- "
+              f"this is a bug in session_calendar.py, not a fact about PSX:")
+        # each one
+        for _, r in _bad.head(10).iterrows():
+            print(f"      {r['date']}  open-to-close "
+                  f"{r['open_to_close_seconds']:,.0f}s vs traded+break+"
+                  f"unobserved+other "
+                  f"{r['traded_seconds'] + r['break_seconds'] + r['unobserved_seconds'] + r['other_seconds']:,.0f}s")
+    else:
+        print(f"\n  seconds balance on all {len(D)} dates: traded + break + "
+              f"unobserved + other = open-to-close.")
+
     # dates that could not be measured at all
     if skipped:
         print(f"\n  {len(skipped)} date(s) could not be measured:")
@@ -1050,6 +1128,7 @@ def main():
             "open_utc", "open_pkt", "close_utc", "close_pkt",
             "open_to_close_seconds", "traded_seconds", "continuous_spans",
             "break_seconds", "break_reasons", "unobserved_seconds",
+            "other_seconds", "other_phases",
             "exchange_says_friday", "status_messages"]
     # EVERY BOARD goes in the file, with the regular one flagged, so nothing
     # is hidden by the choice pick_board made and a wrong pick can be
