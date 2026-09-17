@@ -290,9 +290,27 @@ class Order:
         # the new terms
         self.price_minor = price_minor
         self.quantity = quantity
-        # back to resting, keeping any partial fill already taken
-        self.state = (OrderState.PARTIALLY_FILLED if self.filled_quantity
-                      else OrderState.LIVE)
+        # THE FILL COUNTER RESTARTS FOR THIS GENERATION, and it must.
+        #
+        # PSX Regulations 8.12.2: a Change Former Order "can only modify price
+        # and volume of an unfilled/outstanding Order in whole or in parts".
+        # The quantity coming back is therefore the new RESTING size, not the
+        # original total -- which is also how mm_backtest._amend treats it,
+        # working off the remaining size rather than the order as sent.
+        #
+        # Without this reset, an order for 50 that had filled 30 and was then
+        # amended back to a full 50 would carry filled_quantity = 30 against
+        # quantity = 50, and the very next fill of 50 would be refused as
+        # more fill than the order ever had. That is exactly the
+        # InvalidTransition the first gate run hit on AGP, three days out of
+        # three.
+        #
+        # POSITION IS UNAFFECTED. The order manager accumulates position from
+        # fill events and never derives it from this counter, so rebasing here
+        # cannot lose a share.
+        self.filled_quantity = 0
+        # a freshly amended order is resting with nothing yet taken against it
+        self.state = OrderState.LIVE
 
     def on_suspended(self) -> None:
         """The exchange is holding the order inactive."""

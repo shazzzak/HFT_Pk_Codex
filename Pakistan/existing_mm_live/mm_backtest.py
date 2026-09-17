@@ -670,6 +670,86 @@ class Backtester:
         # master switch: one AMEND message instead of a CANCEL plus a NEW.
         # Absent from cfg -> False -> nothing in the CFO path ever executes.
         self.use_cfo = bool(cfg.get("use_cfo", False))
+        # ---- CROSSED-BOOK GUARD, added 2026-09-17 ------------------------
+        # DO NOT QUOTE OFF A BOOK WHERE THE BEST BID IS AT OR ABOVE THE BEST
+        # ASK. Such a book cannot exist at the exchange: the two orders would
+        # have matched. It appears in the reconstruction, and until this flag
+        # existed the engine quoted against it anyway -- pricing every quote
+        # off a mid that is not a mid.
+        #
+        # THE CAUSE HAS NOT BEEN ESTABLISHED. It may be events applied out of
+        # sequence, a gap in the message stream, or the feed itself. That is
+        # what sim/check_data_quality.py is for. This flag does not diagnose
+        # it; it stops the engine trading on it.
+        #
+        # ON BY DEFAULT, AND THAT CHANGES RESULTS. Every number produced
+        # before 2026-09-17 was computed with the engine quoting on these
+        # books. Set skip_crossed_book=False in cfg to reproduce an older run
+        # exactly; leave it on for anything new. The count is reported as
+        # crossed_book_requotes so the size of the change is visible rather
+        # than inferred.
+        #
+        # WHY HERE AND NOT IN THE STRATEGY. micro_mm already refuses a
+        # one-sided or zero-size book (bb/ba None, or bq/aq <= 0). A crossed
+        # book is not a quoting judgement though -- it is the book being
+        # invalid -- so it belongs to whoever owns the book, which is the
+        # engine. The production engine makes the same check in the same
+        # place, in sim/replay.py's _snapshot.
+        self.skip_crossed_book = bool(cfg.get("skip_crossed_book", True))
+        # ---- STALE-FEED GUARD, added 2026-09-17 --------------------------
+        # DO NOT QUOTE WHEN NOTHING HAS ARRIVED FOR A WHILE.
+        #
+        # MEASURED IN THE CAPTURE, not hypothetical. NRL and MLCF over three
+        # days: 21 stretches during continuous trading with NO message of any
+        # kind -- no trade, no book update, no heartbeat -- for 7 to 33
+        # seconds. The PSX feed heartbeats every 3 seconds per channel, so
+        # that is the receiver having stopped, and the gaps recur on a
+        # ~47-minute cycle (17 of 18 intervals between 0.89x and 1.07x of the
+        # 47.1-minute median), which is a schedule rather than load.
+        #
+        # WHAT THE ENGINE DID BEFORE THIS. Nothing, and that is the problem.
+        # run() is event-driven: no events means _requote is never called, no
+        # fill checks run, and nothing lands. The engine simply sat with its
+        # orders resting through a blind window and picked up afterwards as
+        # if nothing had happened. That is the MOST FLATTERING possible
+        # assumption -- free queue position through exactly the period when a
+        # real book would have moved without us and our quotes would have
+        # been picked off.
+        #
+        # WHAT IT DOES NOW. On the first event after a silence longer than
+        # stale_feed_seconds, it pulls every working quote, exactly as a halt
+        # does, and counts the window. It stays dark until a SNAPSHOT lands,
+        # because a snapshot is a full state replacement and is the only
+        # message that restores a book we know is stale -- incremental
+        # updates applied to a stale book leave it stale.
+        #
+        # THIS IS ALSO THE PRODUCTION BEHAVIOUR. The PSX spec's own answer is
+        # a 3-second channel heartbeat with disconnect after two missed
+        # intervals. A live engine that keeps quoting into a feed it cannot
+        # see is the failure this models.
+        #
+        # 7 SECONDS: two missed 3-second heartbeats plus jitter. Set
+        # stale_feed_seconds=0 to disable and reproduce a pre-2026-09-17 run.
+        self.stale_feed_seconds = float(cfg.get("stale_feed_seconds", 7.0))
+        # the capture time of the last event seen, for measuring the silence
+        self._last_event_cap = None
+        # True while we are standing down after a silence, until a snapshot
+        # restores the book
+        self._feed_stale = False
+        # ---- BLIND-WINDOW LEDGER, added 2026-09-17 ----------------------
+        # One record per silence, so the windows can be taken OUT of the
+        # measurement rather than merely quoted through. Each record holds
+        # the silence in seconds, how much of it fell inside the session
+        # window, the mid on either side of it, and what WE had resting when
+        # the feed went dark. The EOD block turns these into the reported
+        # numbers -- and says plainly which distortion they can and cannot
+        # remove.
+        self.blind_windows = []
+        # index into blind_windows of the record still waiting for its
+        # closing mid, or None. Filled at the mark-to-market step of the
+        # SAME event, because that is the first point where the post-silence
+        # touch exists.
+        self._pending_blind = None
         # ---- SHORT-SALE POLICY, added 2026-09-16 -------------------------
         # read off the strategy, the same way allow_taker and log_fill_state
         # are, so ONE variable drives quoting and execution together.
@@ -1495,6 +1575,36 @@ class Backtester:
 
         # Quotable only in continuous trading AND when not pinned at a circuit limit.
         quotable = self.book.phase in (None, "CONTINUOUS_AUCTION") and not self.book.pinned()
+        # STALE FEED -> STAND DOWN. Nothing has arrived for longer than a
+        # working feed ever goes quiet, so the book in front of us describes a
+        # market that has moved on without us. Pull everything and wait for a
+        # snapshot, which is the only message that restores a book wholesale.
+        # Counted separately from a halt: a halt is the exchange telling us to
+        # stop, this is our own data having stopped arriving.
+        if self._feed_stale:
+            # count the requote refused for this reason
+            self.stats["stale_feed_requotes"] = \
+                self.stats.get("stale_feed_requotes", 0) + 1
+            # and take the same path a halt takes
+            quotable = False
+        # CROSSED OR LOCKED BOOK -> STAND DOWN. bbo() is a single top-of-book
+        # read, so testing it here costs nothing. `>=` covers both cases: a
+        # crossed book (bid above ask) and a locked one (bid equal to ask).
+        # Neither can rest at a continuously matching exchange, so both mean
+        # the reconstruction is momentarily wrong, and a mid computed from
+        # them is not a price. Falls through to the same pull-everything path
+        # a halt uses -- which is also what the production engine does, so the
+        # two agree.
+        _gb, _, _ga, _ = self.book.bbo()
+        # both sides present and inverted or equal
+        if self.skip_crossed_book and _gb is not None and _ga is not None \
+                and _gb >= _ga:
+            # counted separately from halted_requotes: a halt is the exchange
+            # telling us to stop, this is our own data being unusable
+            self.stats["crossed_book_requotes"] = \
+                self.stats.get("crossed_book_requotes", 0) + 1
+            # treat it exactly as not quotable
+            quotable = False
         # Not quotable (halt / auction / closed / pinned) -> pull all our quotes and stand down.
         if not quotable:
             # Count this halted requote for diagnostics.
@@ -1705,6 +1815,90 @@ class Backtester:
         know = 0
         # Walk the merged, time-ordered event stream. kind: "S"=snapshot, "U"=update, "T"=trade.
         for ts_exch, _, _, kind, obj in events:
+            # ---- STALE-FEED DETECTION, before anything else -------------
+            # Measured on the CAPTURE clock, because the question is how long
+            # WE went without hearing anything -- not what the exchange's own
+            # timestamps say about messages we never received.
+            if self.stale_feed_seconds > 0:
+                # this event's arrival time
+                _cap = int(obj.ts_cap)
+                # how long since the previous one arrived, in seconds
+                if self._last_event_cap is not None:
+                    # the silence that just ended
+                    _silence = (_cap - self._last_event_cap) / 1000.0
+                    # longer than the threshold means the receiver had stopped
+                    if _silence > self.stale_feed_seconds:
+                        # mark the book untrustworthy until a snapshot resets it
+                        self._feed_stale = True
+                        # count the window and how much time it cost
+                        self.stats["stale_feed_windows"] = \
+                            self.stats.get("stale_feed_windows", 0) + 1
+                        self.stats["stale_feed_seconds"] = \
+                            self.stats.get("stale_feed_seconds", 0.0) + _silence
+                        # ---- LEDGER THE WINDOW -----------------------
+                        # The touch we last saw. The book has NOT yet been
+                        # updated with this event (that happens at step 3
+                        # below), so bbo() here is the PRE-silence book.
+                        _pb, _, _pa, _ = self.book.bbo()
+                        # a mid only exists if both sides were present
+                        _mid_before = ((_pb + _pa) / 2.0
+                                       if (_pb is not None and _pa is not None)
+                                       else None)
+                        # WHERE THE SILENCE SAT ON THE CLOCK. It spans
+                        # [ts_exch - silence, ts_exch]; clipping that to the
+                        # session window means a gap straddling the open or
+                        # the close contributes only its in-session part,
+                        # which is the only part any denominator cares about.
+                        _sil_start = ts_exch - int(_silence * 1000.0)
+                        # overlap of the silence with [t0, t1], in ms
+                        _ov_ms = min(ts_exch, t1) - max(_sil_start, t0)
+                        # negative means the silence fell wholly outside the
+                        # session, and contributes nothing
+                        _in_sess = max(0.0, _ov_ms / 1000.0)
+                        # the running total every time-denominated metric
+                        # must subtract
+                        self.stats["stale_feed_seconds_in_session"] = (
+                            self.stats.get("stale_feed_seconds_in_session",
+                                           0.0) + _in_sess)
+                        # WHAT WE HAD RESTING WHEN THE LIGHTS WENT OUT.
+                        # Live orders only: one not yet active could not have
+                        # been hit, and one with a cancel already in flight is
+                        # a different exposure. (side, price, qty) is all the
+                        # exposure calculation below needs.
+                        _resting = [
+                            (o.side, float(o.price), float(o.qty))
+                            for o in self.work.values()
+                            if o.t_active <= ts_exch and o.cancel_at is None]
+                        # open the record. mid_after and the exposure are
+                        # filled in at the mark-to-market step below, which is
+                        # the first moment the post-silence touch exists.
+                        self.blind_windows.append({
+                            # exchange-ms of the first event after the silence
+                            "t_exch_end": int(ts_exch),
+                            # the full silence
+                            "seconds": _silence,
+                            # the part of it inside the session
+                            "seconds_in_session": _in_sess,
+                            # the market we left
+                            "mid_before": _mid_before,
+                            # the market we came back to (filled below)
+                            "mid_after": None,
+                            # our exposure going in
+                            "resting": _resting,
+                            # the adverse selection the backtest was spared
+                            # (filled below; None when it cannot be measured)
+                            "spared_adverse_pkr": None})
+                        # this record is the one awaiting its closing mid
+                        self._pending_blind = len(self.blind_windows) - 1
+                # remember this arrival for the next comparison
+                self._last_event_cap = _cap
+                # A SNAPSHOT IS THE ONLY THING THAT CLEARS IT. It replaces the
+                # book wholesale, which is exactly what a book known to be
+                # stale needs. An incremental update applied to a stale book
+                # leaves it stale, so those do not clear the flag.
+                if self._feed_stale and kind == "S":
+                    # the book is trustworthy again from here
+                    self._feed_stale = False
             # (1) Land any of OUR in-flight orders/cancels due before this event.
             self._activate_until(ts_exch)
             # (2) FILL CHECKS -- run against the PRE-event book, before it mutates below.
@@ -1722,7 +1916,12 @@ class Backtester:
             # (3) APPLY the event to the historical book.
             # Snapshot: full replacement of the book, then rebuild our queue dicts.
             if kind == "S":
-                self.book.snapshot(snap_groups[obj.msg_seq])
+                # KEYED BY snap_key, NOT msg_seq -- msg_seq repeats within a
+                # day and two messages would be merged into one book. A loader
+                # that has not been updated will raise AttributeError here
+                # rather than silently looking up the wrong snapshot, which is
+                # the failure mode worth having.
+                self.book.snapshot(snap_groups[obj.snap_key])
                 self._on_snapshot_queue_reset()
             # Update: dispatch to add or cancel on the book.
             elif kind == "U":
@@ -1732,6 +1931,46 @@ class Backtester:
                 self.book.trade(obj)
             # (4) MARK TO MARKET -- read the post-event touch.
             bb, _, ba, _ = self.book.bbo()
+            # ---- CLOSE ANY BLIND WINDOW WAITING ON ITS EXIT MID ---------
+            # The book now carries the first post-silence event, so this
+            # touch is the market we came back to. Done OUTSIDE the
+            # two-sided gate below so a one-sided return still closes the
+            # record -- with mid_after None, which reads as "not measurable"
+            # rather than silently leaving the record open and letting the
+            # next window overwrite it.
+            if self._pending_blind is not None:
+                # the record opened when the silence was detected
+                _rec = self.blind_windows[self._pending_blind]
+                # the mid we came back to, if there is one
+                _m_after = ((bb + ba) / 2.0
+                            if (bb is not None and ba is not None) else None)
+                # record it either way
+                _rec["mid_after"] = _m_after
+                # the exposure calculation needs a price to compare against
+                if _m_after is not None:
+                    # WHAT THE BACKTEST WAS HANDED FOR FREE. Every order we
+                    # had resting sat through a window in which the engine
+                    # saw no events, so it checked no fills -- it could not
+                    # be hit, by construction. This puts a number on that.
+                    _spared = 0.0
+                    # each order that was live when the feed stopped
+                    for _sd, _px, _q in _rec["resting"]:
+                        # our BID, market now BELOW it: anyone could have
+                        # sold into us at _px during the blackout, leaving
+                        # us long at _px with the market at _m_after
+                        if _sd == "BUY" and _m_after < _px:
+                            _spared += _q * (_px - _m_after)
+                        # our OFFER, market now ABOVE it: the same in reverse
+                        elif _sd == "SELL" and _m_after > _px:
+                            _spared += _q * (_m_after - _px)
+                    # store it on the record
+                    _rec["spared_adverse_pkr"] = _spared
+                    # and accumulate for the EOD summary
+                    self.stats["blind_spared_adverse_pkr"] = (
+                        self.stats.get("blind_spared_adverse_pkr", 0.0)
+                        + _spared)
+                # the record is closed either way
+                self._pending_blind = None
             # Only record a row when both sides exist (skips pre-open, halts, one-sided books).
             if bb is not None and ba is not None:
                 # Mid price used for marking inventory.
@@ -1892,6 +2131,82 @@ class Backtester:
                     # "what would the account have done", buffer bet included.
                     self.eod["equity_ex_buffer_move"] = (
                         self.eod["equity_liquidated"] - self.eod["buffer_price_move"])
+                    # ---- BLIND-WINDOW ACCOUNTING, added 2026-09-17 --------
+                    # READ THIS BEFORE USING THESE NUMBERS.
+                    #
+                    # A blind window is a stretch with NO messages at all. It
+                    # is not a period in which the engine did the wrong thing;
+                    # it is a period in which the engine did NOTHING, because
+                    # run() is event-driven and there were no events. So
+                    # "taking the window out of the results" has exactly one
+                    # honest meaning and one dishonest one.
+                    #
+                    # HONEST: take the seconds out of every denominator. The
+                    # engine could not trade in them, so P&L per hour, fills
+                    # per minute and quoted-time fractions must be measured on
+                    # effective_seconds, not on the full session. That is what
+                    # the fields below give.
+                    #
+                    # DISHONEST: subtract a P&L number for the window. There
+                    # is no P&L inside the window to subtract -- no fills
+                    # happened, because nothing arrived to fill against. The
+                    # inventory mark that jumps across the gap is real money:
+                    # in live trading we genuinely hold that position through
+                    # the blackout, and deleting it would flatter the result,
+                    # not clean it.
+                    #
+                    # THE DISTORTION THAT IS ACTUALLY THERE, and that NO
+                    # subtraction fixes: our orders rested through the window
+                    # and could not be hit. A real book moved without us and
+                    # would have picked them off. blind_spared_adverse_pkr
+                    # sizes that gift. It is an UPPER BOUND -- it assumes
+                    # every resting order was filled in full at its limit and
+                    # marks the loss at the post-window mid. Treat it as "the
+                    # result is overstated by at most this much", and if it is
+                    # large relative to the day's P&L, the day is not
+                    # trustworthy however clean the other diagnostics look.
+                    # the session's full length in seconds
+                    _sess_s = (t1 - t0) / 1000.0
+                    # the part of it the engine was blind for
+                    _blind_s = float(
+                        self.stats.get("stale_feed_seconds_in_session", 0.0))
+                    # both, so a consumer can recompute anything
+                    self.eod["session_seconds"] = _sess_s
+                    self.eod["blind_seconds"] = _blind_s
+                    # THE DENOMINATOR every rate metric should use
+                    self.eod["effective_seconds"] = max(0.0, _sess_s - _blind_s)
+                    # the same thing as a share, for eyeballing a day
+                    self.eod["blind_pct_of_session"] = (
+                        100.0 * _blind_s / _sess_s if _sess_s > 0 else None)
+                    # how many separate silences made it up
+                    self.eod["blind_windows"] = len(self.blind_windows)
+                    # how many of them had a two-sided book on the far side,
+                    # i.e. how many the exposure below could be measured on
+                    self.eod["blind_windows_measured"] = sum(
+                        1 for w in self.blind_windows
+                        if w["spared_adverse_pkr"] is not None)
+                    # THE UPPER BOUND ON THE GIFT, in PKR. See the note above.
+                    self.eod["blind_spared_adverse_pkr"] = float(
+                        self.stats.get("blind_spared_adverse_pkr", 0.0))
+                    # P&L PER HOUR ON THE CLOCK THE ENGINE COULD SEE. cash
+                    # starts at 0.0, so equity_liquidated IS the day's net.
+                    self.eod["pnl_per_effective_hour"] = (
+                        self.eod["equity_liquidated"]
+                        / (self.eod["effective_seconds"] / 3600.0)
+                        if self.eod["effective_seconds"] > 0 else None)
+                    # the same number on the uncorrected clock, so the size of
+                    # the correction is visible rather than asserted
+                    self.eod["pnl_per_session_hour"] = (
+                        self.eod["equity_liquidated"] / (_sess_s / 3600.0)
+                        if _sess_s > 0 else None)
+                    # THE GIFT AS A SHARE OF THE DAY'S P&L -- the one number
+                    # that says whether the blind windows matter here. None
+                    # when the day made nothing, because a ratio to zero says
+                    # nothing and inventing one would be worse than a gap.
+                    self.eod["blind_spared_pct_of_pnl"] = (
+                        100.0 * self.eod["blind_spared_adverse_pkr"]
+                        / abs(self.eod["equity_liquidated"])
+                        if self.eod["equity_liquidated"] else None)
                     # ---- EMIT LIQUIDATION FILLS (Stage 1) --------------------
                     # The EOD walk flattened the position; book each consumed
                     # level as a real fill so the FIFO decomposition matches it
@@ -2049,7 +2364,9 @@ def load_events(u_path, s_path, t_path):
     Returns:
       events      list of (ts_exch, kind_rank, appl_seq, kind, row),
                   fully sorted — see ordering rationale below
-      snap_groups {msg_seq: DataFrame of ALL rows of that snapshot message}
+      snap_groups {snap_key: DataFrame of ALL rows of that snapshot message}
+                  where snap_key is "msg_seq|orig_time" -- see the note at the
+                  grouping itself; msg_seq alone is not unique per message
                   — book levels (BID/OFFER), the AGG_BID/AGG_OFFER totals,
                   and the status/circuit-breaker rows. snapshot() does its
                   own filtering. Pre-split once so the replay loop does
@@ -2113,12 +2430,41 @@ def load_events(u_path, s_path, t_path):
     t["rest_oid"] = t["resting_order_id"].map(
         lambda x: ast.literal_eval(x)[0] if isinstance(x, str) and x.startswith("(") else None)
 
-    # One dict entry per snapshot message, holding ALL its rows (book + AGG +
+    # ---- THE SNAPSHOT GROUPING KEY, CORRECTED 2026-09-17 ---------------
+    # msg_seq ALONE IS NOT UNIQUE PER SNAPSHOT MESSAGE, and grouping on it
+    # merged two different 35=W messages into one book.
+    #
+    # MEASURED, not inferred. On NRL and MLCF for 2026-06-30:
+    #   symbol+msg_seq            90 of 12,476 groups held TWO level-1 bids
+    #   symbol+msg_seq+market     90   (the market does not separate them)
+    #   symbol+msg_seq+channel    90   (nor does the channel)
+    #   symbol+msg_seq+orig_time   0 of 12,566   -- clean
+    #
+    # Same symbol, same channel, same market, DIFFERENT orig_time: the FIX
+    # sequence number repeats within the day. Merging two messages puts two
+    # ladders in one book -- two level-1 bids, two level-1 offers -- and the
+    # touch then reads as one message's bid against the other's ask. That is
+    # the crossed-book finding: 275 of 285 were inverted MORE THAN ONE LEVEL
+    # deep, which no event-ordering explanation accounts for.
+    #
+    # AND THE CROSSINGS ARE ONLY THE VISIBLE PART. A merge whose two ladders
+    # happen not to cross produces a book with doubled depth and a wrong
+    # shape, and nothing flags it. 0.72% of snapshot messages were affected;
+    # every quote priced off one of them was priced off a book that never
+    # existed.
+    #
+    # CAVEAT ON orig_time: it is tag 42 and second-precision, so two genuinely
+    # distinct snapshots inside one second would still merge. It separates
+    # every case in the sample, but the durable fix is a per-message id from
+    # the parser. This is the right key today, not forever.
+    s["snap_key"] = (s["msg_seq"].astype("int64").astype(str) + "|"
+                     + s["orig_time"].astype(str))
+    # One dict entry per snapshot MESSAGE, holding ALL its rows (book + AGG +
     # status). snapshot() filters internally; it needs the AGG and phase rows.
-    snap_groups = dict(tuple(s.groupby("msg_seq")))
+    snap_groups = dict(tuple(s.groupby("snap_key")))
     # One (ts_exch, ts_cap) pair per snapshot message. Grouping on the FULL
     # frame means status-only messages also become events (phase changes).
-    snap_ev = s.groupby("msg_seq", as_index=False)[["ts_exch", "ts_cap"]].min()
+    snap_ev = s.groupby("snap_key", as_index=False)[["ts_exch", "ts_cap"]].min()
 
     # Updates: kind "U", rank 1, ordered within a ms by appl_seq.
     events = [(r.ts_exch, 1, r.appl_seq, "U", r) for r in u.itertuples()]

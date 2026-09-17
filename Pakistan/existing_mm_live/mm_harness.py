@@ -244,7 +244,13 @@ def run_symbol_day(date, sym, dsets, params, want_fs=False, cfg_overrides=None):
     # the day's order-book updates for this symbol
     u = R.read_symbol(dsets["ob_updates"], R.REQ_UPDATES, sym)
     # the day's book snapshots for this symbol
-    s = R.read_symbol(dsets["ob_snapshot"], R.REQ_SNAP, sym)
+    # REGULAR MARKET ONLY, added 2026-09-17. A symbol can be listed in more
+    # than one PSX market under the same ticker -- MLCF appears in both REG
+    # and EQ_SQUARE_UP -- and a snapshot from the wrong one REPLACES the whole
+    # book with a different instrument's prices until the next regular
+    # snapshot arrives. Without this argument the filter in read_symbol is
+    # simply not applied and the bug stands.
+    s = R.read_symbol(dsets["ob_snapshot"], R.REQ_SNAP, sym, market="REG")
     # the day's trades for this symbol
     t = R.read_symbol(dsets["trades"], R.REQ_TRADES, sym)
     # unrunnable without both a book and trades

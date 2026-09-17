@@ -20,7 +20,7 @@ mm_backtest = pytest.importorskip(
 # the production side
 from core.model import (BookLevel, BookSnapshot, DesiredQuotes, QuoteIntent,
                         Side)
-from core.oms import OrderManager
+from core.oms import OrderManager, QuoteTolerance
 from core.risk import KillSwitch, OrderQuantityCheck, RiskGateway
 from core.venue import SessionSegment
 from venues.psx import PSXVenue
@@ -321,32 +321,255 @@ def test_a_cancel_racing_a_fill_becomes_a_cancel_reject_not_a_stuck_order():
 # ---------------------------------------------------------------------------
 # the gate's own preconditions
 # ---------------------------------------------------------------------------
-def test_an_amendment_stops_the_run_rather_than_quietly_diverging():
-    """mm_backtest has no amendment path, so a run using one is not comparable."""
-    # a manager configured to amend
+def _amending_replay(returns, quantity_policy="exact"):
+    """A replay harness whose order manager amends instead of cancel+new.
+
+    `quantity_policy` defaults to "exact" -- mm_backtest's rule, which requotes
+    on ANY size difference. The order manager's own default is "ignore", under
+    which a size-only change produces no message at all, so a test of what an
+    amendment does to queue position would silently test nothing.
+    """
+    # the venue, which is also what supplies the three priority rules
     venue = PSXVenue(session_provider=lambda d: [
         SessionSegment(start_ms=OPEN_MS, end_ms=CLOSE_MS)])
-    mm = StubMM({"BUY": (289.00, 50)})
+    # a scripted strategy
+    mm = StubMM(returns)
+    # the production adapter
     adapter = MicroMMAdapter("PPL", venue, mm, reference_price_minor=28900)
+    # THE TOGGLE: use_replace=True sends one Change Former Order per reprice
+    # instead of a cancel and a new order
     oms = OrderManager(venue=venue,
                        gateway=RiskGateway([OrderQuantityCheck(1_000_000)]),
                        kill_switch=KillSwitch(), session_id="R",
-                       account="CLIENT001", use_replace=True)
+                       account="CLIENT001", use_replace=True,
+                       tolerance=QuoteTolerance(
+                           quantity_policy=quantity_policy))
+    # constant latency, so a test can say precisely when a message lands
     cfg = {"latency_ms": 100, "at_price_mode": "queue",
            "fill_on_crossing_adds": False, "log_equity": False,
            "session_ms": (OPEN_MS, CLOSE_MS)}
+    # the harness
     replay = EngineReplay(strategy=mm, adapter=adapter, oms=oms, symbol="PPL",
                           cfg=cfg)
+    # the risk gateway's window check needs a date
     replay.session_date = DAY
+    # a two-sided book to quote against
     set_book(replay)
-    # rest an order
+    # everything the tests need
+    return replay, oms, mm, venue
+
+
+def test_the_venue_drives_the_engines_priority_rules():
+    """The simulated exchange must not have its own opinion.
+
+    Two sets of flags mean the same thing -- the venue's and the engine's --
+    and if they ever drift, every fill after a reprice is wrong in the same
+    direction with nothing raising. So they are wired, not coincidentally
+    equal, and this asserts the wiring rather than the values.
+    """
+    # a harness built against the PSX venue
+    replay, _oms, _mm, venue = _amending_replay({"BUY": (289.00, 50)})
+    # each engine flag must equal the venue's answer, not a constant
+    assert replay.cfo_price_keeps_priority is venue.replace_price_keeps_priority
+    assert replay.cfo_qty_up_keeps_priority is venue.replace_qty_up_keeps_priority
+    assert replay.cfo_qty_down_keeps_priority is venue.replace_qty_down_keeps_priority
+
+
+def test_psx_answers_the_three_priority_questions_as_the_rulebook_does():
+    """PSX Regulations 8.5.2, the only place these answers come from."""
+    # the venue
+    venue = PSXVenue(session_provider=lambda d: None)
+    # a price change re-queues at the back of the new level
+    assert venue.replace_price_keeps_priority is False
+    # so does an increase -- only reduction is carved out
+    assert venue.replace_qty_up_keeps_priority is False
+    # a reduction is amended in place and keeps its position
+    assert venue.replace_qty_down_keeps_priority is True
+
+
+def test_an_amendment_is_one_message_not_two():
+    """The whole point of the toggle: half the wire traffic per reprice."""
+    # a resting bid
+    replay, _oms, mm, _venue = _amending_replay({"BUY": (289.00, 50)})
+    # get it live
     replay._requote(OPEN_MS + 1_000)
     replay._activate_until(OPEN_MS + 2_000)
-    # move the price, which now produces a ReplaceOrder
+    # now want a different price
     mm._returns = {"BUY": (288.99, 50)}
-    # the harness refuses rather than dropping the message
-    with pytest.raises(ValueError, match="no amendment path"):
-        replay._requote(OPEN_MS + 3_000)
+    # one requote cycle
+    replay._requote(OPEN_MS + 3_000)
+    # ONE message, and it is an amendment rather than a cancel
+    assert len(replay.pending) == 1
+    assert replay.pending[0][2] == "AMEND"
+    # and the order manager did emit a ReplaceOrder to get here
+    assert replay.engine_stats["replace_actions"] == 1
+
+
+def test_the_old_terms_stay_live_until_the_amendment_lands():
+    """The real exposure of the single message, and what it costs you."""
+    # a resting bid
+    replay, _oms, mm, _venue = _amending_replay({"BUY": (289.00, 50)})
+    replay._requote(OPEN_MS + 1_000)
+    replay._activate_until(OPEN_MS + 2_000)
+    # reprice
+    mm._returns = {"BUY": (288.99, 50)}
+    replay._requote(OPEN_MS + 3_000)
+    # nothing has been cancelled: the OLD price is still resting and still
+    # matchable. Under cancel-plus-new the cancel would already be in flight.
+    assert replay.work["BUY"].price == 289.00
+    assert replay.work["BUY"].cancel_at is None
+    # and it is marked in flight, so a second amendment is not stacked on it
+    assert replay.work["BUY"].amend_at is not None
+
+
+def test_a_price_change_loses_priority_and_the_manager_is_told():
+    """PSX 8.5.2: a reprice rejoins the back of the queue at the new level."""
+    # a resting bid
+    replay, oms, mm, _venue = _amending_replay({"BUY": (289.00, 50)})
+    replay._requote(OPEN_MS + 1_000)
+    replay._activate_until(OPEN_MS + 2_000)
+    # the production order, before anything changes
+    order = oms.working_orders("PPL")[0]
+    cl_ord_id = order.cl_ord_id
+    # put a queue at the price we are moving TO, so losing priority is visible
+    replay.book.o["H3"] = mm_backtest.Order("BUY", 288.99, 700)
+    # reprice and land it
+    mm._returns = {"BUY": (288.99, 50)}
+    replay._requote(OPEN_MS + 3_000)
+    replay._activate_until(OPEN_MS + 4_000)
+    # we joined the back: all 700 are in front of us
+    assert sum(replay.work["BUY"].ahead.values()) == 700
+    # the engine counted an amendment that did NOT keep its place
+    assert replay.stats["n_cfos"] == 1
+    assert replay.stats.get("n_cfos_kept_priority", 0) == 0
+    # AND THE PRODUCTION SIDE AGREES. The order kept its identity -- it was
+    # amended, not cancelled and re-created -- and carries the new terms.
+    still = oms.working_orders("PPL")
+    assert len(still) == 1
+    assert still[0].cl_ord_id == cl_ord_id
+    assert still[0].price_minor == 28899
+
+
+def test_a_size_reduction_keeps_priority():
+    """PSX 8.5.2's one carve-out, and the only free amendment."""
+    # a resting bid, with a queue in front of it
+    replay, oms, mm, _venue = _amending_replay({"BUY": (289.00, 50)})
+    replay._requote(OPEN_MS + 1_000)
+    replay._activate_until(OPEN_MS + 2_000)
+    # the queue state that must survive
+    kept_ahead = dict(replay.work["BUY"].ahead)
+    kept_t_active = replay.work["BUY"].t_active
+    # SAME price, SMALLER size
+    mm._returns = {"BUY": (289.00, 20)}
+    replay._requote(OPEN_MS + 3_000)
+    replay._activate_until(OPEN_MS + 4_000)
+    # the line in front of us is untouched, and so is our join time
+    assert replay.work["BUY"].ahead == kept_ahead
+    assert replay.work["BUY"].t_active == kept_t_active
+    # with the smaller size applied
+    assert replay.work["BUY"].qty == 20
+    # and counted as keeping its place
+    assert replay.stats["n_cfos_kept_priority"] == 1
+    # the production order carries the new size too
+    assert oms.working_orders("PPL")[0].quantity == 20
+
+
+def test_a_size_increase_loses_priority():
+    """Only reduction is carved out; growing an order re-queues it."""
+    # a resting bid
+    replay, _oms, mm, _venue = _amending_replay({"BUY": (289.00, 50)})
+    replay._requote(OPEN_MS + 1_000)
+    replay._activate_until(OPEN_MS + 2_000)
+    # SAME price, BIGGER size
+    mm._returns = {"BUY": (289.00, 90)}
+    replay._requote(OPEN_MS + 3_000)
+    # the queue at our price grows while the message is in flight, so the
+    # re-snapshot has to happen when it LANDS, not when it was sent
+    replay.book.o["H9"] = mm_backtest.Order("BUY", 289.00, 111)
+    replay._activate_until(OPEN_MS + 4_000)
+    # 500 from the original queue plus 111 that arrived: we are behind both
+    assert sum(replay.work["BUY"].ahead.values()) == 611
+    # nothing kept its place
+    assert replay.stats.get("n_cfos_kept_priority", 0) == 0
+
+
+def test_an_amendment_that_loses_a_race_to_a_fill_is_rejected():
+    """The exchange answers with an Order Cancel Reject; so must we."""
+    # a resting bid
+    replay, oms, mm, _venue = _amending_replay({"BUY": (289.00, 50)})
+    replay._requote(OPEN_MS + 1_000)
+    replay._activate_until(OPEN_MS + 2_000)
+    # decide to reprice
+    mm._returns = {"BUY": (288.99, 50)}
+    replay._requote(OPEN_MS + 3_000)
+    # the order fills completely BEFORE the amendment lands
+    replay._fill("BUY", 289.00, 50, OPEN_MS + 3_500, "through")
+    # land the now-pointless amendment
+    replay._activate_until(OPEN_MS + 4_000)
+    # nothing was resurrected, and the rejection was counted rather than silent
+    assert "BUY" not in replay.work
+    assert replay.stats.get("stale_cfos_ignored") == 1
+    # AND THE PRODUCTION ORDER IS FINISHED, not resurrected. The amendment was
+    # refused because it lost the race to a fill -- the order is done, and the
+    # reject must not put it back into the working set. It did, before
+    # 2026-09-17: it came back as PARTIALLY_FILLED with 50 of 50 filled, where
+    # the diff would have seen a resting order matching what we wanted and left
+    # the side dark for the rest of the session.
+    assert not oms.working_orders("PPL")
+
+
+def test_a_reject_never_resurrects_a_finished_order():
+    """The bug the test above found, pinned on its own.
+
+    A cancel or an amendment is most often refused because it LOST A RACE: the
+    order filled before the exchange reached our message. Returning it to LIVE
+    puts an order the exchange has finished with back in our working set, and
+    the diff then leaves that side alone forever.
+    """
+    # a resting bid
+    replay, oms, mm, _venue = _amending_replay({"BUY": (289.00, 50)})
+    replay._requote(OPEN_MS + 1_000)
+    replay._activate_until(OPEN_MS + 2_000)
+    # the production order, and its id
+    order = oms.working_orders("PPL")[0]
+    # it fills completely
+    replay._fill("BUY", 289.00, 50, OPEN_MS + 2_500, "through")
+    # it is finished
+    assert order.state.is_terminal
+    # now a late reject arrives quoting that order
+    oms.on_cancel_rejected(order.cl_ord_id, "too late, already filled")
+    # it stays finished
+    assert order.state.is_terminal
+    # and it is not back in the working set
+    assert not oms.working_orders("PPL")
+
+
+def test_an_amended_order_can_still_be_cancelled():
+    """The engine renames the order; the production side does not.
+
+    Backtester gives an amended order a NEW internal id. The order manager
+    still knows it by its original client order id. If the two are not kept in
+    step, the cancel silently matches nothing and the quote stays in the book.
+    """
+    # a resting bid
+    replay, oms, mm, _venue = _amending_replay({"BUY": (289.00, 50)})
+    replay._requote(OPEN_MS + 1_000)
+    replay._activate_until(OPEN_MS + 2_000)
+    # amend it once, so the engine id changes
+    mm._returns = {"BUY": (288.99, 50)}
+    replay._requote(OPEN_MS + 3_000)
+    replay._activate_until(OPEN_MS + 4_000)
+    # the order survived the amendment on the production side
+    assert len(oms.working_orders("PPL")) == 1
+    # now pull the side entirely, which is a Cancel and never an amendment
+    mm._returns = {}
+    replay._requote(OPEN_MS + 5_000)
+    # a cancel was actually scheduled -- not silently dropped
+    assert len(replay.pending) == 1
+    assert replay.pending[0][2] == "CANCEL"
+    # and it lands, removing the quote
+    replay._activate_until(OPEN_MS + 6_000)
+    assert "BUY" not in replay.work
 
 
 def test_a_halt_pulls_the_quote_through_the_production_path():

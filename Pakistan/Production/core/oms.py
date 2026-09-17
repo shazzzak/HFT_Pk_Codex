@@ -60,6 +60,45 @@ class QuoteTolerance:
     # want resting. 0 = never requote on size alone, so a partial fill does not
     # cost us our queue position for the remainder.
     qty_ratio: float = 0.0
+    # WHAT TO DO WHEN THE SIZE RESTING IS NOT THE SIZE WANTED.
+    #
+    # PSX Regulations 8.5.2 makes this asymmetric, and the policy has to be
+    # too. An amendment that REDUCES the quantity is applied in place and keeps
+    # its queue position. An amendment that raises it, or changes the price,
+    # goes to the BACK of the queue at that price. So shrinking is free and
+    # growing is expensive, and a single boolean cannot express that.
+    #
+    #   "queue_preserving"
+    #                  A LIST of orders per side. Never amend upward and never
+    #                  cancel a remainder: show more size by sending a SECOND
+    #                  ORDER for the increment, so the shares already resting
+    #                  keep the place they earned and only the new ones join
+    #                  the back. Shrink the YOUNGEST order first, since a
+    #                  reduction is free and the oldest has the best position.
+    #                  This is the design worth running; the others exist to
+    #                  measure it against.
+    #
+    #   "exact"        Requote on ANY size difference. This is mm_backtest's
+    #                  rule -- its no-churn check compares price AND quantity
+    #                  -- so it is what every measured number was produced
+    #                  under, and it is what the reconcile gate runs. It tops
+    #                  the clip back up after every partial fill, and under
+    #                  8.5.2 each of those top-ups surrenders the queue
+    #                  position the order had earned.
+    #
+    #   "reduce_only"  Requote only when we want LESS than is resting. That
+    #                  amendment is the one 8.5.2 carves out, so it costs
+    #                  nothing. When we want MORE -- after a partial fill --
+    #                  leave the remainder where it is and keep its place,
+    #                  showing less size until it is hit. This is the policy
+    #                  that takes every free amendment and pays for none.
+    #
+    #   "ignore"       Never requote on size alone. Simplest, and it also
+    #                  declines the free reductions.
+    #
+    # THE DEFAULT IS "ignore" ONLY BECAUSE IT IS THE BEHAVIOUR THAT SHIPPED.
+    # It is not a recommendation. Pick one deliberately, with a number.
+    quantity_policy: str = "ignore"
 
 
 class OrderManager:
@@ -114,12 +153,33 @@ class OrderManager:
             venue.validate_text(account, "account")
         # the churn lever
         self._tol = tolerance or QuoteTolerance()
+        # A TYPO IN THE POLICY MUST NOT BE A SILENT NO-OP. Checked once here
+        # rather than on every quote, and refused rather than defaulted: an
+        # unrecognised policy that quietly behaved like "ignore" would produce
+        # a full run of numbers that answer a different question.
+        if self._tol.quantity_policy not in ("queue_preserving", "exact",
+                                             "reduce_only", "ignore"):
+            raise ValueError(
+                f"OrderManager: unknown quantity_policy "
+                f"{self._tol.quantity_policy!r}; expected one of "
+                f"queue_preserving / exact / reduce_only / ignore")
         # where every state change is recorded, for the audit trail
         self._on_event = on_event
         # what the strategy currently wants, per symbol
         self._desired: Dict[str, DesiredQuotes] = {}
         # the order resting on each (symbol, side), when there is one
-        self._working: Dict[Tuple[str, Side], Order] = {}
+        # ORDERS RESTING ON EACH SIDE, OLDEST FIRST.
+        #
+        # A LIST, not a single order, and the order of the list is its queue
+        # order. Under PSX 8.5.2 an amendment that raises an order's size sends
+        # it to the BACK of the queue at that price -- so topping a quote back
+        # up after a partial fill surrenders the position it had earned. A
+        # SECOND ORDER for the incremental size does not: the remainder keeps
+        # its place and only the new shares join the back.
+        #
+        # That is the whole reason this is a list. With one order per side the
+        # only way to show more size is to amend, and amending always pays.
+        self._working: Dict[Tuple[str, Side], List[Order]] = {}
         # every order we have ever sent this session, by its OWN id
         self._orders: Dict[str, Order] = {}
         # message ids that refer to an existing order -- the ClOrdID of a cancel
@@ -177,6 +237,42 @@ class OrderManager:
         self.flatten_all(f"kill switch: {switch.reason}")
 
     # ---- the diff ---------------------------------------------------------
+    def _unwork(self, order: Order) -> None:
+        """Take one order off its side, leaving the others where they are."""
+        # the side's list, if it has one
+        key = (order.symbol, order.side)
+        # nothing recorded for this side
+        if key not in self._working:
+            return
+        # drop this order by identity, not by value: two orders on a side can
+        # carry the same price and size and still be different orders
+        self._working[key] = [o for o in self._working[key] if o is not order]
+        # an empty side keeps no entry, so "is there anything resting" stays a
+        # simple truth test everywhere else
+        if not self._working[key]:
+            del self._working[key]
+
+    def _resting(self, symbol: str, side: Side) -> List[Order]:
+        """What is actually resting on one side, oldest first.
+
+        Terminal orders are swept out here rather than everywhere else: they
+        are not resting, and leaving them in the list would make the size
+        arithmetic below count shares that no longer exist.
+        """
+        # whatever the side has
+        orders = self._working.get((symbol, side), [])
+        # only the ones the exchange may still fill
+        live = [o for o in orders if o.state.is_working]
+        # keep the list clean so the next call does less work
+        if len(live) != len(orders):
+            # write back, or drop the side entirely when nothing survives
+            if live:
+                self._working[(symbol, side)] = live
+            else:
+                self._working.pop((symbol, side), None)
+        # oldest first, which is best queue position first
+        return live
+
     def _matches(self, order: Order, want: QuoteIntent) -> bool:
         """Is this resting order close enough to what we want to leave alone?"""
         # the tick size around this price; a tiered venue varies it by price
@@ -186,6 +282,20 @@ class OrderManager:
         # a price move beyond the tolerance means requote
         if drift > self._tol.price_ticks:
             return False
+        # THE SIZE POLICY, per QuoteTolerance above. Checked before the ratio
+        # because "exact" is the stricter rule and subsumes it.
+        policy = self._tol.quantity_policy
+        # mm_backtest's rule: any difference at all is a requote
+        if policy == "exact":
+            # including the size lost to a partial fill, which it tops back up
+            if order.leaves_quantity != want.quantity:
+                return False
+        # take the free amendment, never the expensive one
+        elif policy == "reduce_only":
+            # wanting LESS than is resting: 8.5.2 applies that in place
+            if want.quantity < order.leaves_quantity:
+                return False
+            # wanting MORE: leave it, because growing costs the queue position
         # a size check only when one was asked for; 0 disables it entirely, so
         # a partial fill does not cost us the queue position for the remainder
         if self._tol.qty_ratio > 0.0:
@@ -196,80 +306,239 @@ class OrderManager:
         return True
 
     def _plan_side(self, symbol: str, side: Side,
-                   want: Optional[QuoteIntent]) -> Optional[Action]:
-        """What, if anything, needs to happen on one side of one symbol."""
-        # the order currently resting on this side, if any
-        order = self._working.get((symbol, side))
-        # a terminal order is not resting; forget it and treat the side as empty
-        if order is not None and order.state.is_terminal:
-            self._working.pop((symbol, side), None)
-            order = None
-        # NOTHING RESTING
+                   want: Optional[QuoteIntent]) -> List[Action]:
+        """Dispatch to whichever quoting design this manager is configured for.
+
+        TWO DESIGNS, AND THE DIFFERENCE IS QUEUE POSITION.
+
+        "queue_preserving" holds a LIST of orders per side. After a partial
+        fill it tops the quote back up with a SECOND ORDER, so the remainder
+        keeps the place it earned and only the increment joins the back of the
+        queue. When it has to shrink, it shrinks the youngest order first.
+        This is the design worth running.
+
+        "exact" and "ignore" hold ONE order per side and express every change
+        as a cancel-and-replace or an amendment of that single order. "exact"
+        is mm_backtest's rule -- requote on any difference in price or size --
+        and it exists so the reconcile gate can reproduce the measured numbers.
+        It surrenders queue position on every top-up, which is precisely the
+        cost the other design avoids and the thing worth measuring.
+        """
+        # the list design
+        if self._tol.quantity_policy == "queue_preserving":
+            return self._plan_side_multi(symbol, side, want)
+        # the single-order design, which is what shipped
+        return self._plan_side_single(symbol, side, want)
+
+    def _plan_side_single(self, symbol: str, side: Side,
+                          want: Optional[QuoteIntent]) -> List[Action]:
+        """ONE order per side. The behaviour every measured number came from.
+
+        Kept so the reconcile gate has something to compare against. Under this
+        design a top-up is an amendment or a cancel-and-replace of the whole
+        order, and PSX 8.5.2 sends that to the back of the queue every time.
+        """
+        # whatever is resting, at most one under this design
+        resting = self._resting(symbol, side)
+        # the single order, or nothing
+        order = resting[0] if resting else None
+        # ---- NOTHING RESTING ------------------------------------------
         if order is None:
             # and nothing wanted: no action
             if want is None:
-                return None
+                return []
             # wanted but absent: send it
-            return PlaceOrder(symbol=symbol, cl_ord_id=self._next_id(),
-                              side=side, price_minor=want.price_minor,
-                              quantity=want.quantity, account=self._account)
-        # IN FLIGHT. The exchange has not answered yet, so we do not know what
-        # it thinks exists. Acting now is how an order manager ends up with two
-        # orders resting where it intended one.
-        #
-        # AND ON PSX IT IS NOT MERELY UNWISE, IT IS IMPOSSIBLE. Both the Order
-        # Cancel Request (MsgType 'F') and the Order Cancel/Replace Request
-        # ('G') carry OrderID (tag 37) as a REQUIRED field, and OrderID is
-        # assigned by the exchange on the acknowledgement. Before the ack there
-        # is literally nothing to put in the message. Wait.
+            return [self._place(symbol, side, want.price_minor, want.quantity)]
+        # ---- IN FLIGHT: WAIT ------------------------------------------
+        # PSX requires OrderID on a cancel or an amendment, and OrderID is
+        # assigned on the acknowledgement. Before the ack there is nothing to
+        # put in the message.
         if order.state.is_in_flight:
-            return None
-        # SUSPENDED. The exchange is holding it inactive; it cannot trade and it
-        # cannot be amended into a live quote. Leave it and let an operator
-        # resolve it, rather than guessing at a resume.
+            return []
+        # ---- SUSPENDED: leave it for an operator -----------------------
         if order.state is OrderState.SUSPENDED:
-            return None
-        # RESTING, AND NOT WANTED
+            return []
+        # ---- RESTING, NOT WANTED ---------------------------------------
         if want is None:
-            return self._cancel(order)
-        # RESTING, AND CLOSE ENOUGH
+            return [self._cancel(order)]
+        # ---- RESTING, CLOSE ENOUGH -------------------------------------
         if self._matches(order, want):
-            return None
-        # RESTING, AND WRONG.
-        #
-        # RESOLVED 2026-09-16 BY THE PSX FIX SPECIFICATION v1.2. The earlier
-        # version of this file cancelled and then placed on a later cycle,
-        # because it could not be confirmed that the venue accepted an
-        # amendment. It does: Order Cancel/Replace Request (MsgType 'G')
-        # "will be used to change any valid attribute of an open order (i.e.
-        # reduce/increase quantity, change limit price...)".
-        #
-        # One message therefore replaces two, and the window in which we had
-        # cancelled and not yet replaced -- a window in which we were simply not
-        # quoting -- disappears.
-        #
-        # WHAT IT DOES NOT BUY: the specification does not say whether an
-        # amendment keeps queue position. On most venues a price change or a
-        # size increase goes to the back of the queue. Treat the latency saving
-        # as real and any queue saving as unproven until UAT measures it.
-        # OFF BY DEFAULT -- see use_replace in the constructor. Amendment is
-        # the better wire mechanic and PSX accepts it, but it is not what the
-        # measured results were produced under.
+            return []
+        # ---- RESTING, WRONG: amend if the venue takes one, else replace --
         if (self._use_replace and self._venue.supports_replace
                 and order.exchange_order_id):
-            return ReplaceOrder(symbol=symbol, cl_ord_id=self._next_id(),
-                                side=side, price_minor=want.price_minor,
-                                quantity=want.quantity, account=self._account,
-                                orig_cl_ord_id=order.cl_ord_id,
-                                exchange_order_id=order.exchange_order_id)
-        # CANCEL NOW, PLACE ON A LATER CYCLE. The replacement is not sent here
-        # and must not be: PSX assigns OrderID on the acknowledgement, so until
-        # this cancel is acknowledged there is one order on this side and the
-        # in-flight rule above forbids acting on it. mm_backtest sends both at
-        # once because it is not bound by that -- it knows its own order ids --
-        # and the difference is one cycle of latency, not a different mechanic.
-        # A venue with no amendment at all takes this same path.
-        return self._cancel(order)
+            return [self._replace(order, want)]
+        # cancel now, place on a later cycle -- the in-flight rule above holds
+        # the side until the exchange has answered
+        return [self._cancel(order)]
+
+    def _plan_side_multi(self, symbol: str, side: Side,
+                         want: Optional[QuoteIntent]) -> List[Action]:
+        """What, if anything, needs to happen on one side of one symbol.
+
+        RETURNS A LIST, because showing more size at a price we are already
+        resting at takes a SECOND ORDER, not an amendment. PSX Regulations
+        8.5.2: an amendment that raises the size goes to the back of the queue
+        at that price, while a second order leaves the first exactly where it
+        is and sends only the new shares to the back. The first order keeps
+        the priority it earned; we pay only on the increment.
+
+        The four cases:
+
+          nothing wanted        cancel everything resting on this side.
+          nothing resting       place the full size.
+          resting, wrong price  the price moved, so priority at the old level
+                                is worthless. Move the oldest order to the new
+                                price and cancel any others.
+          resting, right price  compare TOTAL resting size against what we
+                                want. Short -> add a second order for the
+                                difference. Over -> reduce, shrinking the
+                                YOUNGEST order first so the oldest keeps its
+                                place. A reduction is the one amendment 8.5.2
+                                applies in place, so it costs nothing.
+        """
+        # what is actually resting here, oldest first
+        resting = self._resting(symbol, side)
+
+        # ---- NOTHING WANTED -------------------------------------------
+        if want is None:
+            # pull everything that is not already on its way out
+            return [self._cancel(o) for o in resting
+                    if not o.state.is_in_flight]
+
+        # ---- ANYTHING IN FLIGHT: WAIT ----------------------------------
+        # The exchange has not answered yet, so we do not know what it thinks
+        # exists. AND ON PSX IT IS NOT MERELY UNWISE: Order Cancel ('F') and
+        # Cancel/Replace ('G') both carry OrderID (tag 37) as REQUIRED, and
+        # OrderID is assigned on the acknowledgement. Before the ack there is
+        # literally nothing to put in the message.
+        #
+        # NOTE THIS BLOCKS THE WHOLE SIDE, not just the in-flight order. Adding
+        # a second order while the first is unacknowledged would be safe on the
+        # wire, but it would make the resting total ambiguous at the moment the
+        # risk gateway judges it, and the gateway is not a place for ambiguity.
+        if any(o.state.is_in_flight for o in resting):
+            return []
+
+        # ---- SUSPENDED --------------------------------------------------
+        # Held inactive by the exchange: it cannot trade and cannot be amended
+        # into a live quote. Leave it for an operator rather than guessing.
+        if any(o.state is OrderState.SUSPENDED for o in resting):
+            return []
+
+        # ---- NOTHING RESTING --------------------------------------------
+        if not resting:
+            # the whole size, in one order
+            return [self._place(symbol, side, want.price_minor, want.quantity)]
+
+        # ---- SPLIT BY PRICE ---------------------------------------------
+        # orders already at the price we want, oldest first
+        at_price = [o for o in resting
+                    if self._matches_price(o, want)]
+        # and everything sitting at a price we no longer want.
+        # BY IDENTITY, NOT BY VALUE. Order is a plain dataclass, so `in` would
+        # compare every field -- and two orders on the same side at the same
+        # price for the same size are equal by that test while being different
+        # orders with different places in the queue.
+        at_ids = {id(o) for o in at_price}
+        off_price = [o for o in resting if id(o) not in at_ids]
+
+        # ---- THE PRICE MOVED --------------------------------------------
+        # Priority at a price we are leaving is worth nothing, so there is
+        # nothing to protect here. Move the oldest order across and cancel the
+        # rest; the size arithmetic below then applies on the next cycle.
+        if off_price and not at_price:
+            # the one we move
+            first = off_price[0]
+            # an amendment when the venue takes one and we have its handle,
+            # otherwise the cancel-and-replace path on the next cycle
+            head = ([self._replace(first, want)]
+                    if (self._use_replace and self._venue.supports_replace
+                        and first.exchange_order_id)
+                    else [self._cancel(first)])
+            # anything else on this side is surplus at a stale price
+            return head + [self._cancel(o) for o in off_price[1:]]
+
+        # a stale order alongside good ones is simply cancelled
+        actions: List[Action] = [self._cancel(o) for o in off_price]
+
+        # ---- SAME PRICE: COMPARE TOTALS ---------------------------------
+        # every share we have resting at this price
+        total = sum(o.leaves_quantity for o in at_price)
+
+        # SHORT OF WHAT WE WANT -> A SECOND ORDER FOR THE DIFFERENCE.
+        # This is the case the whole list exists for. The orders already there
+        # keep their queue position untouched; only the increment joins the
+        # back.
+        if total < want.quantity:
+            # just the shortfall, never the whole size again
+            actions.append(self._place(symbol, side, want.price_minor,
+                                       want.quantity - total))
+            return actions
+
+        # OVER WHAT WE WANT -> REDUCE, YOUNGEST FIRST.
+        # A reduction keeps its place under 8.5.2, so this costs nothing. Doing
+        # it youngest-first matters: the oldest order has the best position in
+        # the queue and is the last thing to give up.
+        if total > want.quantity:
+            # how many shares have to come off
+            excess = total - want.quantity
+            # walk from the back of the list, which is the back of the queue
+            for o in reversed(at_price):
+                # done
+                if excess <= 0:
+                    break
+                # how much this order can give up
+                take = min(excess, o.leaves_quantity)
+                # it goes entirely: a cancel, not a zero-size amendment
+                if take >= o.leaves_quantity:
+                    actions.append(self._cancel(o))
+                # it shrinks: the free amendment, when the venue takes one
+                elif (self._use_replace and self._venue.supports_replace
+                      and o.exchange_order_id):
+                    # same price, smaller size -- applied in place
+                    actions.append(self._replace(
+                        o, QuoteIntent(side=side,
+                                       price_minor=o.price_minor,
+                                       quantity=o.leaves_quantity - take)))
+                # no amendment available: cancelling is the only way to shrink,
+                # and it costs the position. Better than showing size we do not
+                # want.
+                else:
+                    actions.append(self._cancel(o))
+                # account for what came off
+                excess -= take
+            return actions
+
+        # EXACTLY RIGHT: leave every one of them alone.
+        return actions
+
+    def _matches_price(self, order: Order, want: QuoteIntent) -> bool:
+        """Is this order at the price we want, within the tolerance?"""
+        # the tick around this price; a tiered venue varies it
+        tick = self._venue.tick_minor(want.price_minor)
+        # distance in ticks
+        drift = abs(order.price_minor - want.price_minor) / tick
+        # inside the tolerance counts as the same price
+        return drift <= self._tol.price_ticks
+
+    def _place(self, symbol: str, side: Side, price_minor: int,
+               quantity: int) -> PlaceOrder:
+        """A new order for a stated size at a stated price."""
+        # every field the venue requires on a New Order Single
+        return PlaceOrder(symbol=symbol, cl_ord_id=self._next_id(), side=side,
+                          price_minor=price_minor, quantity=quantity,
+                          account=self._account)
+
+    def _replace(self, order: Order, want: QuoteIntent) -> ReplaceOrder:
+        """An amendment carrying every identifier the venue requires."""
+        # PSX needs a NEW ClOrdID for the amendment, the original's id, and the
+        # exchange's own handle for the order being changed
+        return ReplaceOrder(symbol=order.symbol, cl_ord_id=self._next_id(),
+                            side=order.side, price_minor=want.price_minor,
+                            quantity=want.quantity, account=self._account,
+                            orig_cl_ord_id=order.cl_ord_id,
+                            exchange_order_id=order.exchange_order_id)
 
     def _cancel(self, order: Order) -> CancelOrder:
         """A cancel carrying every identifier the venue requires."""
@@ -307,30 +576,33 @@ class OrderManager:
                 else desired
             # both sides of the book
             for side in (Side.BUY, Side.SELL):
-                # what this side needs, if anything
-                action = self._plan_side(symbol, side, effective.side(side))
-                # nothing to do on this side
-                if action is None:
-                    continue
-                # the state the risk controls judge against
-                ctx = RiskContext(date=date, timestamp_ms=now_ms,
-                                  position=self._position.get(symbol, 0),
-                                  reference_price_minor=refs.get(symbol))
-                # EVERY action clears the gateway. There is no other path out.
-                decision = self._gateway.authorise(action, ctx)
-                # refused: record it and leave the side as it is. A refused
-                # place simply means no quote on that side this cycle, which is
-                # the control doing its job, not an error to work around.
-                if not decision.allowed:
-                    self._emit("risk_rejected",
-                               {"symbol": symbol, "side": side.value,
-                                "check": decision.check,
-                                "reason": decision.reason})
-                    continue
-                # approved: move our own state to match what is now in flight
-                self._mark_sent(action)
-                # cancels are collected separately so they can go out first
-                (cancels if action.is_cancel else places).append(action)
+                # what this side needs -- a LIST, because showing more size
+                # at a price we already rest at takes a second order
+                for action in self._plan_side(symbol, side,
+                                              effective.side(side)):
+                    # the state the risk controls judge against
+                    ctx = RiskContext(date=date, timestamp_ms=now_ms,
+                                      position=self._position.get(symbol, 0),
+                                      reference_price_minor=refs.get(symbol))
+                    # EVERY action clears the gateway. There is no other path.
+                    decision = self._gateway.authorise(action, ctx)
+                    # refused: record it and move on. A refused place means no
+                    # quote there this cycle, which is the control working.
+                    #
+                    # NOTE ONE REFUSAL DOES NOT CANCEL THE OTHERS. Each action
+                    # on a side is judged on its own: a rejected top-up must
+                    # not also drop the cancel that was going out beside it,
+                    # because the cancel is the half that REDUCES exposure.
+                    if not decision.allowed:
+                        self._emit("risk_rejected",
+                                   {"symbol": symbol, "side": side.value,
+                                    "check": decision.check,
+                                    "reason": decision.reason})
+                        continue
+                    # approved: move our own state to match what is in flight
+                    self._mark_sent(action)
+                    # cancels are collected separately so they go out first
+                    (cancels if action.is_cancel else places).append(action)
         # CANCELS BEFORE PLACES, always. Within one cycle this keeps total
         # resting size at or below the intended amount at every instant; the
         # reverse order would briefly double it.
@@ -345,9 +617,11 @@ class OrderManager:
                           side=action.side, price_minor=action.price_minor,
                           quantity=action.quantity,
                           state=OrderState.PENDING_NEW)
-            # remember it by id and as the resting order for that side
+            # remember it by id, and APPEND to the side -- appending is what
+            # keeps the list in queue order, oldest first, which is what the
+            # reduce path relies on to shrink the youngest first
             self._orders[order.cl_ord_id] = order
-            self._working[(order.symbol, order.side)] = order
+            self._working.setdefault((order.symbol, order.side), []).append(order)
             # record it
             self._emit("order_sent",
                        {"cl_ord_id": order.cl_ord_id, "symbol": order.symbol,
@@ -433,7 +707,7 @@ class OrderManager:
         self._gateway.on_trade()
         # a fully filled order is no longer resting
         if order.state is OrderState.FILLED:
-            self._working.pop((order.symbol, order.side), None)
+            self._unwork(order)
         # record it
         self._emit("fill", {"cl_ord_id": fill.cl_ord_id, "symbol": fill.symbol,
                             "side": fill.side.value, "px": fill.price_minor,
@@ -490,6 +764,25 @@ class OrderManager:
         # nothing to do for an order we do not have
         if order is None:
             return
+        # A TERMINAL ORDER STAYS TERMINAL, added 2026-09-17.
+        #
+        # The commonest reason a cancel or an amendment is refused is that it
+        # LOST A RACE: the order filled, or was already cancelled, before the
+        # exchange reached our message. The order is finished. Putting it back
+        # to LIVE would return an order the exchange has done with to our
+        # working set, where _plan_side sees a resting order that matches what
+        # we want and leaves it alone -- forever. The side then never quotes
+        # again for the rest of the session and nothing raises.
+        #
+        # Found by the reconcile-gate tests: an amendment that lost to a full
+        # fill came back as PARTIALLY_FILLED with 50 of 50 filled.
+        if order.state.is_terminal:
+            # say so, because a reject arriving after the end is worth seeing
+            self._emit("cancel_rejected_after_terminal",
+                       {"cl_ord_id": cl_ord_id, "reason": reason,
+                        "state": order.state.value})
+            # and change nothing
+            return
         # back to resting, keeping any partial fill already taken
         order.state = (OrderState.PARTIALLY_FILLED if order.filled_quantity
                        else OrderState.LIVE)
@@ -506,8 +799,8 @@ class OrderManager:
             return
         # now genuinely off the book
         order.on_cancelled()
-        # and no longer the resting order for its side
-        self._working.pop((order.symbol, order.side), None)
+        # and no longer resting on its side
+        self._unwork(order)
         # record it
         self._emit("order_cancelled", {"cl_ord_id": cl_ord_id})
 
@@ -520,8 +813,8 @@ class OrderManager:
             return
         # terminal, with the reason kept for the audit trail
         order.on_rejected(reason)
-        # the side is empty again, so the next reconcile may re-quote it
-        self._working.pop((order.symbol, order.side), None)
+        # one fewer order resting, so the next reconcile may replace it
+        self._unwork(order)
         # record it
         self._emit("order_rejected", {"cl_ord_id": cl_ord_id,
                                       "reason": reason})

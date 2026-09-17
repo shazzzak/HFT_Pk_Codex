@@ -84,8 +84,13 @@ REQ_TRADES = ["symbol", "transact_time", "capture_ts", "price", "qty",
               "initiator", "aggressor_side", "resting_order_id", "appl_seq"]
 REQ_UPDATES = ["symbol", "transact_time", "capture_ts", "order_id", "side",
                "price", "qty", "event", "appl_seq"]
+# `market` added 2026-09-17. MLCF carries 69 EQ_SQUARE_UP rows alongside
+# 272,894 REG rows, and nothing filtered on market -- so a square-up snapshot
+# message would REPLACE that symbol's whole book (square-up best bid 122.49
+# against the regular market's 95.86 ask) until the next regular snapshot
+# arrived. Selected here so read_symbol can filter it out.
 REQ_SNAP = ["symbol", "msg_seq", "orig_time", "capture_ts", "entry_type",
-            "px", "phase", "order_ids", "order_qtys", "qty"]
+            "px", "phase", "order_ids", "order_qtys", "qty", "market"]
 
 
 # --------------------------- loader helpers ---------------------------------
@@ -130,8 +135,10 @@ def parse_rest_oid(x):
 def build_events(u: pd.DataFrame, s: pd.DataFrame, t: pd.DataFrame):
     """In-memory twin of mm_backtest.load_events (post-read section).
 
-    Same timestamp derivation, same rest_oid parse, same snap_groups keyed by
-    msg_seq, same event tuples and the same (ts_exch, kind_rank, appl_seq) sort.
+    Same timestamp derivation, same rest_oid parse, same event tuples and the
+    same (ts_exch, kind_rank, appl_seq) sort. snap_groups is keyed by
+    snap_key ("msg_seq|orig_time"), NOT msg_seq -- see the note at the
+    grouping; msg_seq alone is not unique per snapshot message.
     Returns (events, snap_groups, t) just like load_events.
     """
     # Exchange clock: transact_time for updates/trades, orig_time for snapshots.
@@ -153,11 +160,37 @@ def build_events(u: pd.DataFrame, s: pd.DataFrame, t: pd.DataFrame):
     # so Book.snapshot() does zero pandas per call (removes the 89%-runtime
     # bottleneck). snap_groups now maps msg_seq -> PreparsedSnapshot, not DataFrame.
     from snapshot_prep import prep_snapshot
-    # build the dict of pre-parsed snapshots keyed by msg_seq
-    snap_groups = {ms: prep_snapshot(grp) for ms, grp in s.groupby("msg_seq")}
-    
+    # ---- THE SNAPSHOT GROUPING KEY, CORRECTED 2026-09-17 ---------------
+    # msg_seq ALONE IS NOT UNIQUE PER SNAPSHOT MESSAGE. Grouping on it merged
+    # two different 35=W messages into one book.
+    #
+    # MEASURED, not inferred. NRL and MLCF, 2026-06-30:
+    #   symbol+msg_seq            90 of 12,476 groups held TWO level-1 bids
+    #   symbol+msg_seq+market     90   (market does not separate them)
+    #   symbol+msg_seq+channel    90   (nor does channel)
+    #   symbol+msg_seq+orig_time   0 of 12,566   -- clean
+    #
+    # Same symbol, same channel, same market, DIFFERENT orig_time: the FIX
+    # sequence number repeats within the day. Two ladders in one book means
+    # two level-1 bids and two level-1 offers, and the touch then reads as one
+    # message's bid against the other's ask -- which is the crossed-book
+    # finding, 275 of 285 of them inverted more than one level deep.
+    #
+    # THE CROSSINGS ARE THE VISIBLE PART ONLY. A merge whose ladders happen
+    # not to cross gives a book with doubled depth and a wrong shape, and
+    # nothing flags it. 0.72% of snapshot messages were affected.
+    #
+    # CAVEAT: orig_time is tag 42 and second-precision, so two genuinely
+    # distinct snapshots inside one second would still merge. It separates
+    # every case in the sample; the durable fix is a per-message id from the
+    # parser.
+    s["snap_key"] = (s["msg_seq"].astype("int64").astype(str) + "|"
+                     + s["orig_time"].astype(str))
+    # build the dict of pre-parsed snapshots keyed by that composite
+    snap_groups = {k: prep_snapshot(grp) for k, grp in s.groupby("snap_key")}
+
     # One (ts_exch, ts_cap) per message; status-only messages become events too.
-    snap_ev = s.groupby("msg_seq", as_index=False)[["ts_exch", "ts_cap"]].min()
+    snap_ev = s.groupby("snap_key", as_index=False)[["ts_exch", "ts_cap"]].min()
 
     # Build the merged event list -- identical ordering contract to load_events.
     events = [(r.ts_exch, 1, r.appl_seq, "U", r) for r in u.itertuples()]
@@ -195,9 +228,22 @@ def validate_schema(dsets):
                        + "\n  ".join(problems))
 
 
-def read_symbol(dset, cols, sym):
+def read_symbol(dset, cols, sym, market=None):
+    """One symbol's rows, optionally restricted to a single market.
+
+    `market` added 2026-09-17. A symbol can be listed in more than one PSX
+    market under the same ticker -- MLCF appears in both REG and EQ_SQUARE_UP
+    -- and a snapshot from the wrong one replaces the whole book. Passing
+    market="REG" keeps the regular market only.
+    """
     # Predicate pushdown on symbol (leading sort key -> row-group pruning).
-    tbl = dset.to_table(columns=cols, filter=ds.field("symbol") == sym)
+    pred = ds.field("symbol") == sym
+    # and on market, when the caller asked for one and the table carries it
+    if market is not None and "market" in cols:
+        # both conditions pushed down together
+        pred = pred & (ds.field("market") == market)
+    # read it
+    tbl = dset.to_table(columns=cols, filter=pred)
     return tbl.to_pandas()
 
 
@@ -247,7 +293,9 @@ def make_strategy(session_ms=(0, 1)):
 def run_one(date, sym, dsets):
     """Run one symbol-day. Returns a summary dict, or None if not runnable."""
     u = read_symbol(dsets["ob_updates"], REQ_UPDATES, sym)
-    s = read_symbol(dsets["ob_snapshot"], REQ_SNAP, sym)
+    # REGULAR MARKET ONLY. Without this a square-up snapshot replaces the
+    # book with a different instrument's prices until the next regular one.
+    s = read_symbol(dsets["ob_snapshot"], REQ_SNAP, sym, market="REG")
     t = read_symbol(dsets["trades"], REQ_TRADES, sym)
     # A pure MM needs a trade stream and a book; skip empties.
     if len(t) == 0 or len(s) == 0:
