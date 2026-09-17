@@ -576,8 +576,19 @@ def measure(date, st, session_id=None):
         # continuous close, both clocks
         "close_utc": close_utc,
         "close_pkt": close_utc + PKT_OFFSET,
-        # the span from open to close, breaks included
-        "open_to_close_seconds": float((close_utc - open_utc).total_seconds()),
+        # THE SPAN FROM OPEN TO CLOSE, breaks included, COUNTED THE SAME WAY
+        # AS EVERYTHING ELSE IN THIS ROW.
+        #
+        # This was (close - open).total_seconds(), an elapsed-time
+        # subtraction, while traded/break/unobserved/other are COUNTS of
+        # seconds on the per-second grid. Mixing the two conventions made the
+        # parts exceed the whole by exactly one second on every date -- a
+        # clean day printed "traded 15,180s of 15,179s", which is nonsense on
+        # its face -- and the balance check below only passed because I had
+        # given it a tolerance. A check that needs slack to pass is not
+        # checking. Counting inclusively, as the grid does, makes the parts
+        # sum to the whole exactly and the check exact with it.
+        "open_to_close_seconds": float(close_off - open_off + 1),
         # THE NUMBER THAT MATTERS: seconds of actual continuous trading
         "traded_seconds": float(traded),
         # how many continuous stretches made it up (2 on a split Friday)
@@ -1083,17 +1094,19 @@ def main():
         print("      A market halt looks like this. The phases are the")
         print("      exchange's own words; no cause is asserted here.")
 
-    # ---- THE SECONDS MUST ADD UP -----------------------------------------
-    # traded + break + unobserved + other should equal open-to-close on every
-    # date, give or take one second per continuous stretch (each stretch is
-    # measured inclusively). A date where they do not is a bug in this file,
-    # and is far better found here than by a consumer.
+    # ---- THE SECONDS MUST ADD UP, EXACTLY --------------------------------
+    # traded + break + unobserved + other == open-to-close, to the second, on
+    # every date. NO TOLERANCE. Every one of those five numbers is a count of
+    # seconds on the same per-second grid, so there is nothing for a
+    # tolerance to absorb; an earlier version allowed a second per continuous
+    # stretch and that slack silently hid a constant off-by-one in
+    # open_to_close_seconds on all 207 dates.
     _sum = (D["traded_seconds"] + D["break_seconds"]
             + D["unobserved_seconds"] + D["other_seconds"])
     # how far off each date is
     _off = (D["open_to_close_seconds"] - _sum).abs()
-    # anything beyond the inclusive-counting slack
-    _bad = D[_off > (D["continuous_spans"] + 2)]
+    # anything at all
+    _bad = D[_off > 0]
     # reported loudly, because it means the accounting is wrong
     if len(_bad):
         print(f"\n  ACCOUNTING DOES NOT BALANCE on {len(_bad)} date(s) -- "

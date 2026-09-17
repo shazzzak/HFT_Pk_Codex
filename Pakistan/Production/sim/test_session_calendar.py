@@ -604,16 +604,28 @@ if long_gap is not None and long_gap.get("intervals"):
           f"stretches {_tot}s vs traded {long_gap['traded_seconds']}s")
 # but the closing bell is unmoved either way, which is what the classifier
 # keys off
-check("the seconds balance: traded + break + unobserved + other",
+# THE BALANCE IS EXACT. NO TOLERANCE.
+# An earlier version of this check allowed a second per continuous stretch,
+# and that slack hid a constant off-by-one: open_to_close_seconds was an
+# elapsed-time subtraction while the four parts are counts of seconds on the
+# per-second grid, so the parts exceeded the whole by exactly one second on
+# every one of the 207 real dates. A clean day printed "traded 15,180s of
+# 15,179s". Zero tolerance is what makes this check able to find that.
+check("the seconds balance EXACTLY: traded + break + unobserved + other",
       long_gap is not None
-      and abs(long_gap["open_to_close_seconds"]
-              - (long_gap["traded_seconds"] + long_gap["break_seconds"]
-                 + long_gap["unobserved_seconds"]
-                 + long_gap["other_seconds"]))
-      <= long_gap["continuous_spans"] + 2,
+      and (long_gap["open_to_close_seconds"]
+           == (long_gap["traded_seconds"] + long_gap["break_seconds"]
+               + long_gap["unobserved_seconds"]
+               + long_gap["other_seconds"])),
       f"open-to-close {long_gap['open_to_close_seconds'] if long_gap else None}"
       f" vs parts "
       f"{(long_gap['traded_seconds'] + long_gap['break_seconds'] + long_gap['unobserved_seconds'] + long_gap['other_seconds']) if long_gap else None}")
+# and traded can never exceed the window, which is what the bug looked like
+check("  and traded_seconds never exceeds the window",
+      long_gap is not None
+      and long_gap["traded_seconds"] <= long_gap["open_to_close_seconds"],
+      f"traded {long_gap['traded_seconds'] if long_gap else None} > window "
+      f"{long_gap['open_to_close_seconds'] if long_gap else None}")
 check("and the closing bell is unmoved by either silence",
       short_gap is not None and long_gap is not None
       and str(short_gap["close_pkt"])[11:19]

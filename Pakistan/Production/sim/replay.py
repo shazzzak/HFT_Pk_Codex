@@ -174,22 +174,67 @@ class EngineReplay(Backtester):
         # that will actually run.
         quotable = (self.book.phase in (None, "CONTINUOUS_AUCTION")
                     and not self.book.pinned())
-        # tell the adapter what the market is doing
-        self._adapter.on_phase(SecurityPhase(
-            phase=MarketPhase.CONTINUOUS if quotable else MarketPhase.HALTED))
-        # count a halted cycle the way Backtester does
+        # STALE FEED -> STAND DOWN, added 2026-09-17.
+        #
+        # Backtester grew this guard after this harness was written: when
+        # nothing has arrived for longer than stale_feed_seconds it pulls
+        # every quote and stays dark until a snapshot restores the book. The
+        # DETECTION lives in Backtester.run, which this class inherits, so
+        # self._feed_stale is already maintained correctly -- only the guard
+        # was missing, because the guard lives in the one method this class
+        # replaces. Without it the baseline stands down through roughly seven
+        # silences a day and the engine keeps quoting, and the gate reports a
+        # P&L difference that is this omission rather than the order manager.
+        if getattr(self, "_feed_stale", False):
+            # counted on both sides, as Backtester counts it
+            self.stats["stale_feed_requotes"] = \
+                self.stats.get("stale_feed_requotes", 0) + 1
+            self.engine_stats["stale_feed_requotes"] = \
+                self.engine_stats.get("stale_feed_requotes", 0) + 1
+            # the same path a halt takes
+            quotable = False
+        # CROSSED OR LOCKED BOOK -> STAND DOWN, added 2026-09-17.
+        #
+        # Backtester's skip_crossed_book guard, which this harness also
+        # predates. It matters that this sets `quotable` rather than merely
+        # skipping: the backtest CANCELS on a crossed book, and a harness that
+        # returned early would leave the quotes resting.
+        _gb, _, _ga, _ = self.book.bbo()
+        # both sides present and inverted or equal
+        if getattr(self, "skip_crossed_book", True) \
+                and _gb is not None and _ga is not None and _gb >= _ga:
+            # counted the way Backtester counts it
+            self.stats["crossed_book_requotes"] = \
+                self.stats.get("crossed_book_requotes", 0) + 1
+            # and stand down
+            quotable = False
+        # count a halted cycle the way Backtester does -- AFTER the two guards
+        # above, because Backtester counts a crossed or stale cycle as halted
+        # too
         if not quotable:
             self.stats["halted_requotes"] += 1
             self.engine_stats["halted_requotes"] += 1
         # the book the production stack sees
         book = self._snapshot(ts_know)
-        # nothing to quote against -- but a halt must still pull our quotes, so
-        # only skip entirely when the book is unusable AND we are quotable
-        if book is None and quotable:
-            return
-        # what the strategy wants. On a halt there is no book, so the desire is
-        # explicitly nothing; otherwise ask.
-        desired = (self._adapter.quote(book, self.pos) if book is not None
+        # A ONE-SIDED BOOK IS ALSO A STAND-DOWN, and this is measured rather
+        # than assumed: micro_mm.quotes opens with
+        #     if bb is None or ba is None or bq <= 0 or aq <= 0: return {}
+        # -- the identical test _snapshot uses -- and an empty desire diffs to
+        # a full cancel in Backtester. So the backtest pulls its quotes on a
+        # one-sided book. This harness used to `return` there, leaving them
+        # resting. Routing it through the flat desire below reaches the same
+        # outcome through the production order manager.
+        #
+        # It is NOT counted as a halt: Backtester does not count one, because
+        # there the strategy declines rather than the gate refusing.
+        # tell the adapter what the market is doing, which is what makes it
+        # return nothing and the order manager emit cancels
+        self._adapter.on_phase(SecurityPhase(
+            phase=MarketPhase.CONTINUOUS if (quotable and book is not None)
+            else MarketPhase.HALTED))
+        # what the strategy wants. No book, or not quotable, means nothing.
+        desired = (self._adapter.quote(book, self.pos)
+                   if (quotable and book is not None)
                    else DesiredQuotes.flat(self._symbol))
         # hand it to the production order manager
         self._oms.set_desired(desired)

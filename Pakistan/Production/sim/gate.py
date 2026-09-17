@@ -144,12 +144,28 @@ def load_symbol_day(dsets, sym):
     runs against two subtly different days -- which is exactly the kind of
     difference this file exists to rule out.
     """
+    # THE REGULAR MARKET ONLY, added 2026-09-17.
+    #
+    # A symbol can be listed in more than one PSX market under the same
+    # ticker: MLCF carries 69 EQ_SQUARE_UP rows beside 272,894 REG rows, and
+    # a square-up SNAPSHOT replaces that symbol's whole book -- square-up best
+    # bid 122.49 against the regular market's 95.86 ask -- until the next
+    # regular snapshot arrives. mm_harness.run_symbol_day was fixed for this;
+    # this file was written before that fix and never inherited it, so the
+    # gate was comparing two runs over a day the backtest would not have seen.
+    #
+    # read_symbol applies the filter only where the column list carries
+    # `market`, which today is REQ_SNAP alone, so passing it to all three is
+    # safe and keeps this identical to what mm_harness does. Identical is the
+    # requirement: the gate's job is to reproduce the backtest, so it must
+    # read the same day the backtest reads, not a better one.
+    #
     # the day's order-book updates for this symbol
-    u = R.read_symbol(dsets["ob_updates"], R.REQ_UPDATES, sym)
+    u = R.read_symbol(dsets["ob_updates"], R.REQ_UPDATES, sym, market="REG")
     # the day's book snapshots
-    s = R.read_symbol(dsets["ob_snapshot"], R.REQ_SNAP, sym)
+    s = R.read_symbol(dsets["ob_snapshot"], R.REQ_SNAP, sym, market="REG")
     # the day's trades
-    t = R.read_symbol(dsets["trades"], R.REQ_TRADES, sym)
+    t = R.read_symbol(dsets["trades"], R.REQ_TRADES, sym, market="REG")
     # unrunnable without both a book and trades
     if len(t) == 0 or len(s) == 0:
         return None

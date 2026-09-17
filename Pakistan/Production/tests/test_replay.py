@@ -618,6 +618,100 @@ def test_the_book_reaches_the_strategy_in_paisa_without_a_rounding_error():
     assert book.asks[0].price_minor == 28010
 
 
+# ---------------------------------------------------------------------------
+# the three stand-downs the harness has to share with the backtest
+# ---------------------------------------------------------------------------
+# WHY THESE EXIST. The reconcile gate asks one question: does the production
+# engine reproduce mm_backtest? That question is only answerable if the two
+# stand down in the same places. Backtester grew two guards after this harness
+# was written -- the stale-feed guard and the crossed-book guard -- and both
+# live in `_requote`, the one method the harness replaces, so neither was
+# inherited. A third case, the one-sided book, was never shared at all. In each
+# case the backtest CANCELS and the harness left the quotes resting, so the
+# gate would have reported a P&L difference that was this omission rather than
+# the order manager.
+
+
+def _resting_bid():
+    """A harness with one of our bids actually resting on the book."""
+    # the harness and its order manager
+    replay, oms, _ = build()
+    # an ordinary two-sided book in continuous trading
+    set_book(replay)
+    # ask for a quote and let it land
+    replay._requote(OPEN_MS + 1_000)
+    replay._activate_until(OPEN_MS + 2_000)
+    # nothing in flight, so the next requote's messages are unambiguous
+    replay.pending.clear()
+    # ready to be disturbed
+    return replay, oms
+
+
+def test_a_stale_feed_pulls_the_quote():
+    """Nothing has arrived for longer than a working feed ever goes quiet.
+
+    Backtester stands down and stays dark until a snapshot restores the book.
+    The DETECTION lives in Backtester.run and is inherited; only the guard was
+    missing here.
+    """
+    # a resting bid
+    replay, _ = _resting_bid()
+    # the flag Backtester.run maintains, set directly so this case tests the
+    # GUARD alone rather than the detector
+    replay._feed_stale = True
+    # the next cycle
+    replay._requote(OPEN_MS + 3_000)
+    # the quote is pulled, through the ordinary diff
+    assert len(replay.pending) == 1
+    _, _, action, _ = replay.pending[0]
+    assert action == "CANCEL"
+    # and counted the way Backtester counts it
+    assert replay.stats["stale_feed_requotes"] == 1
+    assert replay.stats["halted_requotes"] == 1
+
+
+def test_a_crossed_book_pulls_the_quote():
+    """A bid at or above the ask cannot rest at a continuously matching
+    exchange, so the reconstruction is momentarily wrong and a mid computed
+    from it is not a price. Backtester pulls; so must this.
+    """
+    # a resting bid
+    replay, _ = _resting_bid()
+    # the book crosses under us
+    set_book(replay, bid=289.05, ask=289.00)
+    # the next cycle
+    replay._requote(OPEN_MS + 3_000)
+    # pulled
+    assert len(replay.pending) == 1
+    _, _, action, _ = replay.pending[0]
+    assert action == "CANCEL"
+    # and counted under Backtester's own name for it
+    assert replay.stats["crossed_book_requotes"] == 1
+
+
+def test_a_one_sided_book_pulls_a_resting_quote():
+    """Measured, not assumed.
+
+    micro_mm.quotes opens with `if bb is None or ba is None or bq <= 0 or
+    aq <= 0: return {}` -- the identical test _snapshot uses -- and an empty
+    desire diffs to a full cancel in Backtester. So the backtest pulls its
+    quotes on a one-sided book, and this harness used to leave them resting.
+    """
+    # a resting bid
+    replay, _ = _resting_bid()
+    # the offer disappears
+    del replay.book.o["H2"]
+    # the next cycle
+    replay._requote(OPEN_MS + 3_000)
+    # pulled
+    assert len(replay.pending) == 1
+    _, _, action, _ = replay.pending[0]
+    assert action == "CANCEL"
+    # NOT counted as a halt: Backtester does not count one here, because there
+    # the strategy declines rather than the gate refusing
+    assert replay.stats["halted_requotes"] == 0
+
+
 if __name__ == "__main__":
     # A pytest file is not a script: there is no runner, and the project root is
     # not on the import path. Say so rather than failing with ModuleNotFoundError.
