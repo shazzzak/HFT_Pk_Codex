@@ -264,7 +264,8 @@ class EngineReplay(Backtester):
             # identity rather than the exchange id: an order that has already
             # been amended once carries a new exchange id, and the production
             # side still knows it by its original client order id.
-            for side_str, cur in list(self.work.items()):
+            for side_str, cur in [(s_, o_) for s_ in ("BUY", "SELL")
+                                  for o_ in list(self._side_orders(s_))]:
                 # AN ORDER STILL ON THE WIRE CANNOT BE AMENDED: PSX requires
                 # the exchange's OrderID on a CFO and it does not exist until
                 # the order is acknowledged. Skipping it here sends this action
@@ -291,6 +292,9 @@ class EngineReplay(Backtester):
                 # counted the way Backtester counts it, so the message totals
                 # of the two runs line up
                 self.stats["n_orders_sent"] += 1
+                # and separately as an amendment, same as Backtester
+                self.stats["n_amends_sent"] = (
+                    self.stats.get("n_amends_sent", 0) + 1)
                 # remember which production message the exchange is answering
                 self._amend_cl_by_oid[self._oid] = action.cl_ord_id
                 # schedule it, carrying the target generation so an amendment
@@ -317,7 +321,8 @@ class EngineReplay(Backtester):
         # exactly as _requote does.
         if isinstance(action, CancelOrder):
             # which side, from the order manager's own record
-            for side_str, cur in list(self.work.items()):
+            for side_str, cur in [(s_, o_) for s_ in ("BUY", "SELL")
+                                  for o_ in list(self._side_orders(s_))]:
                 # MATCH ON THE PRODUCTION IDENTITY, not the exchange id. An
                 # order that has been amended carries a NEW engine id while the
                 # order manager still knows it by its original client order id,
@@ -376,6 +381,9 @@ class EngineReplay(Backtester):
             self._new_in_flight[action.side.value] += 1
             # count it the way Backtester does
             self.stats["n_orders_sent"] += 1
+            # and separately as a NEW order, same as Backtester
+            self.stats["n_new_orders_sent"] = (
+                self.stats.get("n_new_orders_sent", 0) + 1)
             # independent send-latency draw, separate from any cancel
             a_out = self.lat.draw_out()
             # when it becomes eligible to rest
@@ -414,17 +422,17 @@ class EngineReplay(Backtester):
             # manager already refuses to send a second order while the first is
             # in flight, which is why engine_dup_sends measured zero.
             #
-            # PLACING ONTO AN OCCUPIED SIDE IS COUNTED, NOT SILENT. The order
-            # manager should never ask for one: it holds a side while an order
-            # there is in flight, and the side is freed by the landing cancel
-            # or the full fill before it places again. If it ever does ask, the
-            # reservation below replaces what was there, which is the exact
-            # failure just removed from mm_backtest -- so it gets a counter
-            # rather than being invisible.
-            if self.work.get(side_str) is not None:
+            # A SECOND ORDER ON A SIDE IS NOW LEGITIMATE. Backtester holds a
+            # LIST per side, so this appends rather than overwriting. Until
+            # 2026-09-17 it overwrote, and the order already resting -- the one
+            # carrying the queue position the second-order policy exists to
+            # protect -- vanished with no cancel and no fill. The counter is
+            # kept so the old failure stays visible if it ever returns; it
+            # should now be zero on every run.
+            if self._side_orders(side_str):
                 self.engine_stats["placed_onto_occupied_side"] = \
                     self.engine_stats.get("placed_onto_occupied_side", 0) + 1
-            self.work[side_str] = order
+            self._side_orders(side_str).append(order)
             # schedule the arrival; the empty dict is filled at _arrive
             self._push(t_land, "ARRIVE", order)
             # done
@@ -443,7 +451,7 @@ class EngineReplay(Backtester):
         if cl_ord_id is None:
             return
         # it rested if it is now the working order on its side
-        if self.work.get(o.side) is o:
+        if o in self._side_orders(o.side):
             # the exchange's handle, which PSX requires on every later cancel
             self._oms.on_ack(cl_ord_id, str(o.oid))
         else:
@@ -469,11 +477,11 @@ class EngineReplay(Backtester):
         order_cl = self._cl_by_oid.get(oid)
         # let Backtester apply it, or refuse it as stale
         super()._amend(t, payload)
-        # what is resting now
-        after = self.work.get(side)
+        # the amended generation, if it landed
+        after = self._order_by_oid(side, new_oid)
         # THE AMENDMENT WAS REFUSED: the target had already filled or gone, so
         # the engine left the book untouched and counted it.
-        if after is None or after.oid != new_oid:
+        if after is None:
             # count it on this harness's own ledger too
             self.engine_stats["replace_rejected_stale"] += 1
             # tell the order manager, so the order comes back out of
@@ -499,28 +507,37 @@ class EngineReplay(Backtester):
             self._oms.on_replaced(amend_cl, int(round(new_px * 100)),
                                   int(new_qty))
 
-    def _fill(self, side, price, qty, t_exch, reason):
-        """One of our orders executed. Tell the order manager how much."""
+    def _fill(self, side, price, qty, t_exch, reason, order=None):
+        """One of our orders executed. Tell the order manager how much.
+
+        `order` is chosen by Backtester's fill engine, by price then time, and
+        passed through -- with several of our orders resting on one side, WHICH
+        one filled is the whole question and must not be guessed at here.
+        """
         # the order being filled, and its size before
-        order = self.work.get(side)
-        # nothing working on that side: Backtester would fail here anyway
+        order = order if order is not None else self._lead(side)
+        # nothing working on that side: Backtester answers for itself
         if order is None:
             return super()._fill(side, price, qty, t_exch, reason)
         # remaining size before the fill
         before = order.qty
-        # Backtester books it
-        super()._fill(side, price, qty, t_exch, reason)
+        # Backtester books it against THAT order
+        super()._fill(side, price, qty, t_exch, reason, order=order)
         # how much actually executed. Read from the SAME object, which survives
-        # being popped from self.work on a full fill.
+        # being dropped from its side's list on a full fill.
         take = before - order.qty
-        # a zero take would be a Backtester bug, not something to forward
+        # EVERY PATH OUT OF THIS METHOD RETURNS THE QUANTITY CONSUMED. The fill
+        # engine subtracts it from the aggressor's remaining size before
+        # offering what is left to the next order in priority, so a None here
+        # stops the walk dead -- and with one order per side it never showed,
+        # because there was never a next order.
         if take <= 0:
-            return
+            return 0.0
         # the production id
         cl_ord_id = self._cl_by_oid.get(order.oid)
-        # not ours
+        # not ours: Backtester has still booked it, so report what it took
         if cl_ord_id is None:
-            return
+            return take
         # POSITION COMES FROM FILLS, on both sides of the comparison. The fill
         # is booked at OUR limit price, never the print price -- the same rule
         # Backtester uses for cash.
@@ -529,6 +546,8 @@ class EngineReplay(Backtester):
                                price_minor=int(round(order.price * 100)),
                                quantity=int(take),
                                timestamp_ms=int(t_exch)))
+        # and tell the fill engine how much of the aggressor this consumed
+        return take
 
     def _activate_until(self, t_exch):
         """Land in-flight messages, then report any cancel that completed.
@@ -538,16 +557,17 @@ class EngineReplay(Backtester):
         Fills happen in _on_market_trade, on a different path. So a
         disappearance here is unambiguously a cancellation.
         """
-        # which order was on each side before
-        before = {side: order.oid for side, order in self.work.items()}
+        # which of our orders existed before, by id and by side
+        before = {o.oid: s_ for s_ in ("BUY", "SELL")
+                  for o in self._side_orders(s_)}
         # Backtester lands everything due
         super()._activate_until(t_exch)
         # which are still there
-        after = {order.oid for order in self.work.values()}
+        after = {o.oid for o in self._all_orders()}
         # anything that left was cancelled -- unless it was AMENDED, in which
         # case the order did not go away, it became a new generation of itself
         # and _amend has already told the order manager so.
-        for oid in before.values():
+        for oid in before:
             # still working
             if oid in after:
                 continue

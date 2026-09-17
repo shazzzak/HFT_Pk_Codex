@@ -159,12 +159,12 @@ def test_the_order_manager_learns_the_exchange_id_when_the_order_rests():
     # land it
     replay._activate_until(OPEN_MS + 2_000)
     # Backtester has it resting
-    assert "BUY" in replay.work
+    assert replay._lead("BUY") is not None
     # and the production order manager has been acknowledged, with the oid as
     # the exchange's handle
     working = oms.working_orders("PPL")
     assert len(working) == 1
-    assert working[0].exchange_order_id == str(replay.work["BUY"].oid)
+    assert working[0].exchange_order_id == str(replay._lead("BUY").oid)
 
 
 def test_an_order_the_market_ran_past_is_reported_as_a_reject():
@@ -183,7 +183,7 @@ def test_an_order_the_market_ran_past_is_reported_as_a_reject():
     # it lands -- _arrive refuses it under post-only semantics
     replay._activate_until(OPEN_MS + 2_000)
     # nothing rests
-    assert "BUY" not in replay.work
+    assert replay._lead("BUY") is None
     # and the order manager knows, so the side is free to be quoted again
     assert oms.working_orders("PPL") == []
     # the market comes back, and the next cycle re-quotes rather than waiting
@@ -200,7 +200,7 @@ def test_a_price_change_cancels_and_the_replacement_waits_for_the_ack():
     set_book(replay)
     replay._requote(OPEN_MS + 1_000)
     replay._activate_until(OPEN_MS + 2_000)
-    oid = replay.work["BUY"].oid
+    oid = replay._lead("BUY").oid
     # the strategy now wants a different price
     mm._returns = {"BUY": (288.99, 50)}
     replay._requote(OPEN_MS + 3_000)
@@ -210,13 +210,13 @@ def test_a_price_change_cancels_and_the_replacement_waits_for_the_ack():
     assert action == "CANCEL" and payload == ("BUY", oid)
     # the incumbent is still fillable until the cancel lands -- the exposure
     # mm_backtest models and an amendment would remove
-    assert replay.work["BUY"].cancel_at == OPEN_MS + 3_100
+    assert replay._lead("BUY").cancel_at == OPEN_MS + 3_100
     # NOTHING further goes out while the cancel is unconfirmed
     replay._requote(OPEN_MS + 3_050)
     assert len(replay.pending) == 1
     # the cancel lands
     replay._activate_until(OPEN_MS + 4_000)
-    assert "BUY" not in replay.work
+    assert replay._lead("BUY") is None
     # and only now does the replacement go
     replay._requote(OPEN_MS + 4_100)
     assert len(replay.pending) == 1
@@ -269,7 +269,7 @@ def test_a_full_fill_frees_the_side_on_both_sides():
     # all 50 execute
     replay._fill("BUY", 289.00, 50, OPEN_MS + 2_500, "through")
     # gone from Backtester
-    assert "BUY" not in replay.work
+    assert replay._lead("BUY") is None
     # and from the order manager, which is now flat of working orders
     assert oms.working_orders("PPL") == []
     assert oms.position("PPL") == 50
@@ -291,7 +291,7 @@ def test_a_landed_cancel_is_reported_and_is_not_mistaken_for_a_fill():
     # the cancel lands
     replay._activate_until(OPEN_MS + 4_000)
     # both sides agree it is gone, and no fill was invented
-    assert "BUY" not in replay.work
+    assert replay._lead("BUY") is None
     assert oms.working_orders("PPL") == []
     assert oms.position("PPL") == 0
 
@@ -416,10 +416,10 @@ def test_the_old_terms_stay_live_until_the_amendment_lands():
     replay._requote(OPEN_MS + 3_000)
     # nothing has been cancelled: the OLD price is still resting and still
     # matchable. Under cancel-plus-new the cancel would already be in flight.
-    assert replay.work["BUY"].price == 289.00
-    assert replay.work["BUY"].cancel_at is None
+    assert replay._lead("BUY").price == 289.00
+    assert replay._lead("BUY").cancel_at is None
     # and it is marked in flight, so a second amendment is not stacked on it
-    assert replay.work["BUY"].amend_at is not None
+    assert replay._lead("BUY").amend_at is not None
 
 
 def test_a_price_change_loses_priority_and_the_manager_is_told():
@@ -438,7 +438,7 @@ def test_a_price_change_loses_priority_and_the_manager_is_told():
     replay._requote(OPEN_MS + 3_000)
     replay._activate_until(OPEN_MS + 4_000)
     # we joined the back: all 700 are in front of us
-    assert sum(replay.work["BUY"].ahead.values()) == 700
+    assert sum(replay._lead("BUY").ahead.values()) == 700
     # the engine counted an amendment that did NOT keep its place
     assert replay.stats["n_cfos"] == 1
     assert replay.stats.get("n_cfos_kept_priority", 0) == 0
@@ -457,17 +457,17 @@ def test_a_size_reduction_keeps_priority():
     replay._requote(OPEN_MS + 1_000)
     replay._activate_until(OPEN_MS + 2_000)
     # the queue state that must survive
-    kept_ahead = dict(replay.work["BUY"].ahead)
-    kept_t_active = replay.work["BUY"].t_active
+    kept_ahead = dict(replay._lead("BUY").ahead)
+    kept_t_active = replay._lead("BUY").t_active
     # SAME price, SMALLER size
     mm._returns = {"BUY": (289.00, 20)}
     replay._requote(OPEN_MS + 3_000)
     replay._activate_until(OPEN_MS + 4_000)
     # the line in front of us is untouched, and so is our join time
-    assert replay.work["BUY"].ahead == kept_ahead
-    assert replay.work["BUY"].t_active == kept_t_active
+    assert replay._lead("BUY").ahead == kept_ahead
+    assert replay._lead("BUY").t_active == kept_t_active
     # with the smaller size applied
-    assert replay.work["BUY"].qty == 20
+    assert replay._lead("BUY").qty == 20
     # and counted as keeping its place
     assert replay.stats["n_cfos_kept_priority"] == 1
     # the production order carries the new size too
@@ -488,7 +488,7 @@ def test_a_size_increase_loses_priority():
     replay.book.o["H9"] = mm_backtest.Order("BUY", 289.00, 111)
     replay._activate_until(OPEN_MS + 4_000)
     # 500 from the original queue plus 111 that arrived: we are behind both
-    assert sum(replay.work["BUY"].ahead.values()) == 611
+    assert sum(replay._lead("BUY").ahead.values()) == 611
     # nothing kept its place
     assert replay.stats.get("n_cfos_kept_priority", 0) == 0
 
@@ -507,7 +507,7 @@ def test_an_amendment_that_loses_a_race_to_a_fill_is_rejected():
     # land the now-pointless amendment
     replay._activate_until(OPEN_MS + 4_000)
     # nothing was resurrected, and the rejection was counted rather than silent
-    assert "BUY" not in replay.work
+    assert replay._lead("BUY") is None
     assert replay.stats.get("stale_cfos_ignored") == 1
     # AND THE PRODUCTION ORDER IS FINISHED, not resurrected. The amendment was
     # refused because it lost the race to a fill -- the order is done, and the
@@ -569,7 +569,7 @@ def test_an_amended_order_can_still_be_cancelled():
     assert replay.pending[0][2] == "CANCEL"
     # and it lands, removing the quote
     replay._activate_until(OPEN_MS + 6_000)
-    assert "BUY" not in replay.work
+    assert replay._lead("BUY") is None
 
 
 def test_a_halt_pulls_the_quote_through_the_production_path():
@@ -744,52 +744,41 @@ def test_the_engine_does_not_send_twice_into_its_own_latency_window():
     assert replay.stats.get("orders_sent_while_new_in_flight", 0) == 0
 
 
-def test_a_forced_duplicate_is_counted_and_cannot_orphan_the_first_order():
-    """Two things at once: the instrument is live, and the fix holds.
+def test_two_orders_can_rest_on_one_side():
+    """Backtester holds a LIST per side, so a second order ADDS, not replaces.
 
-    The counter has to be provably live, because a zero in the gate's output
-    must mean "did not happen" rather than "was never wired up". And the
-    arrival of the duplicate must NOT destroy the order already on the side,
-    which is what the old code did -- silently, 5,205 times across four
-    symbol-days.
+    This test was written the other way up. It used to force a second order
+    past the order manager and assert that the first was destroyed -- because
+    Backtester.work was dict[side] -> ONE MyOrder and the second to land
+    overwrote it. A real exchange holds both, and now so does this one.
     """
-    # the same harness
+    # the harness, one order out through the normal path
     replay, oms, _ = build()
     set_book(replay)
-    # one order out through the normal path
     replay._requote(OPEN_MS + 1_000)
-    # the counter is clean
-    assert replay.stats.get("orders_sent_while_new_in_flight", 0) == 0
     # the first order is holding the side
-    first = replay.work["BUY"]
-    # now FORCE a second placement on the same side while the first is in the
-    # air, going round the order manager to do it -- this is what mm_backtest
-    # used to do by accident and what the counter exists to catch
-    replay._dispatch(PlaceOrder(symbol="PPL", cl_ord_id="FORCED-1",
+    first = replay._lead("BUY")
+    assert first is not None
+    # a SECOND order on the same side, sent round the order manager
+    replay._dispatch(PlaceOrder(symbol="PPL", cl_ord_id="SECOND-1",
                                 side=Side.BUY, price_minor=28900, quantity=50,
                                 account="CLIENT001"),
                      OPEN_MS + 1_050)
-    # two messages in the air now
+    # two messages in the air
     assert len(replay.pending) == 2
-    # and the counter saw it: the instrument is live
-    assert replay.stats["orders_sent_while_new_in_flight"] == 1
-    # forcing a placement onto a side that is already reserved is itself
-    # counted, so it can never happen unnoticed
-    assert replay.engine_stats["placed_onto_occupied_side"] == 1
     # land both
     replay._activate_until(OPEN_MS + 2_000)
-    # THE SIDE HOLDS EXACTLY ONE ORDER, and the arrival that does not match
-    # the reservation is DISCARDED rather than applied over the top of it.
-    # Under the old code both arrivals were applied and the first order became
-    # unreachable: never cancelled, never filled, never closed out.
+    # BOTH ARE RESTING. Nothing was overwritten and nothing was orphaned.
+    assert len(replay._side_orders("BUY")) == 2
     assert replay.stats["orders_orphaned_by_overwrite"] == 0
-    assert replay.stats["stale_arrivals_ignored"] == 1
-    # the survivor is the SECOND order -- the one the side is holding -- and it
-    # is live and matchable
-    assert replay.work["BUY"].t_active is not None
-    assert replay.work["BUY"] is not first
-    # the in-flight count came back to zero, so it cannot drift upward across a
-    # session and turn every later send into a false positive
+    assert replay.stats["stale_arrivals_ignored"] == 0
+    # the FIRST is still first in the list, which is what carries its time
+    # priority against the second at the same price
+    assert replay._side_orders("BUY")[0] is first
+    # both are live and matchable
+    assert all(o.t_active is not None for o in replay._side_orders("BUY"))
+    # and the in-flight count came back to zero, so it cannot drift upward
+    # across a session and turn every later send into a false positive
     assert replay._new_in_flight["BUY"] == 0
 
 

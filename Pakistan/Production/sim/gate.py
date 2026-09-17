@@ -392,24 +392,47 @@ def main():
                 events, snap_groups, t0, t1, ref_minor = loaded
                 # the thing being reproduced
                 bt = run_baseline(events, snap_groups, params, t0, t1, use_g)
-                # THE SAME ENGINE, TWICE, under the two requote policies.
-                # topup is the one the gate judges; hold is the one that says
-                # what keeping queue position is worth.
+                # THE SAME ENGINE, THREE TIMES, under the three requote
+                # policies. Identical day, identical exchange, identical
+                # latency seed -- the ONLY thing that differs is what each one
+                # does when the size resting is not the size wanted. That is
+                # what makes the comparison a measurement rather than three
+                # runs that happen to disagree.
+                #
+                # 1. AMEND UP. One order; amend it back to the full clip after
+                #    a partial fill. PSX 8.5.2 sends the whole order to the
+                #    back of the queue for that, so the shares that were
+                #    already resting lose their place along with the new ones.
+                #    This is mm_backtest's rule and what the PASS/FAIL gate
+                #    judges.
                 rep = run_engine(events, snap_groups, params, t0, t1,
                                  ref_minor, sym, date, use_g,
                                  quantity_policy="exact")
-                # the realistic alternative, run on the identical day
+                # 2. SECOND ORDER. Leave the remainder alone and send a
+                #    separate order for the shortfall under its own id. Full
+                #    size showing; priority paid only on the increment.
                 hold = run_engine(events, snap_groups, params, t0, t1,
                                   ref_minor, sym, date, use_g,
                                   quantity_policy="queue_preserving")
+                # 3. DON'T TOP UP. Leave the remainder resting, show the
+                #    SMALLER size, and wait to be hit. No new order, no
+                #    amendment, nothing given up at all -- and less size
+                #    working, which is the price of it. Takes the one
+                #    amendment 8.5.2 makes free (a REDUCTION, when the
+                #    strategy wants less than is resting) and pays for none.
+                reduce = run_engine(events, snap_groups, params, t0, t1,
+                                    ref_minor, sym, date, use_g,
+                                    quantity_policy="reduce_only")
             except Exception as exc:                          # noqa: BLE001
                 # report and carry on: one broken day must not lose the rest
                 print(f"    {sym} {date} ERROR {exc!r}")
                 continue
-            # the three headline numbers
-            base_pnl, eng_pnl, hold_pnl = pnl_of(bt), pnl_of(rep), pnl_of(hold)
+            # the four headline numbers
+            base_pnl, eng_pnl = pnl_of(bt), pnl_of(rep)
+            hold_pnl, reduce_pnl = pnl_of(hold), pnl_of(reduce)
             # a broken close on any side has nothing to compare
-            if base_pnl is None or eng_pnl is None or hold_pnl is None:
+            if (base_pnl is None or eng_pnl is None or hold_pnl is None
+                    or reduce_pnl is None):
                 continue
             # one row, with enough detail that a mismatch has a diagnosis
             rows.append({
@@ -431,6 +454,65 @@ def main():
                 # size where the top-up policy raises it.
                 "hold_cfos": hold.stats.get("n_cfos", 0),
                 "hold_cfos_kept": hold.stats.get("n_cfos_kept_priority", 0),
+                # ---- POLICY 3: DON'T TOP UP -----------------------------
+                # Every column the other two carry, so the three are read the
+                # same way. `reduce_orders` should be the LOWEST of the three
+                # by construction: this policy never sends a message to grow.
+                "engine_reduce_pnl": float(reduce_pnl),
+                "reduce_minus_topup": float(reduce_pnl) - float(eng_pnl),
+                "reduce_orders": reduce.stats.get("n_orders_sent", 0),
+                "reduce_cancels": reduce.stats.get("n_cancels", 0),
+                "reduce_fills": len(reduce.fills),
+                # EVERY amendment this policy sends is a reduction, and 8.5.2
+                # applies those in place -- so reduce_cfos_kept should equal
+                # reduce_cfos. If it does not, the venue rule is not being
+                # read the way this policy assumes.
+                "reduce_cfos": reduce.stats.get("n_cfos", 0),
+                "reduce_cfos_kept": reduce.stats.get("n_cfos_kept_priority", 0),
+                "reduce_acted": reduce._oms.plan_counts["acted"],
+                "reduce_held_inflight":
+                    reduce._oms.plan_counts["held_message_in_flight"],
+                "reduce_held_suspended":
+                    reduce._oms.plan_counts["held_suspended"],
+                "reduce_no_change": reduce._oms.plan_counts["no_change"],
+                # ---- CAN THIS HARNESS EVEN RUN THAT POLICY? --------------
+                # EngineReplay inherits Backtester's `work`, which is
+                # dict[side] -> ONE MyOrder. A policy that wants SEVERAL
+                # orders on a side gets the second one landing ON TOP of the
+                # first -- including the very order whose queue position the
+                # policy exists to protect. Counted per run so the column can
+                # be refused rather than read.
+                "engine_occupied": rep.engine_stats.get(
+                    "placed_onto_occupied_side", 0),
+                "hold_occupied": hold.engine_stats.get(
+                    "placed_onto_occupied_side", 0),
+                "reduce_occupied": reduce.engine_stats.get(
+                    "placed_onto_occupied_side", 0),
+                # ---- WHAT KIND OF AMENDMENT, PER POLICY ------------------
+                # Under 8.5.2 only a pure size REDUCTION keeps its place. So
+                # "how many kept their place?" is the same question as "how
+                # many were reductions?", and this decomposition answers it
+                # rather than leaving it to be predicted from the policy's
+                # description -- which was done twice, wrongly, on 2026-09-17.
+                "engine_cfo_px": rep.stats.get("n_cfos_price_change", 0),
+                "engine_cfo_up": rep.stats.get("n_cfos_qty_up", 0),
+                "engine_cfo_dn": rep.stats.get("n_cfos_qty_down", 0),
+                "hold_cfo_px": hold.stats.get("n_cfos_price_change", 0),
+                "hold_cfo_up": hold.stats.get("n_cfos_qty_up", 0),
+                "hold_cfo_dn": hold.stats.get("n_cfos_qty_down", 0),
+                "reduce_cfo_px": reduce.stats.get("n_cfos_price_change", 0),
+                "reduce_cfo_up": reduce.stats.get("n_cfos_qty_up", 0),
+                "reduce_cfo_dn": reduce.stats.get("n_cfos_qty_down", 0),
+                # ---- MESSAGES, SPLIT BY WHAT THEY ARE --------------------
+                # n_orders_sent is the SUM of new orders and amendments, which
+                # made the old table's "orders" column silently include its
+                # "amendments" column. These two are disjoint and add to it.
+                "engine_new_sent": rep.stats.get("n_new_orders_sent", 0),
+                "engine_amend_sent": rep.stats.get("n_amends_sent", 0),
+                "hold_new_sent": hold.stats.get("n_new_orders_sent", 0),
+                "hold_amend_sent": hold.stats.get("n_amends_sent", 0),
+                "reduce_new_sent": reduce.stats.get("n_new_orders_sent", 0),
+                "reduce_amend_sent": reduce.stats.get("n_amends_sent", 0),
                 # fills are the first place a divergence shows
                 "backtest_fills": len(bt.fills),
                 "engine_fills": len(rep.fills),
@@ -676,89 +758,168 @@ def main():
     print("\n" + "=" * 78)
     print("WHAT KEEPING QUEUE POSITION IS WORTH")
     print("=" * 78)
-    print("  THE WORKED EXAMPLE, because the names alone are not enough.")
+    print("  ONE WORKED EXAMPLE, because the names alone are not enough.")
     print("  The clip is 500. A partial fill takes 400 and leaves 100 resting")
-    print("  with the queue position it has already earned. Both policies want")
-    print("  500 showing again; they differ ONLY in how they get there.")
+    print("  with the queue position it has already earned. What now?")
     print()
-    print("  TOP UP BY AMENDMENT   (column: engine_*, quantity_policy=exact)")
-    print("          ONE order. Amend the resting 100 back up to 500. Under PSX")
-    print("          8.5.2 raising the size sends THE WHOLE ORDER to the back")
-    print("          of the queue -- the 100 loses the place it earned along")
-    print("          with the 400 that is new. This is mm_backtest's rule and")
-    print("          what every measured number in this project was produced")
-    print("          under, which is why it is the run the gate judges.")
+    print("  1. AMEND UP      (engine_*,  quantity_policy = exact)")
+    print("     ONE order. Amend the resting 100 back up to 500. PSX 8.5.2")
+    print("     sends THE WHOLE ORDER to the back of the queue for a size")
+    print("     increase, so the 100 loses the place it earned along with the")
+    print("     400 that is new. Full size showing, priority paid on all of")
+    print("     it. This is mm_backtest's rule and what every published number")
+    print("     in this project was produced under -- which is why it is the")
+    print("     run the PASS/FAIL gate judges and the baseline for the rest.")
     print()
-    print("  TOP UP BY SECOND ORDER (column: hold_*, quantity_policy=")
-    print("                          queue_preserving)")
-    print("          TWO orders. The 100 is LEFT ALONE and keeps its place; a")
-    print("          SEPARATE order for the 400 joins the back of the queue")
-    print("          under its own id. Total size showing is the same 500. You")
-    print("          pay in priority only on the increment, never on the")
-    print("          remainder. When the strategy wants LESS than is resting it")
-    print("          shrinks the YOUNGEST order first, and 8.5.2 applies a size")
-    print("          reduction in place, so that costs nothing at all.")
+    print("  2. SECOND ORDER  (hold_*,    quantity_policy = queue_preserving)")
+    print("     TWO orders. The 100 is left alone and keeps its place; a")
+    print("     SEPARATE order for the 400 joins the back under its own id.")
+    print("     Full size showing, priority paid only on the increment.")
+    print("     Shrinking works youngest-first, and 8.5.2 applies a REDUCTION")
+    print("     in place, so giving size back costs nothing.")
     print()
-    print("  CORRECTED 2026-09-17. This block used to describe the second")
-    print("  policy as one that 'shows less size until it is hit'. That was")
-    print("  wrong and it misdescribed every number below it. The policy has")
-    print("  always topped the size back up with a second order -- see")
-    print("  core/oms.py, _plan_side_multi, the SHORT OF WHAT WE WANT branch.")
-    print("  A policy that genuinely declines to top up, and shows the smaller")
-    print("  size until it is hit, is a THIRD thing and is not implemented.")
+    print("  3. DON\'T TOP UP  (reduce_*,  quantity_policy = reduce_only)")
+    print("     NO message at all. The 100 stays exactly where it is and the")
+    print("     quote shows 100, not 500, until someone hits it. Nothing is")
+    print("     given up, and nothing is added -- so the cost is not priority,")
+    print("     it is the 400 shares of working size you are not showing.")
+    print("     Takes the free reduction when the strategy wants LESS, pays")
+    print("     for nothing. This is what a desk does when it thinks the flow")
+    print("     at that price is toxic: keep the place, stop feeding it size.")
     print()
-    print("  Both are legal and both are things a real desk does. The exchange")
-    print("  applies the identical rule to each; the difference is ours.\n")
+    print("  All three are legal and all three are things a real desk does.")
+    print("  The exchange applies the identical rule to each; the difference")
+    print("  is ours, and this is what it is worth.\n")
     # the paired per-day difference, which is how this project measures
-    d = df["hold_minus_topup"].to_numpy()
-    # the totals under each policy
-    print(f"  total, amendment     : {df['engine_pnl'].sum():,.2f} PKR")
-    print(f"  total, second order  : {df['engine_hold_pnl'].sum():,.2f} PKR")
-    print(f"  difference           : {d.sum():+,.2f} PKR "
-          f"({'second order' if d.sum() > 0 else 'amendment'} ahead)")
+    # THE THREE POLICIES, in one table. Column key -> label, and the P&L
+    # column each one reports under. "amend up" is the baseline every
+    # difference is measured against, because it is what produced every number
+    # this project has published.
+    POLICIES = (("amend up    ", "engine", "engine_pnl"),
+                ("second order", "hold", "engine_hold_pnl"),
+                ("don't top up", "reduce", "engine_reduce_pnl"))
+    # the totals
+    print("  TOTAL P&L, SAME DAYS, SAME EXCHANGE, SAME LATENCY SEED")
+    for _label, _col, _pnl in POLICIES:
+        # the policy's own total
+        print(f"    {_label}  {df[_pnl].sum():>12,.2f} PKR")
+    print()
+    # ---- the paired per-day comparison, each against the baseline --------
     # DAY AS UNIT, never pooled fills -- the standing rule on this project
-    if len(d) > 1:
-        # the mean paired difference
-        mean_d = d.mean()
-        # its standard error
-        se = d.std(ddof=1) / (len(d) ** 0.5)
-        # and the t-statistic the |t| > 2 bar applies to
-        t = mean_d / se if se > 0 else float("nan")
-        print(f"  per symbol-day       : {mean_d:+,.2f} PKR mean, "
-              f"se {se:,.2f}, t {t:,.2f}  ({len(d)} days)")
-        print(f"  days 2nd order better: {int((d > 0).sum())} of {len(d)}")
-        # a sample this size measures a LARGE effect and nothing smaller
-        print("  A sample this size can only show a large effect. It cannot")
-        print("  rule out a small one, and |t| > 2 is the bar here as elsewhere.")
-    # the churn each policy generated, which is the mechanism behind any gap
-    print(f"\n  orders sent          : amendment {df['engine_orders'].sum():,}"
-          f"   second order {df['hold_orders'].sum():,}")
-    print(f"  fills                : amendment {df['engine_fills'].sum():,}"
-          f"   second order {df['hold_fills'].sum():,}")
-    print(f"  amendments kept place: amendment {df['engine_cfos_kept'].sum():,}"
-          f" of {df['engine_cfos'].sum():,}"
-          f"   second order {df['hold_cfos_kept'].sum():,}"
-          f" of {df['hold_cfos'].sum():,}")
-    print("  The last line is 8.5.2 doing its work: under the second-order")
-    print("  policy more amendments are size REDUCTIONS, which keep their")
-    print("  place, because topping UP no longer needs an amendment at all.")
-    print()
-    print("  READ THE ORDER COUNT BEFORE THE P&L. If the second-order policy")
-    print("  is sending far FEWER orders and taking far fewer fills, it is not")
-    print("  losing a fair contest -- it is barely competing, and the reason")
-    print("  has to be found before the P&L comparison means anything.")
-    print()
-    print("  WHY EACH POLICY'S SIDES WERE QUIET, counted rather than guessed:")
-    # the four causes, per policy, as the order manager counted them
-    for _label, _col in (("amendment   ", "engine"), ("second order", "hold")):
-        # one line per policy, all four causes on it
-        print(f"    {_label}  acted {df[_col + '_acted'].sum():>7,}"
-              f"   held: message in flight "
-              f"{df[_col + '_held_inflight'].sum():>7,}"
-              f"   suspended {df[_col + '_held_suspended'].sum():>5,}"
-              f"   no change {df[_col + '_no_change'].sum():>7,}")
-    print("  A quiet side has exactly these four causes. Whichever one differs")
-    print("  between the two rows is the explanation; nothing else can be.")
+    print("  AGAINST 'AMEND UP', PAIRED BY SYMBOL-DAY")
+    print("  Paired because the two runs are the SAME day: the day's own")
+    print("  volatility cancels, which an unpaired comparison would leave in.")
+    for _label, _diff_col in (("second order", "hold_minus_topup"),
+                              ("don't top up", "reduce_minus_topup")):
+        # the paired differences
+        d = df[_diff_col].to_numpy()
+        # the total, and which way it points
+        line = (f"    {_label}  total {d.sum():+10,.2f} PKR"
+                f"   better on {int((d > 0).sum())} of {len(d)} days")
+        # the t-statistic, where there is more than one day to compute it on
+        if len(d) > 1:
+            # mean paired difference
+            mean_d = d.mean()
+            # its standard error
+            se = d.std(ddof=1) / (len(d) ** 0.5)
+            # and the statistic the |t| > 2 bar applies to
+            t = mean_d / se if se > 0 else float("nan")
+            line += f"   mean {mean_d:+8,.2f}  se {se:7,.2f}  t {t:5,.2f}"
+        print(line)
+    # a sample this size measures a LARGE effect and nothing smaller
+    print("  A sample this size can only show a large effect. It cannot rule")
+    print("  out a small one, and |t| > 2 is the bar here as elsewhere.")
+
+    # ---- the churn, which is the mechanism behind any gap ----------------
+    print("\n  WHAT EACH POLICY DID")
+    print("  Every column counts a DIFFERENT thing, and they do not overlap.")
+    print("    new orders  a brand new order sent to the exchange")
+    print("    amends      a Change Former Order sent: one message that")
+    print("                changes the price or size of an order already")
+    print("                resting, instead of cancelling and re-sending")
+    print("    landed      of those amendments, how many the exchange")
+    print("                actually applied. The rest arrived to find their")
+    print("                target already filled or already gone")
+    print("    kept place  of the ones that landed, how many kept their")
+    print("                position in the queue at that price. PSX 8.5.2:")
+    print("                only a pure SIZE REDUCTION is applied in place. A")
+    print("                price change, or asking for MORE size, sends the")
+    print("                order to the BACK of the line -- behind everyone")
+    print("                who was already there, so it fills later or not")
+    print("                at all. This column is what churn costs you.")
+    print("    cancels     cancels that reached the exchange and removed an")
+    print("                order that was still resting")
+    print("    fills       fill EVENTS, not shares and not round trips: one")
+    print("                partial fill is one event")
+    print(f"\n    {'policy':14} {'new orders':>11} {'amends':>8} {'landed':>8}"
+          f" {'kept place':>11} {'cancels':>9} {'fills':>7}")
+    for _label, _col, _pnl in POLICIES:
+        # one line per policy, every column disjoint from the others
+        print(f"    {_label} {df[_col + '_new_sent'].sum():>11,}"
+              f" {df[_col + '_amend_sent'].sum():>8,}"
+              f" {df[_col + '_cfos'].sum():>8,}"
+              f" {df[_col + '_cfos_kept'].sum():>11,}"
+              f" {df[_col + '_cancels'].sum():>9,}"
+              f" {df[_col + '_fills'].sum():>7,}")
+    # ---- WHAT THE AMENDMENTS ACTUALLY WERE -------------------------
+    # THE KEPT-PLACE COUNT IS NOT A THING TO PREDICT. Under 8.5.2 only a pure
+    # size REDUCTION is applied in place; a price change re-queues, and so
+    # does a size increase. So "how many kept their place" is the same
+    # question as "how many were reductions", and the honest way to answer it
+    # is to count the kinds rather than reason from the policy's description.
+    print("\n  WHAT THOSE AMENDMENTS WERE")
+    print(f"    {'policy':14} {'price move':>11} {'size up':>9}"
+          f" {'size down':>11} {'kept place':>11}")
+    for _label, _col, _pnl in POLICIES:
+        # the three kinds, and the kept count they should explain
+        print(f"    {_label} {df[_col + '_cfo_px'].sum():>11,}"
+              f" {df[_col + '_cfo_up'].sum():>9,}"
+              f" {df[_col + '_cfo_dn'].sum():>11,}"
+              f" {df[_col + '_cfos_kept'].sum():>11,}")
+    print("  KEPT PLACE SHOULD EQUAL SIZE DOWN on PSX, because the venue's")
+    print("  three rules say a reduction keeps its position and nothing else")
+    print("  does. If those two columns disagree, the engine is not reading")
+    print("  the venue the way this project believes it is.")
+    print("  A PRICE MOVE DOMINATES EVERY POLICY here, which is the real")
+    print("  finding: this strategy reprices on any tick, so a partial fill")
+    print("  rarely survives long enough for the size policy to matter. That")
+    print("  is why the three policies churn so similarly, and it bounds how")
+    print("  much any of them can be worth.")
+
+    # ---- why each policy's sides were quiet ------------------------------
+    print("\n  WHY EACH POLICY'S SIDES WERE QUIET, counted rather than guessed")
+    print("  A side produces no actions for exactly four reasons. Whichever")
+    print("  one differs between these rows is the explanation for the order")
+    print("  counts above; nothing else can be.")
+    print(f"    {'policy':14} {'acted':>9} {'held: in flight':>16}"
+          f" {'suspended':>10} {'no change':>10}")
+    for _label, _col, _pnl in POLICIES:
+        # all four causes, per policy
+        print(f"    {_label} {df[_col + '_acted'].sum():>9,}"
+              f" {df[_col + '_held_inflight'].sum():>16,}"
+              f" {df[_col + '_held_suspended'].sum():>10,}"
+              f" {df[_col + '_no_change'].sum():>10,}")
+    print("  READ THE ORDER COUNT BEFORE THE P&L. A policy sending a third of")
+    print("  the messages and taking a third of the fills is not losing a")
+    print("  fair contest -- it is barely competing, and that has to be")
+    print("  explained before its P&L means anything.")
+
+    # ---- THE SIDE-SHARING COUNT, once a defect and now a measurement ----
+    # Backtester held ONE order per side until 2026-09-17, so a policy that
+    # rests two had its second order overwrite its first -- the one carrying
+    # the queue position it exists to protect. `work` is a LIST per side now,
+    # so this counts something real: how often a policy put a second order
+    # alongside one already resting, which is the manoeuvre the whole
+    # second-order design is built on.
+    print("\n  ORDERS RESTED ALONGSIDE ANOTHER ON THE SAME SIDE")
+    for _label, _col, _pnl in POLICIES:
+        # how many of that policy's orders joined an occupied side
+        print(f"    {_label} {int(df[_col + '_occupied'].sum()):>9,}")
+    print("  The single-order policies should read ZERO here: each holds one")
+    print("  order per side by construction, so a non-zero figure for 'amend")
+    print("  up' or \'don\'t top up\' means one of them is resting size it does")
+    print("  not know about. The second-order policy should be the only one")
+    print("  with a count, and that count is the design working.")
 
     # ---- write ----------------------------------------------------------
     # a fresh timestamped destination; never overwrites

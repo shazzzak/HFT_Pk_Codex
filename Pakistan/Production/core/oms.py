@@ -429,6 +429,19 @@ class OrderManager:
 
         # ---- NOTHING WANTED -------------------------------------------
         if want is None:
+            # COUNT THE WAIT HERE TOO. The single-order path tests for an
+            # outstanding message BEFORE it tests for "nothing wanted", so it
+            # records a wait on every halted or stale cycle where a message is
+            # in the air. This path tests in the other order, so it recorded
+            # nothing -- and the two policies' wait counts then differed by a
+            # factor of two for no reason but where the line sits.
+            #
+            # THE BEHAVIOUR IS DELIBERATELY LEFT ALONE: pulling the orders
+            # that have no message outstanding is the right thing to do when
+            # the strategy wants nothing, and blocking that would be worse.
+            # Only the counting is being made comparable.
+            if any(o.has_message_in_flight for o in resting):
+                self.plan_counts["held_message_in_flight"] += 1
             # pull everything that is not already on its way out
             return [self._cancel(o) for o in resting
                     if not o.has_message_in_flight]

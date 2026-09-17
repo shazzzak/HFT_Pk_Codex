@@ -819,8 +819,21 @@ class Backtester:
                                     # no tail spikes (tail_ms=0), send & ack both = L.
                                     tail_prob=0.0)  # tail_prob=0 -> spike branch never fires -> every draw returns exactly L. A "constant latency" disguised as the same LatencyModel interface.
         self.book = Book()  # the reconstructed real order book (everyone else's orders). Empty until the first snapshot/update.
-        self.work: dict[
-            str, MyOrder] = {}  # OUR live orders, keyed by side: {"BUY": MyOrder, "SELL": MyOrder}. At most one per side.
+        # OUR live orders, keyed by side: {"BUY": [MyOrder, ...], "SELL": [...]}.
+        #
+        # A LIST, NOT ONE ORDER. Until 2026-09-17 this was dict[side] -> ONE
+        # MyOrder, so the simulator could only ever record a single order of
+        # ours per side. A strategy that legitimately rests TWO orders on a
+        # side -- which is how you add size at a price without sending the
+        # shares already resting to the back of the queue, PSX 8.5.2 -- had
+        # its second order overwrite its first. The first then existed
+        # nowhere: no cancel, no fill, no lifecycle end, and every later
+        # message aimed at it was refused. A real exchange holds both.
+        #
+        # ORDER WITHIN THE LIST IS SEND ORDER, oldest first. That is what the
+        # fill engine uses to break time priority between two of our own
+        # orders resting at the same price.
+        self.work: dict[str, list] = {"BUY": [], "SELL": []}
         self._oid = 0  # counter that generates a unique id for each order we send (cancels target a specific oid, not just a side).
         # DIAGNOSTIC STATE, NO BEHAVIOUR CHANGE. Per side: how many NEW orders
         # have been sent and have not yet reached the exchange. self.work above
@@ -931,6 +944,50 @@ class Backtester:
 
 
     # ================= our-order plumbing (EXCHANGE side) =================
+    def _side_orders(self, side):
+        """Our orders on one side, oldest first. Never None."""
+        # a side with nothing resting returns an empty list, not None, so
+        # every caller can iterate without a guard
+        return self.work.setdefault(side, [])
+
+    def _all_orders(self):
+        """Every order of ours, both sides, in no particular order."""
+        # flattened, for the handlers that touch all of them
+        return [o for orders in self.work.values() for o in orders]
+
+    def _order_by_oid(self, side, oid):
+        """The order on this side carrying that id, or None."""
+        # ids are unique per order generation, so at most one matches
+        for o in self._side_orders(side):
+            if o.oid == oid:
+                return o
+        return None
+
+    def _drop_order(self, side, o):
+        """Remove one specific order from a side. BY IDENTITY, not value.
+
+        MyOrder is a plain dataclass, so `list.remove` would compare fields --
+        and two of our orders on the same side at the same price for the same
+        size are equal by that test while being different orders with
+        different places in the queue.
+        """
+        # the list this order lives in
+        orders = self._side_orders(side)
+        # find it by identity and remove that exact element
+        for i, x in enumerate(orders):
+            if x is o:
+                del orders[i]
+                return True
+        # nothing removed
+        return False
+
+    def _lead(self, side):
+        """The oldest order on a side, or None. The single-order view."""
+        # mm_backtest's own _requote never rests more than one order per side,
+        # so this IS that order for every run this file drives
+        orders = self._side_orders(side)
+        return orders[0] if orders else None
+
     def _push(self, t, action, payload):
         """Schedule one of our messages to land on the exchange at time t."""
         heapq.heappush(self.pending, (t, self._seq, action, payload))
@@ -963,9 +1020,9 @@ class Backtester:
                 self._amend(t, p)
             elif action == "CANCEL":  # this message is a CANCEL request reaching the exchange.
                 side, oid = p  # unpack the payload: which side, and the SPECIFIC order id this cancel was meant for.
-                o = self.work.get(side)  # look up our current working order on that side (or None if there isn't one).
-                if o is not None and o.oid == oid:  # is there an order on that side AND is it the SAME order this cancel targeted (matching oid)?
-                    self.work.pop(side, None)  # yes -> remove it from our working orders (the cancel succeeded).
+                o = self._order_by_oid(side, oid)  # the SPECIFIC order this cancel targeted, or None if it has already gone.
+                if o is not None:  # it is still resting, so the cancel lands on it
+                    self._drop_order(side, o)  # remove that one order; anything else of ours on this side is untouched.
                     self.stats["n_cancels"] += 1  # count a successful cancel.
                     # LIFECYCLE: the order ended by cancellation at this land-time
                     if oid in self._olog:
@@ -998,12 +1055,12 @@ class Backtester:
         # this CFO was aimed at, the new terms, and the id the amended version
         # will carry from here on.
         side, oid, new_px, new_qty, new_oid = payload
-        # our current working order on that side, or None if there is none.
-        o = self.work.get(side)
+        # THE SPECIFIC order this amendment was aimed at, or None.
+        o = self._order_by_oid(side, oid)
         # THE TARGET IS GONE -- it filled, or a later message already replaced
         # it. A real exchange answers that with an Order Cancel Reject; there
         # is nothing left to modify.
-        if o is None or o.oid != oid:
+        if o is None:
             # count it so a run can show how often a CFO raced a fill and lost.
             self.stats["stale_cfos_ignored"] = self.stats.get("stale_cfos_ignored", 0) + 1
             # nothing is applied: the book is left exactly as it was.
@@ -1062,12 +1119,36 @@ class Backtester:
         self._olog[new_oid] = {"oid": new_oid, "side": side, "px": new_px,
                                "qty": new_qty, "t_sent": t, "t_live": t,
                                "t_end": None, "end_reason": None}
-        # replace the working order with its amended version. taker is always
-        # False: a CFO modifies a resting order and never crosses.
-        self.work[side] = MyOrder(side, new_px, new_qty, ahead, t_active,
-                                  oid=new_oid, taker=False)
+        # replace the amended order with its new generation AT THE SAME
+        # POSITION IN THE LIST. Position is send order, which is what breaks
+        # time priority between two of our own orders at one price -- an
+        # amendment does not make an order younger than one sent after it, so
+        # appending would silently reorder our own queue.
+        # taker is always False: a CFO modifies a resting order and never
+        # crosses.
+        _new = MyOrder(side, new_px, new_qty, ahead, t_active,
+                       oid=new_oid, taker=False)
+        # find the order being amended and overwrite that slot
+        _orders = self._side_orders(side)
+        for _i, _x in enumerate(_orders):
+            if _x is o:
+                _orders[_i] = _new
+                break
         # how many amendments actually landed this run.
         self.stats["n_cfos"] = self.stats.get("n_cfos", 0) + 1
+        # WHAT KIND OF AMENDMENT IT WAS. Added 2026-09-17, after the kept-place
+        # count was predicted wrongly twice in a row. Under 8.5.2 only a pure
+        # size REDUCTION keeps its place, so "how many kept?" is really "how
+        # many were reductions?" -- and that is a fact to be counted, not
+        # reasoned about from the policy's description.
+        self.stats["n_cfos_price_change"] = (
+            self.stats.get("n_cfos_price_change", 0) + (1 if price_changed else 0))
+        self.stats["n_cfos_qty_up"] = (
+            self.stats.get("n_cfos_qty_up", 0)
+            + (1 if (not price_changed and qty_up) else 0))
+        self.stats["n_cfos_qty_down"] = (
+            self.stats.get("n_cfos_qty_down", 0)
+            + (1 if (not price_changed and qty_down) else 0))
         # and of those, how many held their place in the queue.
         if keeps:
             # if this stays at zero on a PSX run, the reductions are not firing
@@ -1104,7 +1185,7 @@ class Backtester:
         # whatever was resting there was silently dropped: never cancelled,
         # never filled, never closed out in the lifecycle log. The gate
         # measured 5,205 of those across four symbol-days.
-        if self.work.get(o.side) is not o:
+        if o not in self._side_orders(o.side):
             # count it: with the in-flight rule in _requote this should be rare
             # and is worth seeing if it is not
             self.stats["stale_arrivals_ignored"] += 1
@@ -1122,19 +1203,19 @@ class Backtester:
             # every other fill in this engine. Off (default) -> falls through to the
             # original post-only reject below, byte-identical.
             if self.allow_taker and getattr(o, "taker", False):
-                # THE ORDER NEVER RESTS, so the side must be released. It was
-                # reserved at send time; leaving it occupied would block the
-                # side for the rest of the session.
-                self.work.pop(o.side, None)
+                # THE ORDER NEVER RESTS, so its slot must be released. It was
+                # reserved at send time; leaving it there would have the
+                # engine believe size is working that never existed.
+                self._drop_order(o.side, o)
                 # execute the taker and stop
                 self._taker_fill(t, o)
                 # done
                 return
             self.stats["rejected_crossing"] += 1  # count it as a rejected crossing order.
-            # REJECTED, SO RELEASE THE SIDE. Same reason as the taker path
-            # above: the reservation made at send time has to be undone, or the
-            # next requote sees an occupied side that will never come live.
-            self.work.pop(o.side, None)
+            # REJECTED, SO RELEASE THE SLOT. Same reason as the taker path
+            # above: the reservation made at send time has to be undone, or
+            # the engine believes an order is working that never rested.
+            self._drop_order(o.side, o)
             return  # FLAGGED SIMPLIFICATION: reject it (post-only behavior) instead of executing as a taker. The order never enters the book. Exit early.
         o.ahead = self.book.qty_at(o.side, o.price)  # order rests: snapshot our QUEUE POSITION -- {order_id: qty} of every order already resting at our price (all ahead of us under price-time priority).
         o.t_active = t  # record the exchange-time the order became live (used for timing/diagnostics). Until this line runs, t_active is None and every fill path skips the order.
@@ -1297,7 +1378,7 @@ class Backtester:
             self._olog[o.oid]["t_end"] = t_exch
             self._olog[o.oid]["end_reason"] = "taker"
 
-    def _fill(self, side, price, qty, t_exch, reason): # book a fill of OUR order. side = BUY/SELL; price = the trade's print price (not used for our cash);
+    def _fill(self, side, price, qty, t_exch, reason, order=None): # book a fill of OUR order. side = BUY/SELL; price = the trade's print price (not used for our cash);
         # qty = shares offered to us; t_exch = fill time; reason = provenance tag ("through"/"at_queue"/etc).
 
         """Book a (possibly partial) fill of our working order on `side`.
@@ -1332,8 +1413,15 @@ class Backtester:
         changed what followed.
 
         """
-        # fetch our working order on this side (the one being filled).
-        o = self.work.get(side)
+        # THE SPECIFIC ORDER BEING FILLED. Passed in by the fill engine,
+        # which decides -- by price, then by time -- which of our orders on
+        # this side the flow reaches. Defaults to the lead order so the two
+        # callers that can only ever mean one order (the taker path and the
+        # crossing-add path) need no change.
+        o = order if order is not None else self._lead(side)
+        # nothing of ours resting there: no fill to book
+        if o is None:
+            return 0.0
         # we can only fill up to OUR remaining size; if the incoming qty is
         # larger, we take our whole order, not more. This is the actual fill.
         take = min(o.qty, qty)
@@ -1367,8 +1455,9 @@ class Backtester:
                     # count what the constraint cost us, in fills
                     self.stats["short_fills_blocked_by_uptick"] += 1
                     # the exchange would not have matched a short sale here, so
-                    # neither do we. The order stays resting, unchanged.
-                    return
+                    # neither do we. The order stays resting, unchanged, and
+                    # NOTHING was taken out of the aggressor's quantity.
+                    return 0.0
         sgn = 1 if side == "BUY" else -1              # sign of the position change: a BUY adds shares (+1), a SELL removes them (-1).
         self.pos += sgn * take                        # update our position: +take if we bought, -take if we sold.
         self.cash += -sgn * take * o.price - fee_for(o.price, take)   # update cash: money moves OPPOSITE to position (buying spends cash, selling earns it), always at OUR limit price o.price -- then subtract the fee. Note: fee uses o.price, the price we transacted at.
@@ -1389,11 +1478,15 @@ class Backtester:
                            "oid": o.oid})
         o.qty -= take                                 # reduce our order's remaining quantity by what just filled.
         if o.qty <= 0:                                # if the order is now fully filled...
-            self.work.pop(side, None)                 # ...remove it from working orders (it's done). A partial fill leaves it in place with reduced qty.
+            self._drop_order(side, o)                 # ...remove THAT order (it's done). A partial fill leaves it in place with reduced qty, and anything else of ours on this side is untouched.
             # LIFECYCLE: the order ended by being fully filled at this time
             if o.oid in self._olog:
                 self._olog[o.oid]["t_end"] = t_exch
                 self._olog[o.oid]["end_reason"] = "filled"
+        # HOW MUCH OF THE AGGRESSOR'S QUANTITY THIS CONSUMED. The fill engine
+        # subtracts it before offering the rest to the next order in priority,
+        # which is the whole reason this returns a number.
+        return take
 
     def _on_market_trade(self, r):
         """A historical trade printed. Could its aggressive flow have hit us?
@@ -1490,68 +1583,133 @@ class Backtester:
         # PASSIVE side is the opposite: BUY aggressor hits resting SELLs, SELL hits BUYs.
         # This is the side OUR order must be on to get hit.
         passive_side = {"BUY": "SELL", "SELL": "BUY"}.get(aggr)
-        # Fetch OUR working order on that passive side (None if we have none).
-        o = self.work.get(passive_side)
-        # Skip if no order, OR the order has not reached the exchange yet
-        # (t_active is None: it is still on the wire and nothing can hit it),
-        # OR our in-flight cancel has ALREADY landed (trade time >= cancel_at).
-        # Before cancel_at the order is still fillable -- that is in-flight
-        # cancel risk, and it is modelled deliberately.
-        if o is None or o.t_active is None \
-                or (o.cancel_at is not None and r.ts_exch >= o.cancel_at):
+        # EVERY ORDER OF OURS ON THE PASSIVE SIDE that the flow could reach.
+        # Skipped here, per order: one still on the wire (t_active is None, so
+        # nothing can hit it), and one whose in-flight cancel has ALREADY
+        # landed (trade time >= cancel_at). Before cancel_at the order is
+        # still fillable -- that is in-flight cancel risk, modelled
+        # deliberately.
+        live = [o for o in self._side_orders(passive_side)
+                if o.t_active is not None
+                and not (o.cancel_at is not None
+                         and r.ts_exch >= o.cancel_at)]
+        # nothing of ours could be hit
+        if not live:
             return
         # The trade's execution (print) price.
         px = float(r.price)
-        # Did the trade print PAST our price? SELL: print above our ask. BUY: print below our bid.
-        # A through-print forces a fill by price priority.
-        through = (px > o.price) if passive_side == "SELL" else (px < o.price)
-        # Trade went through our price -> CERTAIN fill.
-        if through:
-            # Fill us for the whole trade qty (capped to our size inside _fill).
-            self._fill(passive_side, px, float(r.qty), r.ts_exch, "through")
-        # Trade printed EXACTLY at our price -> queue / time priority decides.
-        elif px == o.price:
-            # At-price fill policy: "never" | "always" | "queue".
-            mode = self.cfg["at_price_mode"]
-            # Conservative lower bound: never fill at our price.
-            if mode == "never":
-                return
-            # Optimistic upper bound: assume we are first in line -> fill fully.
-            if mode == "always":
-                self._fill(passive_side, px, float(r.qty), r.ts_exch, "at_optimistic")
-                return
-            # "queue" mode (realistic): rem = aggressive qty available, starts at full trade size.
-            rem = float(r.qty)
-            # SURGICAL DRAIN: trade names the specific resting order it hit, and it is in our queue.
-            if r.rest_oid and r.rest_oid in o.ahead:
-                # Consume the smaller of that order's remaining qty or the available flow.
-                take = min(o.ahead[r.rest_oid], rem)
-                # Shrink that specific order in our queue.
-                o.ahead[r.rest_oid] -= take
-                # If it is fully consumed, remove it from our queue-ahead.
-                if o.ahead[r.rest_oid] <= 0:
-                    del o.ahead[r.rest_oid]
-                # Reduce remaining flow by what it consumed.
-                rem -= take
-            # POOL DRAIN: id unknown or not in our queue -> consume front-to-back.
-            else:
-                # Walk the orders ahead of us. list() allows safe deletion while iterating.
-                for k in list(o.ahead):
-                    # Flow exhausted before reaching us -> stop.
-                    if rem <= 0:
+        # HOW MUCH OF THE AGGRESSOR'S QUANTITY IS STILL AVAILABLE. It is
+        # consumed as it works through the levels, so an order deeper in the
+        # queue only sees what survived the ones in front of it.
+        flow = float(r.qty)
+        # PRICE FIRST, THEN TIME -- the exchange's own priority rule, and the
+        # reason this is a sort rather than a loop over the list as stored. On
+        # the SELL side the lowest ask is hit first; on the BUY side the
+        # highest bid. Ties break on send order, which is the list's own
+        # order, so `index` carries time priority.
+        order_index = {id(o): k for k, o in
+                       enumerate(self._side_orders(passive_side))}
+        live.sort(key=lambda o: ((o.price if passive_side == "SELL"
+                                  else -o.price), order_index[id(o)]))
+        # OUR OWN ORDERS AT ONE PRICE SHARE ONE QUEUE. Each order carries its
+        # own `ahead` dict, snapshotted from the book when it arrived, and the
+        # historical orders in front of it are the SAME orders for both of
+        # ours at that price. Draining each dict separately would let the
+        # market queue be consumed twice. So the level is drained ONCE, using
+        # the OLDEST of our orders there, and what survives is then offered to
+        # ours in time order.
+        levels = {}
+        # group our live orders by price, preserving the sorted priority order
+        for o in live:
+            levels.setdefault(o.price, []).append(o)
+        # walk the levels in the priority order the sort established
+        for level_px in dict.fromkeys(o.price for o in live):
+            # every order of ours at this price, oldest first
+            ours = levels[level_px]
+            # the aggressor is spent
+            if flow <= 0:
+                break
+            # DID THE TRADE PRINT PAST THIS LEVEL? SELL: print above our ask.
+            # BUY: print below our bid. A through-print forces a fill by price
+            # priority -- the exchange could not have skipped us.
+            through = (px > level_px) if passive_side == "SELL" else (px < level_px)
+            # THROUGH -> certain fill, oldest of ours first
+            if through:
+                # offer the surviving flow to each of our orders in turn
+                for o in ours:
+                    # spent
+                    if flow <= 0:
                         break
-                    # Consume the smaller of this order's qty or remaining flow.
-                    take = min(o.ahead[k], rem)
-                    # Shrink this order and the remaining flow.
-                    o.ahead[k] -= take
-                    rem -= take
-                    # Order fully consumed -> remove it.
-                    if o.ahead[k] <= 0:
-                        del o.ahead[k]
-            # After clearing everyone ahead of us, is there STILL flow left?
-            if rem > 0:
-                # Yes -> remaining qty reaches US -> fill us for rem, tagged "at_queue".
-                self._fill(passive_side, px, rem, r.ts_exch, "at_queue")
+                    # fill it, and take off what it actually consumed
+                    flow -= self._fill(passive_side, px, flow, r.ts_exch,
+                                       "through", order=o)
+                # on to the next level
+                continue
+            # PRINTED EXACTLY AT THIS LEVEL -> queue / time priority decides
+            if px == level_px:
+                # At-price fill policy: "never" | "always" | "queue".
+                mode = self.cfg["at_price_mode"]
+                # Conservative lower bound: never fill at our price.
+                if mode == "never":
+                    continue
+                # Optimistic upper bound: assume we are first in line.
+                if mode == "always":
+                    # each of ours in turn, until the flow is spent
+                    for o in ours:
+                        # spent
+                        if flow <= 0:
+                            break
+                        # fill it, and take off what it consumed
+                        flow -= self._fill(passive_side, px, flow, r.ts_exch,
+                                           "at_optimistic", order=o)
+                    # on to the next level
+                    continue
+                # "queue" mode (realistic). THE LEVEL'S QUEUE IS THE OLDEST OF
+                # OUR ORDERS' `ahead` DICT -- see the note above on why it is
+                # drained once rather than per order.
+                lead = ours[0]
+                # SURGICAL DRAIN: the trade names the specific resting order it
+                # hit, and it is in our queue.
+                if r.rest_oid and r.rest_oid in lead.ahead:
+                    # Consume the smaller of that order's remaining qty or the
+                    # available flow.
+                    take = min(lead.ahead[r.rest_oid], flow)
+                    # Shrink that specific order in our queue.
+                    lead.ahead[r.rest_oid] -= take
+                    # If it is fully consumed, remove it from our queue-ahead.
+                    if lead.ahead[r.rest_oid] <= 0:
+                        del lead.ahead[r.rest_oid]
+                    # Reduce remaining flow by what it consumed.
+                    flow -= take
+                # POOL DRAIN: id unknown or not in our queue -> front-to-back.
+                else:
+                    # Walk the orders ahead of us. list() allows safe deletion.
+                    for k in list(lead.ahead):
+                        # Flow exhausted before reaching us -> stop.
+                        if flow <= 0:
+                            break
+                        # Consume the smaller of this order's qty or the flow.
+                        take = min(lead.ahead[k], flow)
+                        # Shrink this order and the remaining flow.
+                        lead.ahead[k] -= take
+                        flow -= take
+                        # Order fully consumed -> remove it.
+                        if lead.ahead[k] <= 0:
+                            del lead.ahead[k]
+                # WHAT SURVIVED THE MARKET QUEUE now reaches OUR orders at this
+                # price, oldest first -- our own time priority among ourselves.
+                for o in ours:
+                    # spent
+                    if flow <= 0:
+                        break
+                    # fill it, and take off what it consumed
+                    flow -= self._fill(passive_side, px, flow, r.ts_exch,
+                                       "at_queue", order=o)
+                # on to the next level
+                continue
+            # WORSE PRICED THAN THE PRINT. Levels are walked best-first, so
+            # every level after this one is worse too: nothing more can fill.
+            break
 
     def _on_market_add(self, r):
         """A historical ORDER_ADD arrived. If its price CROSSES one of our
@@ -1571,21 +1729,40 @@ class Backtester:
         # Check both of our sides. opp = the opposing side an add must be on to cross us.
         # For our SELL (ask), a crossing add is a BUY; for our BUY (bid), it is a SELL.
         for side, opp in (("SELL", "BUY"), ("BUY", "SELL")):
-            # Fetch OUR working order on this side (None if we have none there).
-            o = self.work.get(side)
-            # Skip if we have no order on this side, OR the order is still on
-            # the wire and cannot be matched against (t_active is None), OR the
-            # add is not on the opposing side.
-            if o is None or o.t_active is None or r.side != opp:
+            # the add is not on the side that could cross us
+            if r.side != opp:
                 continue
             # Only fill off crossing adds if the config enables this (it is optional/optimistic).
-            if self.cfg["fill_on_crossing_adds"]:
-                # The incoming order's price.
-                px = float(r.price)
+            if not self.cfg["fill_on_crossing_adds"]:
+                continue
+            # The incoming order's price.
+            px = float(r.price)
+            # HOW MUCH OF THE INCOMING ORDER IS STILL UNMATCHED. It is
+            # consumed as it works through our orders, so the second of ours
+            # it reaches only sees what the first left.
+            flow = float(r.qty)
+            # OUR ORDERS ON THIS SIDE, in the exchange's priority: best price
+            # first, then oldest first. Sent order is the list's own order, so
+            # the index carries time priority.
+            idx = {id(o): k for k, o in enumerate(self._side_orders(side))}
+            # only orders that have actually reached the exchange can be hit
+            ours = sorted((o for o in self._side_orders(side)
+                           if o.t_active is not None),
+                          key=lambda o: ((o.price if side == "SELL"
+                                          else -o.price), idx[id(o)]))
+            # walk them until the incoming order is exhausted
+            for o in ours:
+                # nothing left of the incoming order
+                if flow <= 0:
+                    break
                 # Does it cross us? Our SELL: add's buy price at/above our ask. Our BUY: add's sell price at/below our bid.
                 if (side == "SELL" and px >= o.price) or (side == "BUY" and px <= o.price):
                     # It would have matched against us -> fill us AT OUR PRICE (o.price), tagged "crossing_add".
-                    self._fill(side, o.price, float(r.qty), r.ts_exch, "crossing_add")
+                    flow -= self._fill(side, o.price, flow, r.ts_exch,
+                                       "crossing_add", order=o)
+                else:
+                    # priced best-first, so no later order can cross either
+                    break
 
     def _on_market_cancel(self, r):
         """A historical order was cancelled. If it was queued AHEAD of one
@@ -1593,7 +1770,7 @@ class Backtester:
         every ahead dict it appears in. (It can only match at one price,
         so at most one dict actually contains it.)"""
         oid = str(r.order_id)
-        for o in self.work.values():
+        for o in self._all_orders():
             o.ahead.pop(oid, None)
 
     def _on_snapshot_queue_reset(self):
@@ -1607,7 +1784,7 @@ class Backtester:
         our priority, never overstates it. Cheap insurance given quotes
         inside a wide spread are usually alone at their price anyway.
         """
-        for o in self.work.values():
+        for o in self._all_orders():
             # An order still on the wire has no queue position yet -- _arrive
             # snapshots it from the book at the instant it lands, which is the
             # only moment that snapshot is meaningful. Rebuilding it here would
@@ -1686,7 +1863,8 @@ class Backtester:
             # Count this halted requote for diagnostics.
             self.stats["halted_requotes"] += 1
             # Cancel every working order that isn't already being cancelled.
-            for side, cur in list(self.work.items()):
+            for side, cur in [(s_, o_) for s_ in ("BUY", "SELL")
+                              for o_ in list(self._side_orders(s_))]:
                 # Skip orders with ANY message of ours outstanding: a cancel
                 # already in flight, an order that has not reached the exchange
                 # yet, or an amendment awaiting an answer. In each case there
@@ -1754,7 +1932,11 @@ class Backtester:
             # The desired quote for this side (or None).
             w = want.get(side)
             # Our current working order on this side (or None).
-            cur = self.work.get(side)
+            # THE LEAD ORDER, which under this file's own requote logic is the
+            # only one: mm_backtest never rests more than one order per side.
+            # The list exists for the production order manager, which drives
+            # the same exchange through sim/replay.py and does rest two.
+            cur = self._lead(side)
             # ---- IN FLIGHT: WAIT --------------------------------------------
             # THE ORDER HAS BEEN SENT AND HAS NOT REACHED THE EXCHANGE YET
             # (t_active is None until _arrive sets it). Nothing can be done
@@ -1831,6 +2013,10 @@ class Backtester:
                 # count it as an order sent, so message-rate reporting stays
                 # comparable between the one-message and two-message paths.
                 self.stats["n_orders_sent"] += 1
+                # AND SEPARATELY, because n_orders_sent counts new orders AND
+                # amendments together and a reader cannot tell them apart.
+                self.stats["n_amends_sent"] = (
+                    self.stats.get("n_amends_sent", 0) + 1)
                 # schedule the amendment to land; the payload carries the
                 # target generation (cur.oid) so a CFO that loses a race to a
                 # fill is recognised and rejected rather than misapplied.
@@ -1902,6 +2088,12 @@ class Backtester:
                 self._new_in_flight[side] += 1
                 # Count an order sent.
                 self.stats["n_orders_sent"] += 1
+                # AND SEPARATELY, as a NEW order. n_orders_sent is the sum of
+                # this and n_amends_sent; reporting only the sum made the
+                # amendment count look like a separate category when it is
+                # part of the same total.
+                self.stats["n_new_orders_sent"] = (
+                    self.stats.get("n_new_orders_sent", 0) + 1)
                 # Independent send-latency draw for the new order (separate from the cancel).
                 a_out = self.lat.draw_out()  # independent new-order draw
                 # The new order lands (becomes eligible to rest) at knowledge time + latency.
@@ -1933,7 +2125,7 @@ class Backtester:
                 # side as empty, and sent another order -- 4,901 of them across
                 # four symbol-days. The in-flight rule at the top of the
                 # reconcile loop now sees this entry and waits.
-                self.work[side] = _o
+                self._side_orders(side).append(_o)
                 # Schedule its arrival; the empty {} is the queue-ahead dict,
                 # filled from the book at _arrive.
                 self._push(t_land, "ARRIVE", _o)
@@ -2034,7 +2226,7 @@ class Backtester:
                         # exposure calculation below needs.
                         _resting = [
                             (o.side, float(o.price), float(o.qty))
-                            for o in self.work.values()
+                            for o in self._all_orders()
                             if o.t_active is not None
                             and o.t_active <= ts_exch
                             and o.cancel_at is None]
@@ -2189,8 +2381,8 @@ class Backtester:
                 self._requote(know)
             # Past session end: pull every working quote (instant -- flagged simplification).
             elif ts_exch > t1:
-                for side in list(self.work):
-                    self.work.pop(side)
+                for side in ("BUY", "SELL"):
+                    self._side_orders(side).clear()
                 # EOD FLATTEN (production): the FIRST time we cross session end,
                 # liquidate remaining inventory by walking the real book instead of
                 # marking it at mid. Mid-marking assumes an impossible exit at the
