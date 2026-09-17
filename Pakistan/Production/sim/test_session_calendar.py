@@ -429,35 +429,100 @@ for seed in range(5):
     SC.partition = lambda table, date: types.SimpleNamespace(
         exists=lambda: True)
     SC.pd.read_parquet = lambda *a, **k: tr_stable
-    # this date's scores
+    # this date's errors
     sc_s = SC.board_scores("2026-06-30", day_s)
     # restore
     SC.partition, SC.pd.read_parquet = _rp, _rr
-    # accumulate
+    # accumulate, as a list, because the choice is made on the median
     for b, v in sc_s.items():
-        tot, n = totals.get(b, (0.0, 0))
-        totals[b] = (tot + v, n + 1)
-    # this date's own winner
-    per_date.append(max(sc_s, key=lambda kk: sc_s[kk]) if sc_s else None)
+        totals.setdefault(b, []).append(v)
+    # this date's own winner -- the SMALLEST error
+    per_date.append(min(sc_s, key=lambda kk: sc_s[kk]) if sc_s else None)
 
-# scores are returned for every board, not just a winner
-check("board_scores returns a score per board, not a single verdict",
+# errors are returned for every board, not just a winner
+check("board_scores returns an error per board, not a single verdict",
       isinstance(totals, dict) and set(totals) == {"03", "05", "09"},
       f"got {set(totals)}")
 # the per-date winner does wander, which is the fault being guarded against
 print(f"        per-date winners: {per_date}")
 # the run-level choice is one board, whatever the per-date winners did
-means = {b: t / n for b, (t, n) in totals.items()}
-chosen = max(means, key=lambda k: means[k])
+meds = {b: float(pd.Series(v).median()) for b, v in totals.items()}
+# the same tie-break main() uses: lowest error, then lowest board id
+chosen = min(meds, key=lambda k: (meds[k], str(k)))
 check("a single board is chosen for the whole run",
       chosen in {"03", "05", "09"},
       f"chose {chosen}")
-# and it does not depend on which date happened to be measured first
+# THE TIE CASE. These three boards are symmetric by construction, so their
+# medians come out exactly equal and min() would otherwise return whichever
+# the dictionary happened to yield first -- a different answer on a different
+# run, for no reason in the data.
+print(f"        median errors: "
+      + ", ".join(f"{b}={meds[b]:.0f}s" for b in sorted(meds)))
+# reversed insertion order must give the same answer
+rev = {b: meds[b] for b in reversed(list(meds))}
 check("  and the choice is the same whichever order the dates came in",
-      chosen == max({b: t / n for b, (t, n) in
-                     {k: totals[k] for k in reversed(list(totals))}.items()},
-                    key=lambda k: means[k]),
+      chosen == min(rev, key=lambda k: (rev[k], str(k))),
       "the accumulation is order-dependent, which it must not be")
+
+# ---- THE MARKET IS NAMED BY THE SPEC, NOT INFERRED FROM TIMING ----------
+# THE MISTAKE THIS GUARDS AGAINST. The timing metric below was used to SELECT
+# the regular market, and on real data it selected '08' -- the Odd Lot Market
+# -- because the odd lot bell sits within 2 seconds of the first and last
+# regular-market print while the Regular Market's own bell is about 2 minutes
+# away. The reason is that the first and last REG prints of a day are AUCTION
+# CROSSES, which happen outside the continuous session. The PSX FIX spec,
+# section 4.2.1, lists tag 336 as MarketCode and says '01' is the Regular
+# Market. It was in the project the whole time.
+check("the spec's market codes are carried, not inferred",
+      SC.MARKET_CODE.get("01") == "Regular Market"
+      and SC.MARKET_CODE.get("08") == "Odd Lot Market",
+      f"got 01={SC.MARKET_CODE.get('01')}, 08={SC.MARKET_CODE.get('08')}")
+check("the regular market is 01, per the spec",
+      SC.REGULAR_MARKET == "01", f"got {SC.REGULAR_MARKET}")
+# every code the real feed was observed to carry, on 2026-03-11/13/25/27
+SEEN_CODES = ("01", "02", "03", "04", "05", "06", "07", "08", "09", "10",
+              "12", "13")
+# any the dictionary is missing
+MISSING = [c for c in SEEN_CODES if c not in SC.MARKET_CODE]
+check("and every code the feed carries is in the dictionary",
+      not MISSING, f"missing {MISSING}")
+
+# ---- THE METRIC ITSELF: minutes late must lose to seconds late -----------
+# Kept as a CROSS-CHECK only. It is no longer what picks the market.
+# This is the discovery that the real data forced. Scoring Jaccard overlap
+# against the 5th-to-95th percentile of print times rated a board whose bell
+# is two MINUTES from the real one at 0.9130 and the board whose bell is two
+# SECONDS away at 0.9130 as well -- tied to four decimals, so the pick was
+# decided by noise. Trimming to percentiles discards the opening and closing
+# prints, which are the only thing telling the boards apart.
+# the real prints, first and last
+first = pd.Timestamp("2026-06-30 04:30:00", tz="UTC")
+last = pd.Timestamp("2026-06-30 10:30:00", tz="UTC")
+# two candidate boards: one two seconds out, one two minutes out
+cands = [
+    {"session_id": "08", "open_utc": first + pd.Timedelta(seconds=2),
+     "close_utc": last},
+    {"session_id": "05", "open_utc": first + pd.Timedelta(seconds=133),
+     "close_utc": last - pd.Timedelta(seconds=1)},
+]
+# the trades those bells are measured against
+tr_m = pd.DataFrame({"capture_ts": [first, last], "market": ["REG", "REG"]})
+# stand in for the read
+_rp, _rr = SC.partition, SC.pd.read_parquet
+SC.partition = lambda table, date: types.SimpleNamespace(exists=lambda: True)
+SC.pd.read_parquet = lambda *a, **k: tr_m
+# the errors
+err = SC.board_scores("2026-06-30", cands)
+# restore
+SC.partition, SC.pd.read_parquet = _rp, _rr
+# the two-second board must win, and by a wide margin
+check("a bell 2s from the real prints beats one 2 minutes away",
+      err.get("08", 9e9) < err.get("05", 0),
+      f"got {err}")
+check("  and the gap is large enough not to be decided by noise",
+      err.get("05", 0) > 10 * max(err.get("08", 1e-9), 1e-9),
+      f"2s board scored {err.get('08')}, 2min board {err.get('05')} -- "
+      f"the old percentile metric put these within 0.0002 of each other")
 
 # ==========================================================================
 # PART 4 -- THE FRIDAY SPLIT
@@ -520,6 +585,23 @@ check("a 300s silence is NOT assumed to be trading",
       long_gap is not None and long_gap["unobserved_seconds"] > 0,
       "assuming the market stayed open through a five-minute blackout "
       "manufactures session time nobody observed")
+# THE STRETCHES MUST SURVIVE AN UNOBSERVED GAP. The run-length arithmetic
+# that finds them works on a numpy bool array, and a second whose state was
+# never observed is neither True nor False -- converting that without saying
+# what to do with the missing values raises, on exactly the dates that matter.
+check("the trading stretches are found even with unobserved seconds",
+      long_gap is not None and isinstance(long_gap.get("intervals"), list)
+      and len(long_gap["intervals"]) >= 1,
+      f"got {long_gap.get('intervals') if long_gap else None}")
+# and they must still sum to the traded seconds
+if long_gap is not None and long_gap.get("intervals"):
+    # the sum of the stretches
+    _tot = sum((e - s).total_seconds() for s, e in long_gap["intervals"])
+    # within one second per stretch, since each is measured inclusively
+    check("  and they sum to traded_seconds",
+          abs(_tot - long_gap["traded_seconds"])
+          <= len(long_gap["intervals"]),
+          f"stretches {_tot}s vs traded {long_gap['traded_seconds']}s")
 # but the closing bell is unmoved either way, which is what the classifier
 # keys off
 check("and the closing bell is unmoved by either silence",

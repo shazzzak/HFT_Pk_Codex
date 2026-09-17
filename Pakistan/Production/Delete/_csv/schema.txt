@@ -1,0 +1,96 @@
+ARROW SCHEMAS -- 2026-03-11
+======================================================================
+
+--- trades
+    rows: 310,467
+    transact_time          timestamp[us, tz=UTC]
+    sending_time           timestamp[us, tz=UTC]
+    capture_ts             timestamp[us, tz=UTC]
+    msg_seq                int64
+    appl_seq               int64
+    channel                int64
+    segment                string
+    market                 string
+    exec_type_code         string
+    exec_type              string
+    exec_inst              string
+    symbol                 string
+    price                  double
+    qty                    double
+    buy_ref                int64
+    sell_ref               int64
+    resting_ref            int64
+    resting_order_id       string
+    initiator              string
+    aggressor_side         string
+
+--- ob_updates
+    rows: 2,143,304
+    transact_time          timestamp[us, tz=UTC]
+    sending_time           timestamp[us, tz=UTC]
+    capture_ts             timestamp[us, tz=UTC]
+    msg_seq                int64
+    appl_seq               int64
+    channel                int64
+    segment                string
+    market                 string
+    event                  string
+    exec_type_code         string
+    exec_type              string
+    exec_inst              string
+    symbol                 string
+    side_code              string
+    side                   string
+    price                  double
+    qty                    double
+    order_id               string
+    buy_ref                int64
+    sell_ref               int64
+    resting_ref            int64
+    raw_last_px            double
+
+--- misc
+    rows: 369,338
+    capture_ts             timestamp[us, tz=UTC]
+    sending_time           timestamp[us, tz=UTC]
+    orig_time              timestamp[us, tz=UTC]
+    msg_seq                int64
+    msg_type               string
+    channel                int64
+    segment                string
+    n_streams              int64
+    appl_last_seq          int64
+    end_of_channel         int64
+    heartbeat_time         timestamp[us, tz=UTC]
+    raw                    string
+
+--- ob_snapshot
+    rows: 25,759,597
+    snapshot_time          timestamp[us, tz=UTC]
+    orig_time              timestamp[us, tz=UTC]
+    capture_ts             timestamp[us, tz=UTC]
+    msg_seq                int64
+    channel                int64
+    segment                string
+    market                 string
+    symbol                 string
+    trading_status         string
+    phase                  string
+    suspended_all_day      bool
+    break_reason           string
+    prev_close             double
+    num_trades             int64
+    cum_volume             double
+    cum_value              double
+    entry_type_code        string
+    entry_type             string
+    level                  int64
+    px                     double
+    qty                    double
+    n_orders_at_level      int64
+    n_orders_detailed      int64
+    order_ids              string
+    order_qtys             string
+    visible_qty_sum        double
+    is_xf_tick_floor       bool
+

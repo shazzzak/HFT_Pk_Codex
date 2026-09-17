@@ -68,6 +68,8 @@ from pathlib import Path
 # the date comes off the filename
 import re
 
+# run-length arithmetic on the per-second flags
+import numpy as np
 # frames
 import pandas as pd
 
@@ -93,6 +95,39 @@ PHASE_MAP = {
     "A": "AFTER_HOUR_TRADING",
     "E": "MARKET_CLOSED",
 }
+
+# THE MARKET DICTIONARY, from the PSX FIX Market Data Interface
+# Specification, section 4.2.1, tag 336 TradingSessionID, described there as
+# MarketCode. PSX publishes a SEPARATE Trading Session Status stream per
+# market, every 3 seconds, and they are not in the same phase at the same
+# moment -- which is why pooling them produces nonsense.
+#
+# THIS IS A DOCUMENTED PROTOCOL CONSTANT, not something to infer. An earlier
+# version of this file tried to identify the regular market by matching each
+# stream's opening and closing bell against the first and last regular-market
+# print, and chose '08' -- the ODD LOT market -- because the odd lot bell sits
+# closer to those prints than the regular market's own does. It does so for a
+# reason worth knowing: the first and last REG prints of the day are AUCTION
+# CROSSES, which happen at the end of the pre-open and at the close, outside
+# the continuous session. Matching a continuous window against auction prints
+# selects the wrong market. The spec was the answer all along.
+MARKET_CODE = {
+    "01": "Regular Market",
+    "02": "Bills and Bond Market",
+    "03": "Stock Deliverable Future Market",
+    "04": "Stock Cash Settled Future Market",
+    "05": "Stock Option Market",
+    "06": "Index Option Market",
+    "07": "Stock Index Future Market",
+    "08": "Odd Lot Market",
+    "09": "Negotiated Deal Market",
+    "10": "Equities Square Up Market",
+    "12": "Futures Square Up Market",
+    "13": "Trade Rectification and Modification Market",
+}
+
+# THE MARKET THIS DESK QUOTES. '01' per the dictionary above.
+REGULAR_MARKET = "01"
 
 # THE BREAK DICTIONARY, likewise. Only meaningful when the phase is B.
 BREAK_REASON_MAP = {
@@ -341,21 +376,39 @@ def seconds_of_day(ts):
 
 
 def board_scores(date, rows):
-    """How well each board's session matches this date's REG trades.
+    """How far each board's bell is from this date's first and last REG print.
 
-    Returns {board_id: score}, where the score is the Jaccard overlap --
-    intersection over union -- between that board's continuous window and the
-    span in which the regular-market trades actually happened. Jaccard rather
-    than coverage alone, so a board that is open all day and all night cannot
-    win simply by containing everything.
+    Returns {board_id: error_seconds}, LOWER IS BETTER: the number is
+    |open - first regular-market print| + |close - last regular-market print|.
 
-    A SCORE, NOT A VERDICT, because the verdict must not be taken one date at
-    a time. Several PSX boards keep near-identical hours, so their scores come
-    out within noise of each other and a per-date winner flips around: the
-    first working run picked board 05 on eleven dates and boards 03, 07 and 09
-    on the other four, which made the calendar's session wander for no reason
-    in the market. The caller adds these up across every date and chooses
-    once.
+    WHY THIS METRIC, measured on 2026-03-11, 03-13, 03-25 and 03-27 (one of
+    each of the four day types):
+
+        board 08          1s      2s      2s     10s
+        board 01        121s    124s    125s      7s
+        boards 03-07    121s    135s    129s     10s
+        board 02      1,802s  3,602s      2s  3,603s
+        board 09      1,801s  3,602s  1,802s  5,352s
+        board 13     19,502s 15,903s 26,403s 30,019s
+
+    Board 08 is the regular market: its bell sits within ten seconds of the
+    real prints on every day type. Boards 01 and 03-07 are consistently about
+    two minutes late at the open -- on 2026-03-25 board 05 reports the market
+    as not yet trading at 09:32:13 while the first regular print is timestamped
+    09:30:00.101. Boards 02 and 09 close half an hour to an hour early; board
+    13 is the after-hours board.
+
+    AN EARLIER VERSION SCORED JACCARD OVERLAP AGAINST THE 5TH-TO-95TH
+    PERCENTILE of print times and picked board 07, 06 or 05 -- all three tied
+    at 0.9130, separated in the fourth decimal. Trimming to percentiles threw
+    away the opening and closing prints, which are precisely the signal that
+    distinguishes one board from another; the extremes ARE the bell. On the
+    same data this metric separates the right board from the rest by a factor
+    of twelve.
+
+    AN ERROR, NOT A VERDICT, because the verdict must not be taken one date at
+    a time. The caller collects these across every date and chooses once, on
+    the median, so one date with a stray print cannot move the answer.
     """
     # nothing to choose between
     if not rows:
@@ -385,24 +438,20 @@ def board_scores(date, rows):
     epoch = pd.Timestamp("1970-01-01", tz="UTC")
     # every trade's arrival, in seconds since the epoch
     ts = (tt - epoch).dt.total_seconds()
-    # the 5th and 95th percentile, so a single stray print outside the
-    # session cannot stretch the target window
-    lo, hi = float(ts.quantile(0.05)), float(ts.quantile(0.95))
-    # board -> score
+    # THE FIRST AND LAST PRINT, untrimmed. See the docstring: trimming to
+    # percentiles removes the opening and closing prints, which are the only
+    # thing that tells the boards apart.
+    lo, hi = float(ts.min()), float(ts.max())
+    # board -> error in seconds
     out = {}
-    # score each board's continuous window against that span
+    # measure each board's bell against those two instants
     for r in rows:
         # this board's window, in the same units
         o = (r["open_utc"] - epoch).total_seconds()
         c = (r["close_utc"] - epoch).total_seconds()
-        # the overlap of the two windows, in seconds, floored at zero for a
-        # board that does not overlap the trades at all
-        inter = max(0.0, min(c, hi) - max(o, lo))
-        # the union of the two windows
-        union = max(c, hi) - min(o, lo)
-        # intersection over union
-        out[r["session_id"]] = inter / union if union > 0 else 0.0
-    # every board's score for this date
+        # how far its bell sits from the real one, at both ends
+        out[r["session_id"]] = abs(o - lo) + abs(c - hi)
+    # every board's error for this date
     return out
 
 
@@ -412,13 +461,15 @@ def pick_board(date, rows):
     Kept because it is the natural unit to test. main() does NOT use it --
     see board_scores for why a per-date verdict is the wrong shape.
     """
-    # the scores
+    # the errors
     s = board_scores(date, rows)
     # nothing to choose between
     if not s:
         return None
-    # the best of them
-    return max(s, key=lambda k: s[k])
+    # The SMALLEST error wins, and an exact tie is broken by the lowest board
+    # id. Without that second key the answer depends on dictionary iteration
+    # order, which is a different answer on a different day for no reason.
+    return min(s, key=lambda k: (s[k], str(k)))
 
 
 def measure(date, st, session_id=None):
@@ -468,6 +519,29 @@ def measure(date, st, session_id=None):
     ic = cont.loc[open_off:close_off]
     # a run starts wherever a True follows a non-True
     spans = int((ic & ~ic.shift(1, fill_value=False)).sum())
+    # THE TRADING INTERVALS THEMSELVES, not just their outer bounds.
+    #
+    # A consumer asking "was this moment inside the session?" CANNOT answer it
+    # from open and close on a Friday: the two-and-a-quarter-hour Jumu'ah
+    # break sits between them, and counting a feed silence during a closed
+    # lunch break as an outage is the same class of error that put 80,000
+    # phantom seconds in the first vendor report.
+    #
+    # Found vectorised rather than by walking the seconds: ten markets times
+    # 207 dates times ~25,000 seconds is fifty million iterations in Python
+    # and about two hundred in numpy.
+    # na_value=False because a second whose state was never observed is not a
+    # trading second. Without it this raises on any date with an unobserved
+    # gap -- which is most of the interesting ones.
+    a = ic.to_numpy(dtype=bool, na_value=False)
+    # a run starts at a True whose predecessor is not True
+    _starts = np.flatnonzero(a & ~np.r_[False, a[:-1]])
+    # and ends at a True whose successor is not True
+    _ends = np.flatnonzero(a & ~np.r_[a[1:], False])
+    # the offsets, as real timestamps
+    intervals = [(t0 + pd.Timedelta(seconds=int(ic.index[s])),
+                  t0 + pd.Timedelta(seconds=int(ic.index[e])))
+                 for s, e in zip(_starts, _ends)]
     # the weekday, which is half the day-type answer on its own
     wd = pd.Timestamp(date).day_name()
     # THE FRIDAY TEST, taken from the exchange rather than from the weekday:
@@ -494,6 +568,9 @@ def measure(date, st, session_id=None):
         "traded_seconds": float(traded),
         # how many continuous stretches made it up (2 on a split Friday)
         "continuous_spans": spans,
+        # THE STRETCHES THEMSELVES, which is what a consumer needs to decide
+        # whether a given moment was inside the session
+        "intervals": intervals,
         # the break time inside the session
         "break_seconds": float(brk_secs),
         # and what the exchange called those breaks
@@ -652,10 +729,11 @@ def main():
     # which date to probe
     ap.add_argument("--date", default=None,
                     help="the date --probe examines; default is the newest")
-    # force the board choice, when the automatic one is wrong
-    ap.add_argument("--board", default=None,
-                    help="measure this board (tag 336) as the regular market "
-                         "instead of the best-matching one")
+    # which market to report as the session, if not the regular one
+    ap.add_argument("--market", default=REGULAR_MARKET,
+                    help=f"the TradingSessionID (tag 336) whose session is "
+                         f"reported; default {REGULAR_MARKET} = Regular "
+                         f"Market")
     args = ap.parse_args()
 
     print("=" * 78)
@@ -690,8 +768,6 @@ def main():
     t_start = dt.datetime.now()
     # board -> (summed score, number of dates it was scored on)
     board_total = {}
-    # date -> the board that scored best on that date alone
-    per_date_best = {}
     # walk them
     for k, date in enumerate(dates, 1):
         # the exchange's own status messages
@@ -732,27 +808,27 @@ def main():
         # SCORE the boards against this date's trades, but do NOT pick a
         # winner yet -- the choice is made once, after every date, below.
         sc = board_scores(date, day_rows)
-        # accumulate each board's score across the whole run
+        # collect each board's error across the whole run. A LIST, not a
+        # running total, because the choice is made on the MEDIAN: one date
+        # with a stray print well outside the session would drag a mean.
         for b, s in sc.items():
-            # total and count, so a board present on few dates cannot win on
-            # one lucky day
-            tot, n = board_total.get(b, (0.0, 0))
-            board_total[b] = (tot + s, n + 1)
-        # keep every board's row
+            board_total.setdefault(b, []).append(s)
+        # keep every market's row
         rows.extend(day_rows)
-        # the progress line shows this DATE's best board, which is not
-        # necessarily the one finally chosen; any disagreement is reported
-        # after the loop rather than hidden
-        best_here = max(sc, key=lambda kk: sc[kk]) if sc else None
-        # remembered so the run can report how often the per-date winner
-        # disagreed with the one finally chosen
-        per_date_best[date] = best_here
-        # that board's row, or the first as a fallback
-        r = next((x for x in day_rows if x["session_id"] == best_here),
-                 day_rows[0])
+        # THE PROGRESS LINE SHOWS THE REGULAR MARKET, named by the spec. It
+        # is not chosen from the data and so cannot wander from date to date.
+        r = next((x for x in day_rows if x["session_id"] == args.market),
+                 None)
+        # a date on which the regular market never opened still gets a line,
+        # from whatever did, rather than vanishing
+        if r is None:
+            # say so plainly on that date's line
+            print(f"  [{k}/{len(dates)}] {date}  market {args.market} did "
+                  f"not open; {len(day_rows)} other market(s) did")
+            continue
         # progress, with the numbers worth watching
         print(f"  [{k}/{len(dates)}] {date} {r['weekday'][:3]}  "
-              f"board {str(r['session_id']):>3s} of {len(day_rows):>2d}  "
+              f"mkt {str(r['session_id']):>3s} of {len(day_rows):>2d}  "
               f"{str(r['open_pkt'])[11:19]}-{str(r['close_pkt'])[11:19]} PKT  "
               f"traded {r['traded_seconds']:>7,.0f}s  "
               f"break {r['break_seconds']:>6,.0f}s  "
@@ -780,81 +856,72 @@ def main():
     # EVERY board's row, which is what the CSV carries
     ALL = pd.DataFrame(rows)
 
-    # ---- CHOOSE THE REGULAR EQUITY BOARD, ONCE, FOR THE WHOLE RUN --------
-    # Several PSX boards keep near-identical hours, so their per-date scores
-    # land within noise of each other and a per-date winner wanders. The
-    # market's regular board does not change from Monday to Tuesday, so the
-    # choice is made once on the MEAN score across every date measured.
+    # ---- THE MARKET, FROM THE SPEC, NOT FROM A GUESS ---------------------
+    # Tag 336 is MarketCode and the specification lists its values. There is
+    # nothing here to infer.
     print("\n" + "=" * 78)
-    print("WHICH BOARD IS THE REGULAR EQUITY MARKET")
+    print("MARKETS PRESENT (tag 336, TradingSessionID)")
     print("=" * 78)
-    # mean score per board, and how many dates it appeared on
-    means = {b: (tot / n, n) for b, (tot, n) in board_total.items()}
-    # the table, best first
-    print(f"\n  {'board':>6s} {'dates':>6s} {'mean match to REG trades':>26s}")
-    # every board that was scored
-    for b in sorted(means, key=lambda k: -means[k][0]):
-        # its mean and its coverage
-        mu, n = means[b]
+    # every market seen, with its name and how its bell compares
+    print(f"\n  {'code':>5s}  {'market':<38s} {'dates':>5s} "
+          f"{'median bell gap (s)':>20s}")
+    # each, in code order
+    for b in sorted(board_total):
+        # the spec's name for it, or a flag that the spec does not list it
+        name = MARKET_CODE.get(str(b), "NOT IN THE SPEC'S MARKET LIST")
+        # the median gap, for the cross-check below
+        mu = float(pd.Series(board_total[b]).median())
         # the row
-        print(f"  {str(b):>6s} {n:>6d} {mu:>26.4f}")
-    # the winner: highest mean, and present on at least half the dates so a
-    # board that existed for a week cannot win on a small sample
-    eligible = {b: v for b, v in means.items()
-                if v[1] >= max(1, len(dates) // 2)}
-    # fall back to every board if that filter leaves nothing
-    pool = eligible or means
-    # the choice, or nothing to choose from
-    reg = (args.board if args.board
-           else (max(pool, key=lambda k: pool[k][0]) if pool else None))
-    # say which, and how
-    print(f"\n  CHOSEN: board {reg}"
-          + ("  (given on the command line)" if args.board
-             else "  (highest mean match, present on enough dates)"))
-    # nothing could be chosen
-    if reg is None:
-        raise SystemExit(
-            "no board could be matched to the regular market's trades. The "
-            "per-board measurements are in the CSV; pick one with --board.")
-    # HOW OFTEN THE PER-DATE WINNER DISAGREED with the run-level choice.
-    # A large number is not an error -- it is the noise this whole mechanism
-    # exists to absorb -- but it should be visible rather than implied.
-    dis = sorted(d for d, b in per_date_best.items() if b != reg)
-    # stated either way
-    if dis:
-        print(f"\n  on {len(dis)} of {len(per_date_best)} dates a DIFFERENT "
-              f"board scored highest on that date alone:")
-        # which boards, and how often
-        alt = {}
-        # count them
-        for d in dis:
-            alt[per_date_best[d]] = alt.get(per_date_best[d], 0) + 1
-        # the tally
-        for b, n in sorted(alt.items(), key=lambda kv: -kv[1]):
-            print(f"      board {b} on {n} date(s)")
-        print(f"      Board {reg} is used on every date regardless. Boards "
-              f"with near-identical")
-        print(f"      hours score within noise of each other, and the "
-              f"regular market does not")
-        print(f"      change from one day to the next.")
-    else:
-        print(f"\n  board {reg} scored highest on every date individually "
-              f"as well.")
-    # flag it on every row
+        print(f"  {str(b):>5s}  {name:<38s} {len(board_total[b]):>5d} "
+              f"{mu:>20,.0f}")
+    # what the gap column is, and why it is NOT the selector
+    print("\n  Bell gap = |open - first REG print| + |close - last REG print|.")
+    print("  It is a CROSS-CHECK, not the selector. The first and last REG")
+    print("  prints of a day are AUCTION CROSSES, which sit outside the")
+    print("  continuous session, so the market whose continuous bell is")
+    print("  closest to them is not necessarily the regular market -- an")
+    print("  earlier version of this file selected on it and chose the Odd")
+    print("  Lot Market. The selector is the spec.")
+    # the market to report
+    reg = args.market
+    # say which, by name
+    print(f"\n  REPORTING: market {reg} = "
+          f"{MARKET_CODE.get(str(reg), 'unknown code')}"
+          + ("  (the spec's Regular Market)" if reg == REGULAR_MARKET
+             else "  (given on the command line)"))
+    # a code the spec does not list is worth flagging rather than accepting
+    if str(reg) not in MARKET_CODE:
+        print(f"  WARNING: {reg} is not one of the spec's market codes.")
+    # THE CROSS-CHECK, stated rather than acted on. If the regular market's
+    # bell is a long way from its own first and last print on most dates,
+    # something is wrong with either the measurement or the assumption -- but
+    # a gap of roughly the pre-open auction's length is EXPECTED, because the
+    # first print is the opening cross.
+    if reg in board_total:
+        # its median gap
+        gap = float(pd.Series(board_total[reg]).median())
+        # stated with its interpretation
+        print(f"\n  cross-check: market {reg}'s bell sits a median "
+              f"{gap:,.0f}s from its own first and last print.")
+        print("  A gap of a couple of minutes is expected -- the first REG")
+        print("  print is the opening auction cross, which happens before")
+        print("  continuous trading starts. A gap of hours would not be.")
+    # flag the reported market on every row
     ALL["is_reg_board"] = (ALL["session_id"] == reg)
-    # THE REGULAR EQUITY BOARD ONLY, which is what the day types describe
+    # THE REPORTED MARKET ONLY, which is what the day types describe
     D = ALL[ALL["is_reg_board"]].copy().reset_index(drop=True)
-    # the chosen board is missing from every date
+    # the reported market is missing from every date
     if len(D) == 0:
         raise SystemExit(
-            f"board {reg} has no measured session on any date. The per-board "
-            f"measurements are in the CSV; pick another with --board.")
-    # dates where the chosen board is absent, which the CSV would otherwise
+            f"market {reg} has no measured session on any date. Every "
+            f"market's measurements are in the CSV; report another one with "
+            f"--market.")
+    # dates where the reported market is absent, which the CSV would otherwise
     # hide by simply not having a row for them
     missing = sorted(set(ALL["date"]) - set(D["date"]))
     # named, because those dates have no session in the output
     if missing:
-        print(f"\n  board {reg} is ABSENT on {len(missing)} date(s), which "
+        print(f"\n  market {reg} is ABSENT on {len(missing)} date(s), which "
               f"therefore have no session in this calendar:")
         # up to fifteen, so a long list does not swamp the output
         for dd in missing[:15]:
@@ -993,13 +1060,56 @@ def main():
     OUT.reindex(columns=cols).to_csv(path, index=False)
     # say where, and what is in it
     print(f"\nwrote {path}")
-    print(f"  {len(OUT):,} rows -- one per board per date, "
+    print(f"  {len(OUT):,} rows -- one per market per date, "
           f"{int(ALL['is_reg_board'].sum()):,} of them the regular market")
+
+    # ---- THE INTERVALS FILE, which is the one a consumer actually uses ----
+    # THE SUMMARY ABOVE CANNOT ANSWER "was this moment inside the session?"
+    # On a Friday the Jumu'ah break sits between open and close, so a script
+    # that tests open <= t <= close counts two and a quarter hours of closed
+    # market as trading time. That is precisely the error that put 80,000
+    # phantom seconds of "feed outage" in the first vendor report.
+    spans_path = outdir / f"session_spans_{stamp}.csv"
+    # one row per continuous stretch
+    span_rows = []
+    # every market's row, so a consumer can pick a different market if needed
+    for r in rows:
+        # each stretch of that market's day
+        for i, (s, e) in enumerate(r.get("intervals") or [], 1):
+            # the row
+            span_rows.append({
+                "date": r["date"],
+                "session_id": r["session_id"],
+                "is_reg_board": r["session_id"] == reg,
+                # which stretch: 1 on an ordinary day, 1 and 2 on a Friday
+                "span": i,
+                # both clocks, as for the summary
+                "start_utc": s,
+                "start_pkt": s + PKT_OFFSET,
+                "end_utc": e,
+                "end_pkt": e + PKT_OFFSET,
+                # its own length, so the parts sum to traded_seconds
+                "seconds": float((e - s).total_seconds()),
+            })
+    # written only if there is something to write
+    if span_rows:
+        # the frame
+        S = pd.DataFrame(span_rows)
+        # out it goes
+        S.to_csv(spans_path, index=False)
+        # say where, and how many of them belong to the regular market
+        print(f"wrote {spans_path}")
+        print(f"  {len(S):,} rows -- one per continuous stretch, "
+              f"{int(S['is_reg_board'].sum()):,} of them the regular market")
     print()
-    print("  Every script that needs a session window should read this file,")
-    print("  FILTERED TO is_reg_board, rather than hard-coding a clock.")
-    print("  traded_seconds is the denominator for any rate metric: it")
-    print("  EXCLUDES the Friday break, which open_to_close_seconds does not.")
+    print("  USE session_spans_*.csv, NOT the summary, to decide whether a")
+    print("  moment was inside the session. Filter to is_reg_board and test")
+    print("  membership of the stretches: on a Friday there are two, and the")
+    print("  gap between them is a closed market, not a feed outage.")
+    print()
+    print("  traded_seconds in the summary is the denominator for any rate")
+    print("  metric: it EXCLUDES the Friday break, which")
+    print("  open_to_close_seconds does not.")
 
 
 # entry point

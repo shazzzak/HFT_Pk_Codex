@@ -1,0 +1,314 @@
+==========================================================================
+STORE FACTS -- 2026-06-30
+==========================================================================
+  store : /Users/shazzak/HFT Data/Pakistan/Capital Stake - Parsed
+
+  Written so that analysis code can be checked against what
+  the store actually holds, rather than against an assumption
+  about it. Column names, dtypes, sample values and protocol
+  messages only -- no prices, positions or P&L.
+
+==========================================================================
+TABLE: trades
+==========================================================================
+  rows        : 418,794
+  row groups  : 2
+  file size   : 8.4 MB
+
+  ARROW SCHEMA (the authority on resolution and timezone)
+    transact_time          timestamp[us, tz=UTC]
+    sending_time           timestamp[us, tz=UTC]
+    capture_ts             timestamp[us, tz=UTC]
+    msg_seq                int64
+    appl_seq               int64
+    channel                int64
+    segment                string
+    market                 string
+    exec_type_code         string
+    exec_type              string
+    exec_inst              string
+    symbol                 string
+    price                  double
+    qty                    double
+    buy_ref                int64
+    sell_ref               int64
+    resting_ref            int64
+    resting_order_id       string
+    initiator              string
+    aggressor_side         string
+
+  PANDAS DTYPES AS READ (200,000-row sample)
+    transact_time          datetime64[us, UTC]
+    sending_time           datetime64[us, UTC]
+    capture_ts             datetime64[us, UTC]
+    msg_seq                int64
+    appl_seq               int64
+    channel                int64
+    segment                object
+    market                 object
+    exec_type_code         object
+    exec_type              object
+    exec_inst              object
+    symbol                 object
+    price                  float64
+    qty                    float64
+    buy_ref                int64
+    sell_ref               int64
+    resting_ref            float64
+    resting_order_id       object
+    initiator              object
+    aggressor_side         object
+
+  COLUMN VALUES
+    transact_time            0.0% null  103,485 distinct, e.g. 2026-06-30 04:30:00+00:0, 2026-06-30 04:30:00+00:0, 2026-06-30 04:30:00+00:0
+    sending_time             0.0% null  110,129 distinct, e.g. 2026-06-30 04:30:00.0420, 2026-06-30 04:30:00.0420, 2026-06-30 04:30:00.0420
+    capture_ts               0.0% null  108,234 distinct, e.g. 2026-06-30 04:30:00.1150, 2026-06-30 04:30:00.1150, 2026-06-30 04:30:00.1150
+    msg_seq                  0.0% null  169,490 distinct, e.g. 142958, 142959, 142960
+    appl_seq                 0.0% null  198,614 distinct, e.g. 78452, 78453, 78454
+    channel                  0.0% null  5 distinct: 2011, 2021, 2041, 4001, 4021
+    segment                  0.0% null  4 distinct: 011, 031, 081, 091
+    market                   0.0% null  4 distinct: NDM, ODD_LOT, REG, STOCK_DEL_FUT
+    exec_type_code           0.0% null  1 distinct: F
+    exec_type                0.0% null  1 distinct: TRADE
+    exec_inst               95.1% null  1 distinct: B
+    symbol                   0.0% null  337 distinct, e.g. 786, 786, 786
+    price                    0.0% null  15,440 distinct, e.g. 25.55, 25.55, 25.55
+    qty                      0.0% null  8,005 distinct, e.g. 1111.0, 51.0, 100.0
+    buy_ref                  0.0% null  65,354 distinct, e.g. 78129, 2062, 17794
+    sell_ref                 0.0% null  64,256 distinct, e.g. 11997, 11997, 11997
+    resting_ref              0.8% null  127,875 distinct, e.g. 81833.0, 81833.0, 101088.0
+    resting_order_id        69.4% null  46,585 distinct, e.g. 0010THF0D0001W3I, 0010THF0D0001W3I, 0010THF0D000310M
+    initiator                0.1% null  3 distinct: AUCTION, BUYER_INITIATED, SELLER_INITIATED
+    aggressor_side           0.1% null  3 distinct: AUCTION, BUY, SELL
+
+==========================================================================
+TABLE: ob_updates
+==========================================================================
+  rows        : 2,153,287
+  row groups  : 9
+  file size   : 45.4 MB
+
+  ARROW SCHEMA (the authority on resolution and timezone)
+    transact_time          timestamp[us, tz=UTC]
+    sending_time           timestamp[us, tz=UTC]
+    capture_ts             timestamp[us, tz=UTC]
+    msg_seq                int64
+    appl_seq               int64
+    channel                int64
+    segment                string
+    market                 string
+    event                  string
+    exec_type_code         string
+    exec_type              string
+    exec_inst              string
+    symbol                 string
+    side_code              string
+    side                   string
+    price                  double
+    qty                    double
+    order_id               string
+    buy_ref                int64
+    sell_ref               int64
+    resting_ref            int64
+    raw_last_px            double
+
+  PANDAS DTYPES AS READ (200,000-row sample)
+    transact_time          datetime64[us, UTC]
+    sending_time           datetime64[us, UTC]
+    capture_ts             datetime64[us, UTC]
+    msg_seq                int64
+    appl_seq               int64
+    channel                int64
+    segment                object
+    market                 object
+    event                  object
+    exec_type_code         object
+    exec_type              object
+    exec_inst              object
+    symbol                 object
+    side_code              object
+    side                   object
+    price                  float64
+    qty                    float64
+    order_id               object
+    buy_ref                float64
+    sell_ref               float64
+    resting_ref            float64
+    raw_last_px            float64
+
+  COLUMN VALUES
+    transact_time            0.0% null  143,516 distinct, e.g. 2026-06-30 04:15:00.0200, 2026-06-30 04:15:00.0200, 2026-06-30 04:15:00.0200
+    sending_time             0.0% null  152,572 distinct, e.g. 2026-06-30 04:15:00.0360, 2026-06-30 04:15:00.0360, 2026-06-30 04:15:00.0360
+    capture_ts               0.0% null  144,468 distinct, e.g. 2026-06-30 04:15:00.2330, 2026-06-30 04:15:00.2330, 2026-06-30 04:15:00.3860
+    msg_seq                  0.0% null  169,741 distinct, e.g. 13172, 13173, 13176
+    appl_seq                 0.0% null  193,071 distinct, e.g. 5, 6, 9
+    channel                  0.0% null  4 distinct: 2011, 2021, 2041, 4021
+    segment                  0.0% null  3 distinct: 011, 031, 081
+    market                   0.0% null  3 distinct: ODD_LOT, REG, STOCK_DEL_FUT
+    event                    0.0% null  2 distinct: CANCEL, ORDER_ADD
+    exec_type_code          58.5% null  1 distinct: 4
+    exec_type               58.5% null  1 distinct: CANCELLED
+    exec_inst              ALL NULL in this sample
+    symbol                   0.0% null  87 distinct, e.g. 786, 786, 786
+    side_code                0.0% null  2 distinct: 1, 2
+    side                     0.0% null  2 distinct: BUY, SELL
+    price                    0.2% null  12,891 distinct, e.g. 28.56, 28.36, 28.14
+    qty                      0.0% null  3,959 distinct, e.g. 1000.0, 1000.0, 1000.0
+    order_id                 0.2% null  82,194 distinct, e.g. 0010THF0D000004M, 0010THF0D000004N, 0010THF0D000004Q
+    buy_ref                 58.5% null  35,596 distinct, e.g. 0.0, 0.0, 0.0
+    sell_ref                58.5% null  46,568 distinct, e.g. 104174.0, 127958.0, 95093.0
+    resting_ref             58.5% null  81,608 distinct, e.g. 104174.0, 127958.0, 95093.0
+    raw_last_px             58.5% null  1 distinct: 0.0
+
+==========================================================================
+TABLE: misc
+==========================================================================
+  rows        : 404,086
+  row groups  : 2
+  file size   : 7.9 MB
+
+  ARROW SCHEMA (the authority on resolution and timezone)
+    capture_ts             timestamp[us, tz=UTC]
+    sending_time           timestamp[us, tz=UTC]
+    orig_time              timestamp[us, tz=UTC]
+    msg_seq                int64
+    msg_type               string
+    channel                int64
+    segment                string
+    n_streams              int64
+    appl_last_seq          int64
+    end_of_channel         int64
+    heartbeat_time         timestamp[us, tz=UTC]
+    raw                    string
+
+  PANDAS DTYPES AS READ (200,000-row sample)
+    capture_ts             datetime64[us, UTC]
+    sending_time           datetime64[us, UTC]
+    orig_time              datetime64[us, UTC]
+    msg_seq                int64
+    msg_type               object
+    channel                int64
+    segment                object
+    n_streams              float64
+    appl_last_seq          float64
+    end_of_channel         float64
+    heartbeat_time         datetime64[us, UTC]
+    raw                    object
+
+  COLUMN VALUES
+    capture_ts               0.0% null  92,204 distinct, e.g. 2026-06-29 22:41:57.3160, 2026-06-29 22:41:57.3170, 2026-06-29 22:41:57.5500
+    sending_time             0.0% null  89,148 distinct, e.g. 2026-06-29 22:41:57.2450, 2026-06-29 22:41:57.2450, 2026-06-29 22:41:57.4790
+    orig_time              ALL NULL in this sample
+    msg_seq                  0.0% null  87,700 distinct, e.g. 486, 487, 488
+    msg_type                 0.0% null  2 distinct: f, h
+    channel                  0.0% null  1 distinct: 1
+    segment                ALL NULL in this sample
+    n_streams              ALL NULL in this sample
+    appl_last_seq          ALL NULL in this sample
+    end_of_channel         ALL NULL in this sample
+    heartbeat_time         ALL NULL in this sample
+    raw                      0.0% null  (bodies sampled separately below)
+
+  THREE WHOLE RAW BODIES PER MESSAGE TYPE
+    --- 35=f  (27,151 in sample)
+      8=FIXT.1.1^9=109^35=f^49=NMDU001Q0001^56=PSX^34=523^52=20260629-23:05:47.099^42=20260629-23:05:45.000^10201=1^55=P05PFL171127^10=125^
+      8=FIXT.1.1^9=174^35=f^49=NMDU001Q0001^56=PSX^34=3382^52=20260630-03:56:03.000^42=20260630-03:56:00.000^10201=1^55=SZTM^10202=4^10203=1^10204=Y^10203=2^10204=Y^10203=3^10204=Y^10203=4^10204=Y^10=071^
+      8=FIXT.1.1^9=175^35=f^49=NMDU001Q0001^56=PSX^34=23038^52=20260630-04:45:48.008^42=20260630-04:45:45.000^10201=1^55=ZELP^10202=4^10203=1^10204=Y^10203=2^10204=Y^10203=3^10204=Y^10203=4^10204=Y^10=125^
+    --- 35=h  (172,849 in sample)
+      8=FIXT.1.1^9=107^35=h^49=NMDU001Q0001^56=PSX^34=486^52=20260629-22:41:57.245^42=20260629-22:41:57.000^10201=1^336=01^8538=S^10=178^
+      8=FIXT.1.1^9=109^35=h^49=NMDU001Q0001^56=PSX^34=21830^52=20260630-03:43:48.481^42=20260630-03:43:48.000^10201=1^336=04^8538=S^10=007^
+      8=FIXT.1.1^9=110^35=h^49=NMDU001Q0001^56=PSX^34=345539^52=20260630-10:00:54.726^42=20260630-10:00:54.000^10201=1^336=05^8538=T^10=042^
+
+==========================================================================
+TABLE: ob_snapshot
+==========================================================================
+  rows        : 33,044,340
+  row groups  : 127
+  file size   : 142.4 MB
+
+  ARROW SCHEMA (the authority on resolution and timezone)
+    snapshot_time          timestamp[us, tz=UTC]
+    orig_time              timestamp[us, tz=UTC]
+    capture_ts             timestamp[us, tz=UTC]
+    msg_seq                int64
+    channel                int64
+    segment                string
+    market                 string
+    symbol                 string
+    trading_status         string
+    phase                  string
+    suspended_all_day      bool
+    break_reason           string
+    prev_close             double
+    num_trades             int64
+    cum_volume             double
+    cum_value              double
+    entry_type_code        string
+    entry_type             string
+    level                  int64
+    px                     double
+    qty                    double
+    n_orders_at_level      int64
+    n_orders_detailed      int64
+    order_ids              string
+    order_qtys             string
+    visible_qty_sum        double
+    is_xf_tick_floor       bool
+
+  PANDAS DTYPES AS READ (200,000-row sample)
+    snapshot_time          datetime64[us, UTC]
+    orig_time              datetime64[us, UTC]
+    capture_ts             datetime64[us, UTC]
+    msg_seq                int64
+    channel                int64
+    segment                object
+    market                 object
+    symbol                 object
+    trading_status         object
+    phase                  object
+    suspended_all_day      object
+    break_reason           object
+    prev_close             float64
+    num_trades             int64
+    cum_volume             float64
+    cum_value              float64
+    entry_type_code        object
+    entry_type             object
+    level                  float64
+    px                     float64
+    qty                    float64
+    n_orders_at_level      float64
+    n_orders_detailed      float64
+    order_ids              object
+    order_qtys             object
+    visible_qty_sum        float64
+    is_xf_tick_floor       object
+
+  COLUMN VALUES
+    snapshot_time            0.0% null  7,524 distinct, e.g. 2026-06-30 03:05:41.0810, 2026-06-30 03:05:41.0810, 2026-06-29 22:42:41.0960
+    orig_time                0.0% null  7,032 distinct, e.g. 2026-06-30 03:05:41+00:0, 2026-06-30 03:05:41+00:0, 2026-06-29 22:42:41+00:0
+    capture_ts               0.0% null  7,771 distinct, e.g. 2026-06-30 03:05:41.1520, 2026-06-30 03:05:41.1520, 2026-06-29 22:42:41.1670
+    msg_seq                  0.0% null  8,077 distinct, e.g. 1058, 1058, 1188
+    channel                  0.0% null  4 distinct: 10, 1011, 1021, 3021
+    segment                  0.0% null  3 distinct: 010, 080, 900
+    market                   0.0% null  3 distinct: INDEX, ODD_LOT, REG
+    symbol                   0.0% null  12 distinct: 786, 786R, AABS, AAL, AASM, AATM, ABL, ABOT, ABSON, ACI, ACIETF, ACPL
+    trading_status           0.0% null  17 distinct: A0, A1, B01, B04, B11, B14, E, E0, E1, O, O0, O1, S0, S1, T, T0, T1
+    phase                    0.0% null  6 distinct: AFTER_HOUR_TRADING, CONTINUOUS_AUCTION, MARKET_CLOSED, OPEN_CALL_AUCTION, STARTING, TRADING_BREAK
+    suspended_all_day        3.7% null  2 distinct: False, True
+    break_reason            99.9% null  2 distinct: AFTER_PRE_OPEN, BEFORE_POST_CLOSE
+    prev_close               0.0% null  12 distinct: 0.0, 16.0, 17.94, 177.73, 2.47, 2.5, 220.0, 25.96, 3.49, 63.37, 903.0, 970.76
+    num_trades               0.0% null  2,042 distinct, e.g. 0, 0, 0
+    cum_volume               0.0% null  2,486 distinct, e.g. 0.0, 0.0, 0.0
+    cum_value                0.0% null  2,490 distinct, e.g. 0.0, 0.0, 0.0
+    entry_type_code          0.0% null  21 distinct: 0, 1, 2, 3, 4, 5, 7, 8, x1, x2, x3, x4, x7, x8, xa, xb, xc, xd, xe, xf, xl
+    entry_type               0.0% null  21 distinct: AGG_BID, AGG_OFFER, BID, CLOSE_INDEX, CLOSING_PRICE, ETF_INAV, FUND_PREV_NAV, HIGH_INDEX, INDEX_VALUE, LAST_TRADE, LOWER_CIRCUIT_BREAKER, LOW_INDEX, NET_CHANGE_1, NET_CHANGE_2, OFFER, OPENING_PRICE, OPEN_INDEX, PREV_CLOSE_INDEX, SESSION_HIGH, SESSION_LOW, UPPER_CIRCUIT_BREAKER
+    level                    3.7% null  11 distinct: 0.0, 1.0, 10.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0
+    px                       0.0% null  5,314 distinct, e.g. 23.36, 28.56, 23.36
+    qty                      3.7% null  5,527 distinct, e.g. 0.0, 0.0, 0.0
+    n_orders_at_level        3.7% null  21 distinct: 0.0, 1.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 18.0, 2.0, 20.0, 21.0, 22.0, 23.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0
+    n_orders_detailed       53.7% null  10 distinct: 1.0, 10.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0
+    order_ids               53.7% null  2,852 distinct, e.g. 0010THF0D000MHD2, 0010THF0D000MH48, 0010THF0D000LQDK|0010THF
+    order_qtys              53.7% null  1,479 distinct, e.g. 2.00, 1.00, 9.00|20.00
+    visible_qty_sum         53.7% null  934 distinct, e.g. 2.0, 1.0, 29.0
+    is_xf_tick_floor        96.7% null  1 distinct: False
