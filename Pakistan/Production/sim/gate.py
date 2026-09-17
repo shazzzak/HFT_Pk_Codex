@@ -56,13 +56,21 @@
 # policy is a simulation artefact and neither is more "real" than the other;
 # the difference is a choice, and this run puts a number on it.
 #
-#   cancel_new  A reprice is a cancel plus a new order. THE TWO SIDES GENUINELY
-#               DIFFER HERE AND THE RUN WILL NOT MATCH: mm_backtest fires both
-#               messages in the same cycle, while the order manager holds one
-#               order per side and so cannot place the replacement until the
-#               cancel has been acknowledged -- roughly one round trip later.
-#               That is a real difference in mechanics and this mode exists to
-#               MEASURE it, not to hide it. It is not the mode to gate on.
+#   cancel_new  A reprice is a cancel plus a new order.
+#
+#               CORRECTED 2026-09-17. This note used to say the two sides
+#               differ by design here, because mm_backtest fired both messages
+#               in the same cycle while the order manager waited for the
+#               cancel to be acknowledged. mm_backtest firing both at once was
+#               a DEFECT, not a design: the cancel and the replacement drew
+#               independent latencies, so whenever the replacement won it
+#               landed on top of an order that was still resting and dropped
+#               it on the floor -- never cancelled, never filled, never closed
+#               out. 5,205 of them over four symbol-days.
+#
+#               Both sides now wait for the cancel to land, so this mode is
+#               expected to reconcile like the other one. If it does not, that
+#               is a finding rather than an explanation.
 #
 # READ-ONLY on every input. Writes ONE timestamped CSV. Never overwrites.
 #
@@ -518,6 +526,23 @@ def main():
                     "stale_arrivals_ignored", 0),
                 "engine_stale_arrivals": rep.stats.get(
                     "stale_arrivals_ignored", 0),
+                # ---- WHY EACH POLICY'S SIDES WENT QUIET ------------------
+                # The order manager counts the four -- and only four -- ways a
+                # side can produce no actions. Added after the two policies
+                # came back with a threefold difference in orders sent and the
+                # reason was GUESSED at twice: first as "more messages to wait
+                # on", which was wrong because a partially filled order is
+                # acknowledged and holds nothing up. Guessing stops here.
+                "engine_acted": rep._oms.plan_counts["acted"],
+                "engine_held_inflight":
+                    rep._oms.plan_counts["held_message_in_flight"],
+                "engine_held_suspended": rep._oms.plan_counts["held_suspended"],
+                "engine_no_change": rep._oms.plan_counts["no_change"],
+                "hold_acted": hold._oms.plan_counts["acted"],
+                "hold_held_inflight":
+                    hold._oms.plan_counts["held_message_in_flight"],
+                "hold_held_suspended": hold._oms.plan_counts["held_suspended"],
+                "hold_no_change": hold._oms.plan_counts["no_change"],
             })
         # progress
         print(f"  [{di}/{len(dates)}] {date} done", flush=True)
@@ -651,25 +676,46 @@ def main():
     print("\n" + "=" * 78)
     print("WHAT KEEPING QUEUE POSITION IS WORTH")
     print("=" * 78)
-    print("  TOP UP  restores the full clip after a partial fill. Under PSX")
-    print("          8.5.2 raising the size sends the order to the BACK of the")
-    print("          queue at that price, so every top-up pays for itself in")
-    print("          priority. This is what mm_backtest does and what every")
-    print("          measured number was produced under.")
-    print("  HOLD    leaves the remainder resting, keeping the place in line it")
-    print("          has already earned, and shows less size until it is hit.")
-    print("          When the strategy wants LESS than is resting it reduces")
-    print("          instead -- which 8.5.2 carves out, so that amendment keeps")
-    print("          its position and costs nothing.")
+    print("  THE WORKED EXAMPLE, because the names alone are not enough.")
+    print("  The clip is 500. A partial fill takes 400 and leaves 100 resting")
+    print("  with the queue position it has already earned. Both policies want")
+    print("  500 showing again; they differ ONLY in how they get there.")
+    print()
+    print("  TOP UP BY AMENDMENT   (column: engine_*, quantity_policy=exact)")
+    print("          ONE order. Amend the resting 100 back up to 500. Under PSX")
+    print("          8.5.2 raising the size sends THE WHOLE ORDER to the back")
+    print("          of the queue -- the 100 loses the place it earned along")
+    print("          with the 400 that is new. This is mm_backtest's rule and")
+    print("          what every measured number in this project was produced")
+    print("          under, which is why it is the run the gate judges.")
+    print()
+    print("  TOP UP BY SECOND ORDER (column: hold_*, quantity_policy=")
+    print("                          queue_preserving)")
+    print("          TWO orders. The 100 is LEFT ALONE and keeps its place; a")
+    print("          SEPARATE order for the 400 joins the back of the queue")
+    print("          under its own id. Total size showing is the same 500. You")
+    print("          pay in priority only on the increment, never on the")
+    print("          remainder. When the strategy wants LESS than is resting it")
+    print("          shrinks the YOUNGEST order first, and 8.5.2 applies a size")
+    print("          reduction in place, so that costs nothing at all.")
+    print()
+    print("  CORRECTED 2026-09-17. This block used to describe the second")
+    print("  policy as one that 'shows less size until it is hit'. That was")
+    print("  wrong and it misdescribed every number below it. The policy has")
+    print("  always topped the size back up with a second order -- see")
+    print("  core/oms.py, _plan_side_multi, the SHORT OF WHAT WE WANT branch.")
+    print("  A policy that genuinely declines to top up, and shows the smaller")
+    print("  size until it is hit, is a THIRD thing and is not implemented.")
+    print()
     print("  Both are legal and both are things a real desk does. The exchange")
     print("  applies the identical rule to each; the difference is ours.\n")
     # the paired per-day difference, which is how this project measures
     d = df["hold_minus_topup"].to_numpy()
     # the totals under each policy
-    print(f"  total, top up        : {df['engine_pnl'].sum():,.2f} PKR")
-    print(f"  total, hold          : {df['engine_hold_pnl'].sum():,.2f} PKR")
+    print(f"  total, amendment     : {df['engine_pnl'].sum():,.2f} PKR")
+    print(f"  total, second order  : {df['engine_hold_pnl'].sum():,.2f} PKR")
     print(f"  difference           : {d.sum():+,.2f} PKR "
-          f"({'hold' if d.sum() > 0 else 'top up'} ahead)")
+          f"({'second order' if d.sum() > 0 else 'amendment'} ahead)")
     # DAY AS UNIT, never pooled fills -- the standing rule on this project
     if len(d) > 1:
         # the mean paired difference
@@ -680,21 +726,39 @@ def main():
         t = mean_d / se if se > 0 else float("nan")
         print(f"  per symbol-day       : {mean_d:+,.2f} PKR mean, "
               f"se {se:,.2f}, t {t:,.2f}  ({len(d)} days)")
-        print(f"  days hold was better : {int((d > 0).sum())} of {len(d)}")
+        print(f"  days 2nd order better: {int((d > 0).sum())} of {len(d)}")
         # a sample this size measures a LARGE effect and nothing smaller
         print("  A sample this size can only show a large effect. It cannot")
         print("  rule out a small one, and |t| > 2 is the bar here as elsewhere.")
     # the churn each policy generated, which is the mechanism behind any gap
-    print(f"\n  orders sent          : top up {df['engine_orders'].sum():,}"
-          f"   hold {df['hold_orders'].sum():,}")
-    print(f"  fills                : top up {df['engine_fills'].sum():,}"
-          f"   hold {df['hold_fills'].sum():,}")
-    print(f"  amendments kept place: top up {df['engine_cfos_kept'].sum():,}"
+    print(f"\n  orders sent          : amendment {df['engine_orders'].sum():,}"
+          f"   second order {df['hold_orders'].sum():,}")
+    print(f"  fills                : amendment {df['engine_fills'].sum():,}"
+          f"   second order {df['hold_fills'].sum():,}")
+    print(f"  amendments kept place: amendment {df['engine_cfos_kept'].sum():,}"
           f" of {df['engine_cfos'].sum():,}"
-          f"   hold {df['hold_cfos_kept'].sum():,}"
+          f"   second order {df['hold_cfos_kept'].sum():,}"
           f" of {df['hold_cfos'].sum():,}")
-    print("  The last line is the rule doing its work. Under hold, more")
-    print("  amendments should be size REDUCTIONS, which keep their place.")
+    print("  The last line is 8.5.2 doing its work: under the second-order")
+    print("  policy more amendments are size REDUCTIONS, which keep their")
+    print("  place, because topping UP no longer needs an amendment at all.")
+    print()
+    print("  READ THE ORDER COUNT BEFORE THE P&L. If the second-order policy")
+    print("  is sending far FEWER orders and taking far fewer fills, it is not")
+    print("  losing a fair contest -- it is barely competing, and the reason")
+    print("  has to be found before the P&L comparison means anything.")
+    print()
+    print("  WHY EACH POLICY'S SIDES WERE QUIET, counted rather than guessed:")
+    # the four causes, per policy, as the order manager counted them
+    for _label, _col in (("amendment   ", "engine"), ("second order", "hold")):
+        # one line per policy, all four causes on it
+        print(f"    {_label}  acted {df[_col + '_acted'].sum():>7,}"
+              f"   held: message in flight "
+              f"{df[_col + '_held_inflight'].sum():>7,}"
+              f"   suspended {df[_col + '_held_suspended'].sum():>5,}"
+              f"   no change {df[_col + '_no_change'].sum():>7,}")
+    print("  A quiet side has exactly these four causes. Whichever one differs")
+    print("  between the two rows is the explanation; nothing else can be.")
 
     # ---- write ----------------------------------------------------------
     # a fresh timestamped destination; never overwrites

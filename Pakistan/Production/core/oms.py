@@ -141,6 +141,25 @@ class OrderManager:
         self._session_id = venue.validate_text(session_id, "session_id")
         # the client code every order carries, where the venue requires one
         self._account = account
+        # ---- WHY A CYCLE PRODUCED NO ACTIONS -----------------------------
+        # Plain counters, read by sim/gate.py. They exist because the two
+        # quantity policies came back with a threefold difference in orders
+        # sent and the reason was GUESSED AT rather than measured -- twice.
+        # A quiet side has exactly four causes and each one is counted here,
+        # so the next comparison starts from a number.
+        self.plan_counts = {
+            # some order on this side has a message outstanding, so nothing
+            # may be sent for ANY of them until the exchange answers. Under
+            # the list policy this waits on the SLOWEST outstanding answer,
+            # which is why it is worth separating from the rest.
+            "held_message_in_flight": 0,
+            # an order the exchange is holding inactive
+            "held_suspended": 0,
+            # what is resting already matches what is wanted
+            "no_change": 0,
+            # the side was asked for a quote and produced one or more actions
+            "acted": 0,
+        }
         # FAIL AT CONSTRUCTION, NOT AT GO-LIVE. PSX makes Account (tag 1) a
         # required field; without it the exchange rejects every order we send.
         # That is worth discovering here rather than on the first live morning.
@@ -353,16 +372,24 @@ class OrderManager:
         # PSX requires OrderID on a cancel or an amendment, and OrderID is
         # assigned on the acknowledgement. Before the ack there is nothing to
         # put in the message.
-        if order.state.is_in_flight:
+        # NOTE `has_message_in_flight`, NOT `state.is_in_flight`. A fill
+        # overwrites `state`, so a partially filled order with an amendment
+        # still on the wire reads as quiescent to the state property. Acting on
+        # it is what produced the InvalidTransition that killed two of six
+        # symbol-days in the reconcile gate.
+        if order.has_message_in_flight:
+            self.plan_counts["held_message_in_flight"] += 1
             return []
         # ---- SUSPENDED: leave it for an operator -----------------------
         if order.state is OrderState.SUSPENDED:
+            self.plan_counts["held_suspended"] += 1
             return []
         # ---- RESTING, NOT WANTED ---------------------------------------
         if want is None:
             return [self._cancel(order)]
         # ---- RESTING, CLOSE ENOUGH -------------------------------------
         if self._matches(order, want):
+            self.plan_counts["no_change"] += 1
             return []
         # ---- RESTING, WRONG: amend if the venue takes one, else replace --
         if (self._use_replace and self._venue.supports_replace
@@ -404,7 +431,7 @@ class OrderManager:
         if want is None:
             # pull everything that is not already on its way out
             return [self._cancel(o) for o in resting
-                    if not o.state.is_in_flight]
+                    if not o.has_message_in_flight]
 
         # ---- ANYTHING IN FLIGHT: WAIT ----------------------------------
         # The exchange has not answered yet, so we do not know what it thinks
@@ -417,13 +444,15 @@ class OrderManager:
         # a second order while the first is unacknowledged would be safe on the
         # wire, but it would make the resting total ambiguous at the moment the
         # risk gateway judges it, and the gateway is not a place for ambiguity.
-        if any(o.state.is_in_flight for o in resting):
+        if any(o.has_message_in_flight for o in resting):
+            self.plan_counts["held_message_in_flight"] += 1
             return []
 
         # ---- SUSPENDED --------------------------------------------------
         # Held inactive by the exchange: it cannot trade and cannot be amended
         # into a live quote. Leave it for an operator rather than guessing.
         if any(o.state is OrderState.SUSPENDED for o in resting):
+            self.plan_counts["held_suspended"] += 1
             return []
 
         # ---- NOTHING RESTING --------------------------------------------
@@ -510,7 +539,11 @@ class OrderManager:
                 excess -= take
             return actions
 
-        # EXACTLY RIGHT: leave every one of them alone.
+        # EXACTLY RIGHT: leave every one of them alone. `actions` may still
+        # carry cancels for orders at a stale price, so this is only a quiet
+        # cycle when it is empty.
+        if not actions:
+            self.plan_counts["no_change"] += 1
         return actions
 
     def _matches_price(self, order: Order, want: QuoteIntent) -> bool:
@@ -603,6 +636,8 @@ class OrderManager:
                     self._mark_sent(action)
                     # cancels are collected separately so they go out first
                     (cancels if action.is_cancel else places).append(action)
+                    # this side did something this cycle
+                    self.plan_counts["acted"] += 1
         # CANCELS BEFORE PLACES, always. Within one cycle this keeps total
         # resting size at or below the intended amount at every instant; the
         # reverse order would briefly double it.
@@ -727,8 +762,18 @@ class OrderManager:
         # nothing to do for an order we do not have
         if order is None:
             return
-        # apply the new terms
+        # the state before, so a race can be reported rather than inferred
+        was_terminal = order.state.is_terminal
+        # apply the new terms -- a no-op on an order that already finished
         order.on_replaced(price_minor, quantity)
+        # AN AMENDMENT THAT LOST ITS RACE. The order filled or was cancelled
+        # while the message was on the wire, so nothing was applied. Worth a
+        # line of its own: it is a real cost of the one-message reprice and the
+        # count of it says how often the amendment window bites.
+        if was_terminal:
+            self._emit("replace_confirmed_after_terminal",
+                       {"cl_ord_id": cl_ord_id, "state": order.state.value})
+            return
         # record it
         self._emit("order_replaced", {"cl_ord_id": cl_ord_id,
                                       "px": price_minor, "qty": quantity})
@@ -776,12 +821,19 @@ class OrderManager:
         #
         # Found by the reconcile-gate tests: an amendment that lost to a full
         # fill came back as PARTIALLY_FILLED with 50 of 50 filled.
+        # THE MESSAGE HAS BEEN ANSWERED -- with a refusal, but answered. Both
+        # flags are cleared FIRST, before the terminal check returns, or a
+        # terminal order would keep a raised flag and nothing would ever lower
+        # it. A flag that is never lowered holds its side for the rest of the
+        # session and raises nothing.
+        order.replace_in_flight = False
+        order.cancel_in_flight = False
         if order.state.is_terminal:
             # say so, because a reject arriving after the end is worth seeing
             self._emit("cancel_rejected_after_terminal",
                        {"cl_ord_id": cl_ord_id, "reason": reason,
                         "state": order.state.value})
-            # and change nothing
+            # and change nothing else
             return
         # back to resting, keeping any partial fill already taken
         order.state = (OrderState.PARTIALLY_FILLED if order.filled_quantity

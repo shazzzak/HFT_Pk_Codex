@@ -223,6 +223,44 @@ class Order:
     reason: Optional[str] = None
     # the id of the order this one replaced, when it came from an amendment
     orig_cl_ord_id: Optional[str] = None
+    # ---- MESSAGE STATE, HELD SEPARATELY FROM LIFECYCLE STATE -------------
+    # IS ONE OF OUR MESSAGES ON THE WIRE FOR THIS ORDER, RIGHT NOW?
+    #
+    # THE BUG THIS EXISTS TO FIX. `state` was carrying two different things at
+    # once: where the order is in its lifecycle, and whether we are waiting for
+    # the exchange to answer. A fill overwrites `state` -- it has to, that is
+    # what PARTIALLY_FILLED means -- and in doing so it ERASED the record that
+    # an amendment was outstanding. The order then looked quiescent, the
+    # manager sent a cancel, and when the amendment finally landed the
+    # transition raised:
+    #
+    #   InvalidTransition('order GATE-00001068 (NRL SELL) is PENDING_CANCEL;
+    #                      cannot apply replaced')
+    #
+    # In the reconcile gate that killed two of six symbol-days. In live
+    # trading it raises mid-session on the most active name on the book, which
+    # is exactly when it can least be afforded.
+    #
+    # The two facts are independent and are now stored independently. This is
+    # the same separation mm_backtest.MyOrder already makes between cancel_at
+    # (which gates fills) and amend_at (which does not).
+    replace_in_flight: bool = False
+    # the same, for a cancel
+    cancel_in_flight: bool = False
+
+    @property
+    def has_message_in_flight(self) -> bool:
+        """True while ANY message of ours is outstanding for this order.
+
+        THIS, NOT `state.is_in_flight`, IS THE HOLD RULE. The state property
+        still answers correctly for an order that has not been filled, but a
+        partially filled order with an amendment on the wire is precisely the
+        case it gets wrong, and that case is common on an active name.
+        """
+        # a message we have sent and not had answered, in either form
+        return (self.state.is_in_flight
+                or self.replace_in_flight
+                or self.cancel_in_flight)
 
     @property
     def leaves_quantity(self) -> int:
@@ -265,12 +303,17 @@ class Order:
             raise InvalidTransition(self, "cancel_sent")
         # the exposure is still real until the exchange confirms
         self.state = OrderState.PENDING_CANCEL
+        # AND THE MESSAGE FACT, recorded separately so a fill arriving before
+        # the cancel lands cannot erase it
+        self.cancel_in_flight = True
 
     def on_cancelled(self) -> None:
         """The exchange confirmed the cancel."""
         # confirmation for an order that was never working is inconsistent
         if not self.state.is_working:
             raise InvalidTransition(self, "cancelled")
+        # the cancel has been answered
+        self.cancel_in_flight = False
         # now genuinely off the book
         self.state = OrderState.CANCELLED
 
@@ -281,12 +324,32 @@ class Order:
             raise InvalidTransition(self, "replace_sent")
         # the OLD terms are still live until the exchange confirms the new ones
         self.state = OrderState.PENDING_REPLACE
+        # AND THE MESSAGE FACT. This is the one that was being lost: a fill on
+        # the still-live old terms overwrites `state`, and without this flag
+        # the amendment on the wire became invisible to the hold rule.
+        self.replace_in_flight = True
 
     def on_replaced(self, price_minor: int, quantity: int) -> None:
         """The exchange confirmed the amendment; the new terms are live."""
-        # only an order with an amendment outstanding can be replaced
-        if self.state is not OrderState.PENDING_REPLACE:
+        # ONLY AN ORDER WITH AN AMENDMENT OUTSTANDING CAN BE REPLACED, and
+        # the flag is what says so. The old test was `state is
+        # PENDING_REPLACE`, which a fill in the meantime silently falsified --
+        # the confirmation then arrived for an order whose state had moved on
+        # and raised, killing the session. The flag survives a fill, because a
+        # fill has nothing to do with whether our message was answered.
+        if not self.replace_in_flight:
             raise InvalidTransition(self, "replaced")
+        # the amendment has been answered, whatever the answer turns out to be
+        self.replace_in_flight = False
+        # A CONFIRMATION FOR A FINISHED ORDER IS A RACE, NOT AN IMPOSSIBILITY.
+        # The amendment was on the wire when the order filled or was cancelled.
+        # Applying the new terms would resurrect an order the exchange has done
+        # with -- it would go back to LIVE, back into the working set, and the
+        # side would never quote again. The flag is lowered above and the terms
+        # are NOT applied. The caller records it; raising here would end the
+        # session over a race that is expected to happen.
+        if self.state.is_terminal:
+            return
         # the new terms
         self.price_minor = price_minor
         self.quantity = quantity
@@ -309,8 +372,14 @@ class Order:
         # fill events and never derives it from this counter, so rebasing here
         # cannot lose a share.
         self.filled_quantity = 0
-        # a freshly amended order is resting with nothing yet taken against it
-        self.state = OrderState.LIVE
+        # A FRESHLY AMENDED ORDER IS RESTING -- UNLESS A CANCEL IS ALSO ON
+        # THE WIRE FOR IT. Both messages can be outstanding at once: the
+        # amendment goes out, a fill lands, the manager sends a cancel, and
+        # then the amendment is confirmed. Returning the order to LIVE there
+        # would lose the pending cancel and the cancel confirmation would then
+        # raise in its turn.
+        self.state = (OrderState.PENDING_CANCEL if self.cancel_in_flight
+                      else OrderState.LIVE)
 
     def on_suspended(self) -> None:
         """The exchange is holding the order inactive."""

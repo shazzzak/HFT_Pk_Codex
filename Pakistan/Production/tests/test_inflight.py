@@ -349,3 +349,329 @@ if __name__ == "__main__":
     raise SystemExit(
         "This is a pytest file, not a script.\n"
         "    PYTHONPATH=/path/to/existing_mm_live python -m pytest -q")
+
+
+# ---------------------------------------------------------------------------
+# 6. THE CRASH THE GATE HIT: a fill must not erase a message in flight
+# ---------------------------------------------------------------------------
+# WHAT HAPPENED. From the run of 2026-09-17:
+#
+#   NRL 2026-06-24 ERROR InvalidTransition('order GATE-00001068 (NRL SELL)
+#                        is PENDING_CANCEL; cannot apply replaced')
+#
+# Two of six symbol-days died this way, and it is production code -- core/
+# model.py and core/oms.py -- so in live trading it raises mid-session on the
+# most active name on the book.
+#
+# THE SEQUENCE. An amendment goes out, so the order is PENDING_REPLACE. The
+# OLD terms are still resting and still matchable -- that is the whole point
+# of an amendment and the real exposure of the one message. A fill arrives on
+# them, and Order.on_fill overwrites `state` with PARTIALLY_FILLED, which is
+# correct for the lifecycle and destroys the only record that a message was on
+# the wire. The order manager then reads a quiescent order and sends a cancel.
+# When the amendment is finally confirmed, the order is PENDING_CANCEL and the
+# transition raises.
+#
+# THE FIX separates the two facts: `state` is the lifecycle, and
+# replace_in_flight / cancel_in_flight are the messages. A fill touches the
+# first and cannot touch the second.
+# ALIASED. mm_backtest.Order (a resting order in the historical book) is
+# imported at the top of this file and the book helper builds them; importing
+# core.model.Order under its own name would shadow it and every book in this
+# module would fail to build. The tests caught it immediately, which is the
+# argument for having them.
+from core.model import InvalidTransition, OrderState, Side
+from core.model import Order as EngineOrder
+
+
+def _live_order(qty=100):
+    """An order acknowledged by the exchange and resting."""
+    # a plain order
+    o = EngineOrder(cl_ord_id="C1", symbol="NRL", side=Side.SELL,
+                    price_minor=28900, quantity=qty)
+    # sent
+    o.state = OrderState.PENDING_NEW
+    # and acknowledged, which is what gives it an exchange id
+    o.on_ack("EX1")
+    # resting
+    return o
+
+
+def test_a_fill_does_not_erase_an_amendment_on_the_wire():
+    """THE CRASH, stated as a test. This is the exact sequence that failed."""
+    # a resting order
+    o = _live_order()
+    # we send an amendment: the order manager must now leave the side alone
+    o.on_replace_sent()
+    assert o.has_message_in_flight
+    # A FILL ARRIVES ON THE OLD TERMS, which are still live
+    o.on_fill(40)
+    # the lifecycle moved, exactly as it should
+    assert o.state is OrderState.PARTIALLY_FILLED
+    # AND THE MESSAGE IS STILL ON THE WIRE. This is what was being lost.
+    assert o.replace_in_flight is True
+    assert o.has_message_in_flight is True
+    # so the amendment can still be confirmed, without raising
+    o.on_replaced(28950, 60)
+    # the new terms are live and the flag is down
+    assert o.price_minor == 28950
+    assert o.state is OrderState.LIVE
+    assert o.has_message_in_flight is False
+
+
+def test_an_amendment_and_a_cancel_can_both_be_outstanding():
+    """Both messages at once, which is how the crash actually arose."""
+    # a resting order with an amendment on the wire
+    o = _live_order()
+    o.on_replace_sent()
+    # a fill lands on the old terms
+    o.on_fill(40)
+    # the manager sends a cancel -- legal, the order is partially filled
+    o.on_cancel_sent()
+    # both messages are outstanding
+    assert o.replace_in_flight and o.cancel_in_flight
+    assert o.state is OrderState.PENDING_CANCEL
+    # the amendment is confirmed FIRST
+    o.on_replaced(28950, 60)
+    # THE PENDING CANCEL SURVIVES. Returning the order to LIVE here would lose
+    # it, and the cancel confirmation would then raise in its turn.
+    assert o.state is OrderState.PENDING_CANCEL
+    assert o.cancel_in_flight is True
+    assert o.replace_in_flight is False
+    # and the cancel confirmation lands cleanly
+    o.on_cancelled()
+    assert o.state is OrderState.CANCELLED
+    assert o.has_message_in_flight is False
+
+
+def test_an_amendment_confirmed_after_a_full_fill_does_not_resurrect_it():
+    """The other race: the order finished while the message was on the wire."""
+    # a resting order with an amendment out
+    o = _live_order(qty=100)
+    o.on_replace_sent()
+    # it fills completely
+    o.on_fill(100)
+    assert o.state is OrderState.FILLED
+    # the amendment is confirmed after the fact
+    o.on_replaced(28950, 60)
+    # NOTHING WAS APPLIED and the order stays finished. Putting it back to LIVE
+    # would return an order the exchange is done with to the working set, where
+    # the diff sees a resting order matching what it wants and leaves it alone
+    # -- for the rest of the session, silently.
+    assert o.state is OrderState.FILLED
+    assert o.price_minor == 28900
+    # but the message is answered, so nothing holds the side
+    assert o.has_message_in_flight is False
+
+
+def test_a_confirmation_with_no_amendment_outstanding_still_raises():
+    """The fix must not turn a genuine impossibility into a silent no-op."""
+    # a resting order with nothing on the wire
+    o = _live_order()
+    # a replace confirmation out of nowhere is a real inconsistency
+    try:
+        o.on_replaced(28950, 60)
+    except InvalidTransition:
+        # which is what should happen
+        return
+    # reaching here means the guard was lost
+    raise AssertionError("on_replaced did not raise with no amendment out")
+
+
+# ---------------------------------------------------------------------------
+# 7. AN AMENDMENT ON THE WIRE HOLDS THE SIDE TOO
+# ---------------------------------------------------------------------------
+# FOUND BY sim/diff_fills.py ON NRL 2026-06-30. The two sides filled 51 times
+# each and still differed by 145.74 PKR, because the engine bought 0.1124
+# cheaper and sold 0.0426 dearer -- 0.155 a share on the round trip.
+#
+# The mechanism was one rule. When a reprice arrives while a CFO is already
+# outstanding, mm_backtest could not send a second CFO (amend_at blocks that,
+# correctly) and so fell through to the cancel path and PULLED THE QUOTE. The
+# production order manager does nothing at all: an order with any message
+# outstanding is left exactly where it is until the exchange answers.
+#
+# At 1782807500800 that cost a real fill -- the engine sold 10 shares at
+# 364.34, over two rupees above the day's mid, off an order it had left
+# resting; mm_backtest had cancelled its own and had nothing there.
+def test_an_amendment_on_the_wire_holds_the_side():
+    """A reprice during an outstanding CFO must send NOTHING, not a cancel."""
+    # a resting bid, CFO enabled so a reprice is one message
+    bt = build(use_cfo=True)
+    bt._requote(OPEN_MS + 1_000)
+    bt._activate_until(OPEN_MS + 2_000)
+    # one order sent, resting, nothing outstanding
+    assert bt.stats["n_orders_sent"] == 1
+    assert bt.work["BUY"].amend_at is None
+    # the strategy reprices: one amendment goes out
+    bt.strat.want = {"BUY": (289.10, 50)}
+    bt._requote(OPEN_MS + 2_100)
+    assert bt.stats["n_orders_sent"] == 2
+    # the amendment is on the wire and the OLD terms are still resting
+    assert bt.work["BUY"].amend_at == OPEN_MS + 2_200
+    assert bt.work["BUY"].price == 289.00
+    # THE STRATEGY REPRICES AGAIN while that amendment is unanswered
+    bt.strat.want = {"BUY": (289.20, 50)}
+    bt._requote(OPEN_MS + 2_150)
+    # NOTHING WENT OUT -- no second amendment, and crucially NO CANCEL
+    assert bt.stats["n_orders_sent"] == 2
+    assert bt.work["BUY"].cancel_at is None, "the quote was pulled"
+    # the order is still resting and still fillable at the old terms
+    assert bt.work["BUY"].t_active is not None
+    # and the cycle is accounted for
+    assert bt.stats["requotes_blocked_in_flight"] >= 1
+    # when the amendment lands the side is free again and quoting resumes
+    bt._activate_until(OPEN_MS + 3_000)
+    assert bt.work["BUY"].amend_at is None
+    bt._requote(OPEN_MS + 3_100)
+    assert bt.stats["n_orders_sent"] == 3
+
+
+def test_an_order_still_fills_while_its_amendment_is_on_the_wire():
+    """Holding the side must not stop the OLD terms being hit.
+
+    That exposure is the entire cost of a one-message reprice: until the
+    amendment lands, the order the exchange holds is the old one.
+    """
+    # a resting bid with an amendment outstanding
+    bt = build(use_cfo=True)
+    bt._requote(OPEN_MS + 1_000)
+    bt._activate_until(OPEN_MS + 2_000)
+    bt.strat.want = {"BUY": (289.10, 50)}
+    bt._requote(OPEN_MS + 2_100)
+    assert bt.work["BUY"].amend_at is not None
+    # a through-print hits the OLD price while the amendment is in the air
+    bt._on_market_trade(FakeTrade(ts_exch=OPEN_MS + 2_150, price=288.00,
+                                  qty=100, aggressor_side="SELL"))
+    # filled, at the OLD terms, which is exactly right
+    assert len(bt.fills) == 1
+    assert bt.fills[0]["px"] == 289.00
+    assert bt.pos == 50
+
+
+def test_a_refused_amendment_does_not_block_the_side_for_ever():
+    """A held flag that is never lowered is worse than the bug it prevents.
+
+    If the amendment's target has gone, nothing clears amend_at on the order
+    the side is holding -- so this checks the side comes back rather than going
+    quiet for the rest of the session.
+    """
+    # a resting bid with an amendment outstanding
+    bt = build(use_cfo=True)
+    bt._requote(OPEN_MS + 1_000)
+    bt._activate_until(OPEN_MS + 2_000)
+    bt.strat.want = {"BUY": (289.10, 50)}
+    bt._requote(OPEN_MS + 2_100)
+    # the order is FULLY FILLED before the amendment lands, so the amendment
+    # has nothing left to modify
+    bt._on_market_trade(FakeTrade(ts_exch=OPEN_MS + 2_150, price=288.00,
+                                  qty=500, aggressor_side="SELL"))
+    # the side is empty: a fully filled order leaves self.work
+    assert bt.work.get("BUY") is None
+    # the amendment lands and is refused as stale
+    bt._activate_until(OPEN_MS + 3_000)
+    assert bt.stats["stale_cfos_ignored"] == 1
+    # AND THE SIDE QUOTES AGAIN. Nothing is stuck holding it.
+    bt._requote(OPEN_MS + 3_100)
+    assert bt.work.get("BUY") is not None
+
+
+# ---------------------------------------------------------------------------
+# 8. A PARTIALLY FILLED ORDER HOLDS NOTHING UP
+# ---------------------------------------------------------------------------
+# I claimed the second-order (queue_preserving) policy was quiet because
+# "holding two orders per side gives it more messages to wait on", and pointed
+# at the whole-side block in _plan_side_multi. That was wrong, and wrong in the
+# one case the policy exists for: after a partial fill the first order is
+# ACKNOWLEDGED and PARTIALLY_FILLED, it has no message outstanding, and the
+# block does not fire. The top-up goes out on the very next cycle.
+#
+# This test exists so that claim cannot be made again without failing.
+from core.model import DesiredQuotes, Fill, PlaceOrder, QuoteIntent
+from core.oms import OrderManager, QuoteTolerance
+from core.risk import KillSwitch, OrderQuantityCheck, RiskGateway
+from core.venue import SessionSegment
+from venues.psx import PSXVenue
+
+# the symbol and date these use
+SYM, DATE = "NRL", "2026-06-30"
+
+
+def _queue_preserving_oms():
+    """An order manager on the second-order policy, with a permissive gateway."""
+    # a venue with one all-day session, so the window check never bites
+    venue = PSXVenue(session_provider=lambda d: [
+        SessionSegment(start_ms=0, end_ms=86_400_000)])
+    # the manager under test
+    return OrderManager(
+        venue=venue,
+        gateway=RiskGateway([OrderQuantityCheck(max_quantity=1_000_000)]),
+        kill_switch=KillSwitch(), session_id="T", account="A",
+        tolerance=QuoteTolerance(quantity_policy="queue_preserving"))
+
+
+def test_a_partial_fill_does_not_block_the_top_up():
+    """THE CORRECTION, as a test. Clip 500, 400 fills, 400 goes back out."""
+    # a manager wanting 500 on the bid
+    oms = _queue_preserving_oms()
+    oms.set_desired(DesiredQuotes(
+        symbol=SYM, bid=QuoteIntent(side=Side.BUY, price_minor=36100,
+                                    quantity=500)))
+    # cycle one places the whole clip
+    acts = oms.reconcile(1_000, DATE, {SYM: 36100})
+    assert len(acts) == 1 and acts[0].quantity == 500
+    # the exchange acknowledges it
+    oms.on_ack(acts[0].cl_ord_id, "EX1")
+    # 400 of the 500 fills, leaving 100 resting with its queue position
+    oms.on_fill(Fill(cl_ord_id=acts[0].cl_ord_id, symbol=SYM, side=Side.BUY,
+                     price_minor=36100, quantity=400, timestamp_ms=1_100))
+    # the order is acknowledged and partially filled
+    order = oms._orders[acts[0].cl_ord_id]
+    assert order.state is OrderState.PARTIALLY_FILLED
+    assert order.leaves_quantity == 100
+    # AND IT HOLDS NOTHING UP. This is the line the wrong claim turned on.
+    assert order.has_message_in_flight is False
+    # the counters before the next cycle
+    before = dict(oms.plan_counts)
+    # cycle two: the top-up
+    acts2 = oms.reconcile(2_000, DATE, {SYM: 36100})
+    # ONE NEW ORDER FOR THE SHORTFALL ONLY -- not 500, and not an amendment.
+    # The resting 100 is untouched and keeps the place it earned.
+    assert len(acts2) == 1
+    assert isinstance(acts2[0], PlaceOrder)
+    assert acts2[0].quantity == 400
+    assert acts2[0].price_minor == 36100
+    # and the side was NOT held for any reason
+    assert oms.plan_counts["held_message_in_flight"] == \
+        before["held_message_in_flight"]
+    assert oms.plan_counts["acted"] == before["acted"] + 1
+
+
+def test_the_side_is_held_only_while_a_message_is_actually_outstanding():
+    """Where the block DOES bite, so the counter can be read correctly."""
+    # the same manager, with 500 resting after a partial fill
+    oms = _queue_preserving_oms()
+    oms.set_desired(DesiredQuotes(
+        symbol=SYM, bid=QuoteIntent(side=Side.BUY, price_minor=36100,
+                                    quantity=500)))
+    acts = oms.reconcile(1_000, DATE, {SYM: 36100})
+    oms.on_ack(acts[0].cl_ord_id, "EX1")
+    oms.on_fill(Fill(cl_ord_id=acts[0].cl_ord_id, symbol=SYM, side=Side.BUY,
+                     price_minor=36100, quantity=400, timestamp_ms=1_100))
+    # the top-up goes out and is NOT yet acknowledged
+    top_up = oms.reconcile(2_000, DATE, {SYM: 36100})[0]
+    # the counters before the next cycle
+    before = dict(oms.plan_counts)
+    # NOW the side is held: one of its two orders has a message outstanding
+    assert oms.reconcile(2_100, DATE, {SYM: 36100}) == []
+    assert oms.plan_counts["held_message_in_flight"] == \
+        before["held_message_in_flight"] + 1
+    # once the exchange answers, the side is free again
+    oms.on_ack(top_up.cl_ord_id, "EX2")
+    # and with 500 resting against 500 wanted there is simply nothing to do
+    before = dict(oms.plan_counts)
+    assert oms.reconcile(3_000, DATE, {SYM: 36100}) == []
+    # counted as no_change, NOT as held -- the distinction the gate now prints
+    assert oms.plan_counts["no_change"] == before["no_change"] + 1
+    assert oms.plan_counts["held_message_in_flight"] == \
+        before["held_message_in_flight"]

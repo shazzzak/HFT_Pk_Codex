@@ -1687,11 +1687,15 @@ class Backtester:
             self.stats["halted_requotes"] += 1
             # Cancel every working order that isn't already being cancelled.
             for side, cur in list(self.work.items()):
-                # Skip orders that already have a cancel in flight, AND orders
-                # that have not reached the exchange yet -- there is no OrderID
-                # to put in a cancel for one still on the wire. It lands, and
-                # the next requote (still not quotable) pulls it then.
-                if cur.cancel_at is None and cur.t_active is not None:
+                # Skip orders with ANY message of ours outstanding: a cancel
+                # already in flight, an order that has not reached the exchange
+                # yet, or an amendment awaiting an answer. In each case there
+                # is nothing we may send, and the order manager holds in
+                # exactly the same three cases. Whichever message is
+                # outstanding lands, and the next requote -- still not
+                # quotable -- pulls the order then.
+                if (cur.cancel_at is None and cur.t_active is not None
+                        and cur.amend_at is None):
                     # Draw a send latency for this cancel.
                     a_out = self.lat.draw_out()
                     # The cancel lands (exchange stops matching) at knowledge time + latency.
@@ -1762,8 +1766,24 @@ class Backtester:
             #
             # This one test is what takes the duplicate-send count from 4,901
             # to zero. The production order manager expresses the identical
-            # rule as OrderState.is_in_flight.
-            if cur is not None and cur.t_active is None:
+            # rule as Order.has_message_in_flight.
+            #
+            # AN AMENDMENT ON THE WIRE COUNTS THE SAME WAY, and until
+            # 2026-09-17 it did not. The order was live, so t_active was set,
+            # and a reprice arriving while a CFO was outstanding could not send
+            # a second CFO (amend_at blocks that) -- so it fell through to the
+            # cancel path and PULLED THE QUOTE instead. The order manager does
+            # no such thing: an order with any message outstanding is left
+            # exactly where it is until the exchange answers.
+            #
+            # sim/diff_fills.py found it on NRL 2026-06-30. At 1782807500800
+            # the engine sold 10 shares at 364.34, more than two rupees above
+            # the day's mid, off an order it had left resting. mm_backtest had
+            # cancelled its own and had nothing there. Over the day that one
+            # difference in rule is worth 0.155 PKR a share on both sides of
+            # the round trip.
+            if cur is not None and (cur.t_active is None
+                                    or cur.amend_at is not None):
                 # count it, so a run can show how much of the session each side
                 # spent waiting on the wire rather than quoting
                 self.stats["requotes_blocked_in_flight"] += 1
