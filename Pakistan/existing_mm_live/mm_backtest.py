@@ -566,29 +566,82 @@ class LatencyModel:
     FLAGGED SIMPLIFICATION: tail params are PRIORS for PSX-remote access, not
     measured. Refit from colo telemetry once live. A constant-latency run is
     recoverable with tail_prob=0 and tail_ms=0.
+
+    BODY SHAPE (added 2026-09-19). With wire_out_sigma == 0 (the default) the
+    body is a POINT MASS: 98% of messages take exactly decision_ms +
+    wire_out_median_ms, with zero variance. That is not what a network does,
+    and it is a FLAGGED SIMPLIFICATION, not a finding. Set wire_out_sigma > 0
+    (with latency_floor_ms) to draw the body as a SHIFTED LOGNORMAL instead:
+    a hard physical floor with a right skew above it, which is the shape
+    one-way latency actually has. mu is solved so the MEAN is unchanged, so
+    sigma is a pure shape knob and can be swept against a fixed level.
+
+    Do NOT guess sigma or the floor. The floor is measurable with a timestamped
+    round trip to the gateway; sigma is the spread of those timestamps.
     """
 
     def __init__(self, decision_ms=5.0, wire_out_median_ms=40.0,
                  # constructor. All args have defaults = PRIORS for PSX-remote access (not measured); refit from your colo telemetry once live.
                  wire_out_tail_ms=400.0, wire_in_median_ms=40.0,
-                 wire_in_tail_ms=10.0, tail_prob=0.02, seed=0):
+                 wire_in_tail_ms=10.0, tail_prob=0.02, seed=0,
+                 # SHAPE OF THE BODY, added 2026-09-19. Defaults reproduce the
+                 # previous behaviour exactly -- see draw_out/draw_ack.
+                 wire_out_sigma=0.0, wire_in_sigma=0.0, latency_floor_ms=0.0):
         self.decision_ms = decision_ms  # your compute time: feed-in -> order-out (strategy decides). Typical 5ms.
-        self.wire_out_median_ms = wire_out_median_ms  # typical one-way network delay YOU -> exchange gateway. Applies to new orders AND cancels. ~40ms.
+        self.wire_out_median_ms = wire_out_median_ms  # MEAN one-way network delay YOU -> exchange gateway. Applies to new orders AND cancels. ~40ms.
         self.wire_out_tail_ms = wire_out_tail_ms  # size of the OCCASIONAL spike on the send leg (GC pause, congestion). Mean of the tail draw. ~400ms.
-        self.wire_in_median_ms = wire_in_median_ms  # typical delay exchange -> YOU for an ACK (confirmation a cancel landed). ~40ms.
+        self.wire_in_median_ms = wire_in_median_ms  # MEAN delay exchange -> YOU for an ACK (confirmation a cancel landed). ~40ms.
         self.wire_in_tail_ms = wire_in_tail_ms  # size of the occasional spike on the ack leg. Smaller than send-side. ~10ms.
         self.tail_prob = tail_prob  # probability ANY given message hits the fat tail. 0.02 = 2% of messages spike.
+        # SHAPE OF THE BODY. 0.0 = the old behaviour: every non-tail message
+        # takes EXACTLY the same time, which no real network does. Above 0 the
+        # body becomes a shifted lognormal -- a hard floor with a right skew,
+        # which is the shape latency actually has. A normal is the wrong family
+        # here: it is symmetric and unbounded below, and latency is neither.
+        self.wire_out_sigma = float(wire_out_sigma)  # lognormal sigma of the send-leg body. FIT FROM GATEWAY TIMESTAMPS, never guessed.
+        self.wire_in_sigma = float(wire_in_sigma)  # same for the ack leg.
+        self.latency_floor_ms = float(latency_floor_ms)  # physical minimum: light + serialisation + fixed processing. Nothing goes below it.
+        # a sigma with no headroom above the floor is a silent no-op, so refuse
+        # it loudly rather than returning a degenerate distribution
+        if self.wire_out_sigma > 0.0:
+            assert wire_out_median_ms > latency_floor_ms, \
+                "wire_out_median_ms must exceed latency_floor_ms"
+        if self.wire_in_sigma > 0.0:
+            assert wire_in_median_ms > latency_floor_ms, \
+                "wire_in_median_ms must exceed latency_floor_ms"
         self.rng = np.random.default_rng(
             seed)  # seeded random generator. Same seed -> identical latency draws every run -> reproducible backtests.
 
     def draw_out(self):  # returns ONE random send latency (ms), for a new order OR a cancel request.
-        base = self.decision_ms + self.wire_out_median_ms  # start with the normal case: your compute time + typical wire delay (5 + 40 = 45ms).
+        # BODY. sigma == 0 -> the old constant 45 ms, and NO extra rng draw is
+        # taken, so every existing result is unchanged to the last paisa.
+        if self.wire_out_sigma <= 0.0:
+            base = self.decision_ms + self.wire_out_median_ms  # start with the normal case: your compute time + typical wire delay (5 + 40 = 45ms).
+        else:
+            # only the delay ABOVE the physical floor can vary
+            excess = max(self.wire_out_median_ms - self.latency_floor_ms, 1e-9)
+            # mu set so E[draw] == excess: sigma changes the SHAPE, never the mean
+            mu = np.log(excess) - 0.5 * self.wire_out_sigma ** 2
+            # compute time + floor + a right-skewed body
+            base = (self.decision_ms + self.latency_floor_ms
+                    + self.rng.lognormal(mu, self.wire_out_sigma))
         if self.rng.random() < self.tail_prob:  # roll a die in [0,1): with probability tail_prob (2%), this message spikes.
             base += self.rng.exponential(self.wire_out_tail_ms)  # add a random spike drawn from an exponential distribution (mean = tail_ms). Most spikes small, occasionally huge -> models real fat tails.
         return base  # total one-way send latency for this message.
 
     def draw_ack(self):  # returns ONE random ACK latency (ms) -- time to LEARN a cancel succeeded.
-        base = self.wire_in_median_ms  # normal case: typical return-path delay (40ms). No decision_ms here -- an ack is passive, no compute.
+        # BODY. sigma == 0 -> the old constant, and NO extra rng draw is taken,
+        # so an existing run reproduces byte-for-byte.
+        if self.wire_in_sigma <= 0.0:
+            base = self.wire_in_median_ms  # normal case: typical return-path delay (40ms). No decision_ms here -- an ack is passive, no compute.
+        else:
+            # only the delay ABOVE the physical floor can vary
+            excess = max(self.wire_in_median_ms - self.latency_floor_ms, 1e-9)
+            # lognormal mu chosen so the MEAN of the draw is exactly `excess`,
+            # which is what lets sigma be swept without moving the average
+            mu = np.log(excess) - 0.5 * self.wire_in_sigma ** 2
+            # floor + a right-skewed body, which is the shape real latency has
+            base = self.latency_floor_ms + self.rng.lognormal(mu, self.wire_in_sigma)
         if self.rng.random() < self.tail_prob:  # same 2% chance of a spike on the return path.
             base += self.rng.exponential(self.wire_in_tail_ms)  # add an exponential spike (smaller mean than send side).
         return base  # total ack latency for this message.
