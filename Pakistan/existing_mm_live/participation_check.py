@@ -67,6 +67,25 @@ ALARM_PCT = 15.0
 C_BLUE, C_VERM, C_GREEN, C_PURPLE, C_GREY = "#0072B2", "#D55E00", "#009E73", "#CC79A7", "#6B7280"
 
 
+# a log axis must still read as ordinary numbers -- 0.1, 1, 5, 10 -- never as
+# 10^0 and 10^1, which is matplotlib's default and is unreadable on a
+# percentage axis
+def plain_log_axis(ax, which="x", ticks=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 25, 50)):
+    # the axis object being relabelled
+    axis = ax.xaxis if which == "x" else ax.yaxis
+    # the current data range, so ticks outside it are dropped
+    lo, hi = (ax.get_xlim() if which == "x" else ax.get_ylim())
+    # keep only the ticks that actually fall inside the plotted range
+    keep = [v for v in ticks if lo <= v <= hi]
+    # place them
+    axis.set_ticks(keep)
+    # no minor ticks, which on a log axis would re-introduce clutter
+    axis.set_ticks([], minor=True)
+    # format each as a plain number: drop the decimal when it is a whole number
+    axis.set_major_formatter(plt.FuncFormatter(
+        lambda v, _: f"{v:g}"))
+
+
 # ------------------------------------------------------- MARKET VOLUME -----
 def market_value_by_symbol_day(dates, symbols):
     """Total traded VALUE per (date, symbol) from the parsed store.
@@ -244,6 +263,8 @@ def charts(df, dly, out_dir, arm):
     ax.set_xlabel("my traded value as % of the name's traded value, that day (log scale)")
     ax.set_ylabel("symbol-days")
     ax.set_title(f"1. Participation per name-day — {arm}, {len(df):,} symbol-days")
+    # plain numbers on the log x axis
+    plain_log_axis(ax, "x")
     fig.tight_layout(); fig.savefig(out_dir / "participation_1_distribution.png"); plt.close(fig)
 
     # ---- CHART 2: the time series, as percentile bands ---------------------
@@ -267,6 +288,8 @@ def charts(df, dly, out_dir, arm):
     ax.set_ylabel("% of the name's daily traded value")
     ax.set_title(f"2. Participation over time, spread across names — {arm}")
     ax.legend(ncol=4, loc="upper left")
+    # plain numbers on the log y axis
+    plain_log_axis(ax, "y")
     fig.autofmt_xdate()
     fig.tight_layout(); fig.savefig(out_dir / "participation_2_timeseries.png"); plt.close(fig)
 
