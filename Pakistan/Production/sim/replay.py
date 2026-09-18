@@ -238,10 +238,73 @@ class EngineReplay(Backtester):
                    else DesiredQuotes.flat(self._symbol))
         # hand it to the production order manager
         self._oms.set_desired(desired)
+        # THE REFERENCE PRICE THE RISK GATEWAY MEASURES AGAINST. Until
+        # 2026-09-18 this call passed none, so RiskContext.reference_price_minor
+        # was always None -- and PriceBandCheck REJECTS on a missing reference
+        # rather than passing, deliberately: quoting a symbol whose own mid
+        # cannot be computed means the book is not trustworthy, which is
+        # exactly when a wrong price gets sent. So the check could not be
+        # installed at all; adding it would have refused every order. This is
+        # the plumbing that makes it installable.
+        #
+        # THE MID, NOT THE DAY'S FIRST TRADE. The house band is a tolerance
+        # around where the market IS. An opening price anchors it to somewhere
+        # the market may have left hours ago, which on a trending day either
+        # blocks legitimate quotes or waves through stale ones.
+        #
+        # ABSENT IS ABSENT. A one-sided or empty book has no mid, and an empty
+        # dict is how that is said. It costs nothing here: with no book the
+        # strategy wants nothing, so the only actions are cancels, and
+        # PriceBandCheck passes anything that is not an order request.
+        refs = ({self._symbol: book.mid_minor}
+                if book is not None and book.mid_minor is not None else {})
         # THE DIFF, THE RISK GATEWAY AND THE IN-FLIGHT RULE, all inside here.
         # This call is the thing under test.
-        actions = self._oms.reconcile(now_ms=int(ts_know), date=self._date())
-        # turn each action into a message on Backtester's own scheduler
+        actions = self._oms.reconcile(now_ms=int(ts_know), date=self._date(),
+                                      reference_prices=refs)
+        # ---- THE ACKNOWLEDGEMENT WAIT, which this harness was missing ------
+        # Backtester holds a side after sending a CANCEL until the exchange's
+        # reply comes back -- cancel_at plus one inbound latency. Until then
+        # the old order might still be resting and might still fill, so
+        # putting a fresh order there could leave more size working than
+        # intended. That is a rule about HOW FAST YOU LEARN, not about which
+        # message type was sent: a Cancel/Replace ('G') sets no wait on either
+        # side, because there is no separate cancel to be told about.
+        #
+        # THIS HARNESS ALREADY DREW THE LATENCY AND STORED IT in
+        # self.ack_until when it dispatched the cancel -- it simply never read
+        # it back, so the engine resumed quoting the instant the cancel
+        # landed. On PPL 2026-06-19 the backtest waited 1,465 times and the
+        # engine none, which is what put the two runs on different messages
+        # and therefore different latency draws.
+        #
+        # Filtered here rather than inside the order manager: the manager is
+        # venue-agnostic production code, and this is the simulated exchange
+        # telling it when news arrives.
+        if self.use_ack:
+            # what survives the wait
+            allowed = []
+            # judge every action on the side it belongs to
+            for action in actions:
+                # the side this action touches, spelled as Backtester spells it
+                side_str = getattr(getattr(action, "side", None), "value", None)
+                # an action on a side still awaiting its cancel acknowledgement
+                if side_str is not None and ts_know < self.ack_until[side_str]:
+                    # counted the way Backtester counts it, so the two runs
+                    # report this the same way
+                    self.stats["requotes_blocked_by_ack"] = (
+                        self.stats.get("requotes_blocked_by_ack", 0) + 1)
+                    # AND TELL THE ORDER MANAGER IT DID NOT HAPPEN. The
+                    # manager has already moved its own record to match what
+                    # it believes is in flight, so dropping the message
+                    # silently would strand the order there for the session.
+                    self._unsend(action)
+                    # nothing goes out for this side this cycle
+                    continue
+                # clear to send
+                allowed.append(action)
+            # only these reach the exchange
+            actions = allowed
         for action in actions:
             self._dispatch(action, ts_know)
 
@@ -249,6 +312,35 @@ class EngineReplay(Backtester):
         """The trading date, which the risk gateway's window check needs."""
         # Backtester does not carry one, so it is supplied at construction
         return getattr(self, "session_date", "")
+
+    def _unsend(self, action) -> None:
+        """Undo the order manager's record of a message this harness held back.
+
+        The manager marks its own state the moment it approves an action --
+        PENDING_NEW for a placement, PENDING_CANCEL or PENDING_REPLACE for the
+        others -- because from its point of view the message is on the wire.
+        When the acknowledgement wait holds one back, that record has to be
+        undone or the side stays blocked for the rest of the session with
+        nothing ever answering it.
+
+        Both of these are paths the manager already has, and both are already
+        tested: an order the exchange refused, and a cancel or amendment it
+        refused. A message that never went out is the same thing from the
+        manager's side as one that went out and was rejected.
+        """
+        # a placement that never left: the order is terminal and unworked, so
+        # the next cycle is free to place again
+        if isinstance(action, PlaceOrder):
+            self._oms.on_rejected(action.cl_ord_id, "held: awaiting cancel ack")
+            # and drop the id map entry, so nothing later resolves to it
+            return
+        # a cancel or an amendment that never left: the order goes back to
+        # resting, keeping any partial fill it had taken
+        if isinstance(action, (CancelOrder, ReplaceOrder)):
+            self._oms.on_cancel_rejected(action.cl_ord_id,
+                                         "held: awaiting cancel ack")
+            # done
+            return
 
     def _dispatch(self, action, ts_know) -> None:
         """One production action -> one message on Backtester's scheduler."""
@@ -397,7 +489,7 @@ class EngineReplay(Backtester):
             # the price, back in float rupees
             px = action.price_minor / 100.0
             # the lifecycle record Backtester's reporting reads
-            self._olog[self._oid] = {"oid": self._oid, "side": side_str,
+            self._olog[self._oid] = {"kind": "new", "oid": self._oid, "side": side_str,
                                      "px": px, "qty": action.quantity,
                                      "t_sent": ts_know, "t_live": None,
                                      "t_end": None, "end_reason": None}
@@ -442,22 +534,55 @@ class EngineReplay(Backtester):
 
     # ---- keeping the two order lifecycles in step -------------------------
     def _arrive(self, t, o: MyOrder):
-        """The order reached the exchange. Tell the order manager which way."""
-        # Backtester decides: rest, reject as crossing, or execute as a taker
+        """The order reached the exchange. Tell the order manager which way.
+
+        THREE OUTCOMES now, not two. Until 2026-09-18 an order that arrived
+        marketable was refused, so this method only had to say "rested" or
+        "rejected". PSX has no post-only instruction (Regulation 8.5.1 and
+        8.9(b) list every order type and time-in-force term it accepts, and
+        neither list has one), so a marketable order TRADES -- in whole, or
+        in part with the rest resting under 8.4.4.
+
+        If the order manager is not told about those shares its position
+        drifts from the exchange's, and position is what the strategy prices
+        off. That is the whole reason this override exists.
+        """
+        # Backtester decides: rest, cross on arrival, or execute as a taker
         super()._arrive(t, o)
         # the production id for this order
         cl_ord_id = self._cl_by_oid.get(o.oid)
         # an order this harness did not send (there should be none)
         if cl_ord_id is None:
             return
-        # it rested if it is now the working order on its side
-        if o in self._side_orders(o.side):
+        # what this order executed the instant it landed, as (shares, cash).
+        # Backtester leaves it here; popping keeps the ledger from growing.
+        crossed_qty, crossed_notional = self._cross_exec.pop(o.oid, (0.0, 0.0))
+        # it rested if it is still one of our orders on its side
+        rested = o in self._side_orders(o.side)
+        # ACKNOWLEDGE IT if it did anything at all. PSX reports an execution
+        # on an execution report, which acknowledges the order in the same
+        # breath -- and the order manager cannot apply a fill to an order it
+        # has not acknowledged, because tag 37 does not exist until then.
+        if rested or crossed_qty > 0:
             # the exchange's handle, which PSX requires on every later cancel
             self._oms.on_ack(cl_ord_id, str(o.oid))
         else:
-            # post-only reject: the book moved during our latency window and
-            # the order would have crossed. A real reject, not a lost message.
+            # only reachable with cfg["cross_on_arrival"]=False, the old
+            # post-only behaviour kept for reproducing published numbers
             self._oms.on_rejected(cl_ord_id, "post-only reject: would cross")
+        # NOW THE SHARES. Reported at the quantity-weighted average of the
+        # levels actually consumed, not at our limit -- a taker pays what is
+        # resting, and the backtest booked the cash the same way.
+        if crossed_qty > 0:
+            # average price paid across the levels this order swept
+            avg_px = crossed_notional / crossed_qty
+            # tell the order manager, in the same units every other fill uses
+            self._oms.on_fill(Fill(cl_ord_id=cl_ord_id, symbol=self._symbol,
+                                   side=(Side.BUY if o.side == "BUY"
+                                         else Side.SELL),
+                                   price_minor=int(round(avg_px * 100)),
+                                   quantity=int(crossed_qty),
+                                   timestamp_ms=int(t)))
 
     def _amend(self, t, payload):
         """An amendment reached the exchange. Keep the order manager in step.

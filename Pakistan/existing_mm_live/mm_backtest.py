@@ -669,6 +669,38 @@ class Backtester:
         # with end_reason to give an unbiased fill-probability dataset: every
         # posted quote, filled or not, with the circumstances it was posted into.
         self.log_fill_state = bool(getattr(strategy, "log_fill_state", False))
+        # ---- CROSSING ON ARRIVAL, added 2026-09-18 -----------------------
+        # ON BY DEFAULT, AND THAT CHANGES RESULTS.
+        #
+        # A quote that left this engine passive can ARRIVE marketable, because
+        # the book moves during the latency window. Until now the engine threw
+        # those orders away and counted them as `rejected_crossing` -- that is
+        # post-only behaviour, and PSX has no post-only instruction to buy it
+        # with. Checked against the documents, not assumed:
+        #   * Regulation 8.5.1 lists EVERY order type PSX accepts: Limit,
+        #     Market, Market-to-Limit, CFO, CXL.
+        #   * Regulation 8.9(b) lists EVERY time-in-force term: GTD, FOK, IOC.
+        #   * FIX Market Data spec v1.05 defines ExecInst(18) with exactly one
+        #     value, 'B' = Ok to Cross, on an OUTBOUND execution report.
+        # None of them is a post-only or book-or-cancel instruction.
+        #   * Regulation 8.4.2 -- "Orders that cannot be immediately executed
+        #     shall be queued for future execution." Two outcomes, not three.
+        #
+        # THE OLD BEHAVIOUR DELETED TRADES, AND NOT NEUTRAL ONES. Our bid only
+        # becomes marketable if the offer FELL to meet it, so these were buys
+        # into a falling market and sells into a rising one -- adverse fills.
+        # Dropping them flattered P&L. A simplification that errs toward
+        # profit is the worst kind to leave in.
+        #
+        # Set cfg["cross_on_arrival"]=False to reproduce a number published
+        # before 2026-09-18. That is not the cautious setting; it is the bug.
+        self.cross_on_arrival = bool(cfg.get("cross_on_arrival", True))
+        # WHAT EACH ARRIVING ORDER EXECUTED ON CONTACT, keyed by order id, as
+        # (shares, cash notional). EngineReplay reads this to tell the
+        # production order manager about shares that traded the instant they
+        # landed -- without it the manager's position silently drifts from the
+        # exchange's, and position is what the strategy quotes off.
+        self._cross_exec = {}
         # ---- CFO (Change Former Order), added 2026-09-16 ------------------
         # Off by default: with use_cfo False nothing below this line executes
         # and the engine is byte-identical to the cancel-plus-new original.
@@ -913,6 +945,19 @@ class Backtester:
                       # not only what it did to P&L.
                       "short_fills_blocked_by_uptick": 0,
                       "rejected_crossing": 0, "n_orders_sent": 0, "n_cancels": 0,
+                      # ---- CROSSING ON ARRIVAL, added 2026-09-18 ---------
+                      # DECLARED HERE, not created on first use. These were
+                      # incremented with stats.get(k, 0) + 1, so a run where
+                      # no order ever arrived marketable simply had no such
+                      # key -- and every reader then needed its own default
+                      # or got a KeyError. rejected_crossing above has always
+                      # been declared; these now match it.
+                      # orders that landed priced through the touch
+                      "crossed_on_arrival": 0,
+                      # shares those orders actually traded on contact
+                      "crossed_on_arrival_shares": 0.0,
+                      # how many of them left a remainder resting (PSX 8.4.4)
+                      "crossed_on_arrival_rested": 0,
                       # diagnostic counters, all start at 0:
                       "stale_cancels_ignored": 0, "requotes_blocked_by_ack": 0,
                       # rejected_crossing = post-only rejects; n_orders_sent/n_cancels = message counts;
@@ -1116,7 +1161,7 @@ class Backtester:
         # open a record for the amended version. t_sent and t_live are the same
         # instant here: unlike a new order, an amendment is live the moment it
         # lands -- it was already in the book under its previous terms.
-        self._olog[new_oid] = {"oid": new_oid, "side": side, "px": new_px,
+        self._olog[new_oid] = {"kind": "amend", "oid": new_oid, "side": side, "px": new_px,
                                "qty": new_qty, "t_sent": t, "t_live": t,
                                "t_end": None, "end_reason": None}
         # replace the amended order with its new generation AT THE SAME
@@ -1211,12 +1256,54 @@ class Backtester:
                 self._taker_fill(t, o)
                 # done
                 return
-            self.stats["rejected_crossing"] += 1  # count it as a rejected crossing order.
-            # REJECTED, SO RELEASE THE SLOT. Same reason as the taker path
-            # above: the reservation made at send time has to be undone, or
-            # the engine believes an order is working that never rested.
-            self._drop_order(o.side, o)
-            return  # FLAGGED SIMPLIFICATION: reject it (post-only behavior) instead of executing as a taker. The order never enters the book. Exit early.
+            # ---- THE OLD, WRONG BEHAVIOUR, kept only for reproducibility --
+            # Off by default. See the constructor for the three regulation
+            # citations that say PSX does not do this.
+            if not self.cross_on_arrival:
+                # count it as a rejected crossing order.
+                self.stats["rejected_crossing"] += 1
+                # RELEASE THE SLOT: the reservation made at send time has to
+                # be undone, or the engine believes an order is working that
+                # never rested.
+                self._drop_order(o.side, o)
+                # LIFECYCLE: this record is CLOSED and it has to say so. It
+                # used to keep end_reason=None, which is the same value an
+                # order still resting at the close carries -- so a rejection
+                # and a live quote were indistinguishable in the order log.
+                if o.oid in self._olog:
+                    # the instant the exchange refused it
+                    self._olog[o.oid]["t_end"] = t
+                    # its own reason, disjoint from every other
+                    self._olog[o.oid]["end_reason"] = "rejected_crossing"
+                # the order never enters the book
+                return
+            # ---- WHAT PSX ACTUALLY DOES ---------------------------------
+            # Execute against the resting book, best-first, but only as far
+            # as our own limit price reaches. Returns what is left over.
+            remaining = self._cross_on_arrival(t, o)
+            # FULLY CONSUMED: nothing rests.
+            if remaining <= 0:
+                # release the slot reserved at send time
+                self._drop_order(o.side, o)
+                # LIFECYCLE: it ended by crossing on contact, which is its
+                # own outcome and not the same as a passive fill
+                if o.oid in self._olog:
+                    # when it happened
+                    self._olog[o.oid]["t_end"] = t
+                    # and why
+                    self._olog[o.oid]["end_reason"] = "crossed_filled"
+                # done
+                return
+            # PART OF IT RESTS. Regulation 8.4.4: "In case an Order is
+            # executed partly, the remaining part of such Order shall not
+            # lose its priority." Shrink the order to what is left and fall
+            # through to the ordinary resting path below, which snapshots the
+            # queue and marks it live exactly as a passive arrival would.
+            o.qty = remaining
+            # how often a crossing left something working, counted separately
+            # from how often one happened at all
+            self.stats["crossed_on_arrival_rested"] = \
+                self.stats.get("crossed_on_arrival_rested", 0) + 1
         o.ahead = self.book.qty_at(o.side, o.price)  # order rests: snapshot our QUEUE POSITION -- {order_id: qty} of every order already resting at our price (all ahead of us under price-time priority).
         o.t_active = t  # record the exchange-time the order became live (used for timing/diagnostics). Until this line runs, t_active is None and every fill path skips the order.
         # LIFECYCLE: the order is now live at the exchange (resting, matchable)
@@ -1377,6 +1464,92 @@ class Backtester:
         if o.oid in self._olog:
             self._olog[o.oid]["t_end"] = t_exch
             self._olog[o.oid]["end_reason"] = "taker"
+
+    def _cross_on_arrival(self, t_exch, o):
+        """Our passive quote became marketable while it was in flight.
+
+        NOT THE SAME THING AS _taker_fill. That method is a deliberate sweep
+        to get flat: it pays through every level it needs and drops whatever
+        it could not fill. This is a LIMIT order that merely happened to
+        arrive marketable, so two rules bind it that do not bind a sweep:
+
+          * it never trades through its OWN limit price, and
+          * whatever the limit cannot reach RESTS (Regulation 8.4.4).
+
+        Each level fills at the LEVEL price, because a taker pays what is
+        already resting rather than its own limit. Shadow-fill: the
+        historical book is NOT mutated, the same assumption every other fill
+        in this engine makes.
+
+        Returns the quantity still unfilled, for the caller to rest.
+        """
+        # the opposite side's ranked levels, best-first: our BUY eats asks
+        bids, asks = self.book.ranked_depth(n=50)
+        # the side this order consumes
+        levels = asks if o.side == "BUY" else bids
+        # +1 our bid bought (position up), -1 our ask sold
+        sgn = 1 if o.side == "BUY" else -1
+        # what we still need to fill
+        remaining = float(o.qty)
+        # shares actually executed, for the counters and for EngineReplay
+        traded = 0.0
+        # cash value of those shares, so a quantity-weighted average price can
+        # be handed to the production order manager
+        notional = 0.0
+        # walk the opposite book outwards from the touch
+        for px, avail in levels:
+            # nothing left to fill
+            if remaining <= 0:
+                break
+            # THE LIMIT, which is the whole difference from a sweep. A buy
+            # never pays above its own price; a sell never accepts below it.
+            # Levels are ordered best-first, so the first one out of reach
+            # means every later one is too.
+            if (o.side == "BUY" and px > o.price) or \
+               (o.side == "SELL" and px < o.price):
+                break
+            # take what this level holds, capped by what we still need
+            take = min(float(avail), remaining)
+            # an empty or negative level contributes nothing
+            if take <= 0:
+                continue
+            # position moves with our side
+            self.pos += sgn * take
+            # cash moves opposite, AT THE LEVEL PRICE -- the taker pays what
+            # is resting, never its own limit -- and then the fee. fee_for is
+            # the same schedule a passive fill pays: PSX charges commission
+            # and levies, not a maker-taker spread.
+            self.cash += -sgn * take * px - fee_for(px, take)
+            # one fills row per level consumed, tagged with its OWN reason so
+            # this can be measured, or excluded, separately from both a
+            # passive fill and a deliberate taker sweep
+            self.fills.append({"t": t_exch, "side": o.side, "px": px,
+                               "qty": take, "reason": "crossed_on_arrival",
+                               "window": getattr(self.strat,
+                                                 "current_window", "none"),
+                               "bucket": getattr(self.strat,
+                                                 "current_bucket", "middle"),
+                               "regime": getattr(self.strat,
+                                                 "current_regime", "normal"),
+                               "oid": o.oid})
+            # this much of our order is done
+            remaining -= take
+            # running totals for the ledger below
+            traded += take
+            notional += take * px
+        # how many orders arrived marketable, whether or not they traded
+        self.stats["crossed_on_arrival"] = \
+            self.stats.get("crossed_on_arrival", 0) + 1
+        # and how many shares that cost us, which is the number that says
+        # whether this correction matters at all
+        self.stats["crossed_on_arrival_shares"] = \
+            self.stats.get("crossed_on_arrival_shares", 0.0) + traded
+        # leave the execution where EngineReplay can find it. Without this the
+        # production order manager never learns these shares traded.
+        if traded > 0:
+            self._cross_exec[o.oid] = (traded, notional)
+        # what the caller must now rest
+        return remaining
 
     def _fill(self, side, price, qty, t_exch, reason, order=None): # book a fill of OUR order. side = BUY/SELL; price = the trade's print price (not used for our cash);
         # qty = shares offered to us; t_exch = fill time; reason = provenance tag ("through"/"at_queue"/etc).
@@ -2105,7 +2278,7 @@ class Backtester:
                 # LIFECYCLE LOG: one record per order, keyed by oid. t_sent = the
                 # knowledge-time we decided to send; t_live set at _arrive;
                 # t_end + end_reason set at cancel-land / full fill.
-                self._olog[self._oid] = {"oid": self._oid, "side": side,
+                self._olog[self._oid] = {"kind": "new", "oid": self._oid, "side": side,
                                          "px": w[0], "qty": w[1],
                                          "t_sent": ts_know, "t_live": None,
                                          "t_end": None, "end_reason": None}
@@ -2641,6 +2814,25 @@ class Backtester:
                                 # no order id
                                 "oid": None})
         # Return the accounting logs as DataFrames, plus the diagnostic counters.
+        # EVERY RECORD MUST CARRY A REASON. Anything still None at this point
+        # was never closed by a cancel, an amendment, a fill, a taker
+        # execution or a crossing -- which leaves exactly two cases, and they
+        # are different things that used to be pooled into one blank and read
+        # as an unexplained remainder of about 12,000 per policy.
+        for _rec in self._olog.values():
+            # already closed by one of the paths above: leave it alone
+            if _rec["end_reason"] is not None:
+                continue
+            # t_live is stamped in _arrive, so None means this order was still
+            # travelling when the day ended and never reached the exchange
+            if _rec["t_live"] is None:
+                _rec["end_reason"] = "in_flight_at_close"
+            # otherwise it did reach the exchange and was still resting there,
+            # possibly after one or more partial fills
+            else:
+                _rec["end_reason"] = "open_at_close"
+            # t_end stays None on both: neither of these ENDED, the day did.
+            # Stamping a time here would corrupt every time-to-fill statistic.
         # flush the order lifecycle log to a DataFrame for the harness
         # (rows: oid, side, px, qty, t_sent, t_live, t_end, end_reason)
         self.order_log = pd.DataFrame(self._olog.values())

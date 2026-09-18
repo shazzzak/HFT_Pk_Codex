@@ -82,6 +82,8 @@
 
 # command-line flags
 import argparse
+# wall-clock, so a long run can say how far along it is
+import time
 # path handling, so Production/ is importable when run as a script
 import sys
 from pathlib import Path
@@ -115,8 +117,9 @@ except Exception as _e:                                       # noqa: BLE001
 # ---- the production engine -------------------------------------------------
 # the order manager under test
 from core.oms import OrderManager
-# the kill switch, the gateway, and the one check this run applies
-from core.risk import KillSwitch, OrderQuantityCheck, RiskGateway
+# the kill switch, the gateway, and the checks this run applies
+from core.risk import (KillSwitch, OrderQuantityCheck, PriceBandCheck,
+                       RiskGateway)
 # the quote tolerance, which is how the engine is told to match mm_backtest
 from core.oms import QuoteTolerance
 
@@ -134,8 +137,12 @@ from core.oms import QuoteTolerance
 # backtest on these, it reproduces it where it matters.
 GATE_NAMES = ["NRL", "MLCF", "ENGROH", "NBP", "LUCK", "NPL",
               "SEARL", "NML", "SYS", "PPL", "THCCL", "NCPL"]
-# the session segment the venue hands out
-from core.venue import SessionSegment
+# HOW FAR FROM OUR OWN MID THE GATEWAY TOLERATES A QUOTE, in percent. Wide on
+# purpose here so the EXCHANGE band is what binds -- see run_engine. Not a
+# live-trading value.
+HOUSE_BAND_PCT = 25.0
+# the session segment the venue hands out, and the published price band
+from core.venue import PriceBand, SessionSegment
 # the venue, which owns the tick grid and the three amendment rules
 from venues.psx import PSXVenue
 # the bridge from micro_mm to the order manager
@@ -213,6 +220,44 @@ def run_baseline(events, snap_groups, params, t0, t1, use_g):
     return bt
 
 
+def _end_reasons(run):
+    """Count how every order record on this run was closed.
+
+    ONE RECORD PER ORDER GENERATION. An amendment CLOSES the record it
+    amends and OPENS a new one, so this counts quote versions rather than
+    distinct orders -- `records` is not the number of orders that needed
+    disposing of and must not be read as one.
+
+    Every record carries exactly one reason once mm_backtest labels the
+    crossings and the two at-close cases, so the buckets sum to `records`
+    with no remainder. `unlabelled` exists to catch a record that slipped
+    through, and must be zero.
+    """
+    # every reason a record can close with, in the order the table prints
+    keys = ("cancelled", "amended", "filled", "taker", "crossed_filled",
+            "rejected_crossing", "open_at_close", "in_flight_at_close")
+    # start every bucket at zero so a run that never hits one still reports
+    # the column -- a missing key would change the CSV's shape between days
+    out = {k: 0 for k in keys}
+    # records carrying a reason this function does not know about
+    out["unlabelled"] = 0
+    # the total, which the buckets above must add up to
+    out["records"] = 0
+    # walk the lifecycle log this run produced
+    for rec in run._olog.values():
+        # one more record, counted before anything can skip it
+        out["records"] += 1
+        # the reason it closed with, or None if nothing set one
+        r = rec.get("end_reason")
+        # into its own bucket, or into the defect bucket
+        if r in keys:
+            out[r] += 1
+        else:
+            out["unlabelled"] += 1
+    # the caller prefixes these with the run's own column stem
+    return out
+
+
 def run_engine(events, snap_groups, params, t0, t1, ref_minor, sym, date,
                use_g, quantity_policy):
     """The production order manager driving the same exchange.
@@ -243,10 +288,61 @@ def run_engine(events, snap_groups, params, t0, t1, ref_minor, sym, date,
     the identical rule to each. The difference is ours, and this is what puts
     a number on it.
     """
+    # ---- THE PUBLISHED PRICE BAND, AND WHY THIS EXISTS -------------------
+    # THE BUG THIS FIXES. Until 2026-09-18 this venue was built with NO band
+    # provider, so PSXVenue.price_band() returned None for every symbol. Two
+    # things downstream then went quiet rather than wrong:
+    #
+    #   * MicroMMAdapter._clamp_to_band clamped to nothing, so a quote outside
+    #     the daily circuit limit went out as-is. mm_backtest clamps (see its
+    #     _requote, "BAND CLAMP"), so the two sides sent different prices.
+    #   * The adapter sets micro_mm.limit_up/limit_dn from the same call, so
+    #     the strategy's lock trigger was fed None in the engine run.
+    #
+    # MEASURED, not inferred: on THCCL 2026-06-05 the strategy asked for an
+    # ask of 66.89 in BOTH runs. The backtest clamped it to the published
+    # 66.14 and the engine sent 66.89. That is the whole of the one symbol-day
+    # in 240 whose order counts disagreed. Live, PSX rejects 66.89 and that
+    # side stops quoting.
+    #
+    # READ THE BAND, NEVER COMPUTE IT. PriceBand's own docstring is explicit:
+    # on a split the exchange bands off the ADJUSTED close, so a +/-10%
+    # reconstruction is wrong by the split ratio on exactly the day it
+    # matters. mm_backtest reads it off the UPPER/LOWER_CIRCUIT_BREAKER rows
+    # in the snapshot feed and keeps it on its Book, so that is the source.
+    #
+    # LATE BINDING, because the venue has to exist before the exchange that
+    # publishes the band. This one-element list holds the EngineReplay once it
+    # is built; the closure reads through it on every call, so the band is
+    # always the one being published right now rather than a snapshot.
+    _exchange = []
+
+    def _band_provider(symbol):
+        # nothing to read until the exchange has been constructed below
+        if not _exchange:
+            return None
+        # mm_backtest's own Book, which the snapshot feed keeps current
+        book = _exchange[0].book
+        # the two published bounds, in major units (rupees)
+        up, dn = book.limit_up, book.limit_dn
+        # NO BAND MEANS NO BAND. The sentinels are already handled upstream --
+        # the parser nulls the upper one and flags a suspicious lower one --
+        # so None here is an absent bound, not a wide one, and inventing a
+        # band would be worse than having none.
+        if up is None and dn is None:
+            return None
+        # the venue speaks in paisa. Each bound converts independently,
+        # because one side can be published without the other.
+        return PriceBand(
+            upper_minor=(int(round(up * 100)) if up is not None else None),
+            lower_minor=(int(round(dn * 100)) if dn is not None else None))
+
     # the venue. Its session provider hands back the same window the backtest
-    # uses, so the trading-window check cannot be the thing that differs.
+    # uses, so the trading-window check cannot be the thing that differs, and
+    # its band provider reads the same circuit limits mm_backtest clamps to.
     venue = PSXVenue(session_provider=lambda d: [
-        SessionSegment(start_ms=t0, end_ms=t1)])
+        SessionSegment(start_ms=t0, end_ms=t1)],
+        band_provider=_band_provider)
     # a fresh strategy, identical parameters
     strat = MicrostructureMM(session_ms=(t0, t1), **params)
     # the bridge
@@ -257,7 +353,28 @@ def run_engine(events, snap_groups, params, t0, t1, ref_minor, sym, date,
     # reproduction; the risk checks are tested in tests/test_risk.py. The
     # rejection counter is reported anyway, so a non-zero value is visible
     # rather than silently absorbed.
-    gateway = RiskGateway([OrderQuantityCheck(max_quantity=1_000_000)])
+    #
+    # PRICE BAND ADDED 2026-09-18, AND IT IS THE ONE EXCEPTION TO "PERMISSIVE".
+    # THCCL 2026-06-05 was the engine quoting 66.89 against a published ceiling
+    # of 66.14 -- an order PSX rejects on arrival -- and nothing in this run
+    # noticed. MicroMMAdapter._clamp_to_band is what prevents it; this is the
+    # backstop that catches the day the clamp is fed a band it did not expect.
+    #
+    # IT MUST NEVER FIRE. The clamp runs first and pulls every price inside the
+    # published band, so a rejection here means the band moved between the
+    # clamp and the gateway, or the clamp was bypassed. Either is worth failing
+    # the run for, and `gateway_rejections` is already a must-be-zero column.
+    #
+    # THE HOUSE BAND IS WIDE ON PURPOSE. PriceBandCheck enforces the tighter of
+    # the exchange band and a percentage around our own mid. Here the EXCHANGE
+    # band is the one we want binding, so the house figure is set well outside
+    # anything micro_mm can legitimately produce -- it quotes inside the touch,
+    # so its distance from the mid is half a spread. A live deployment should
+    # tighten this considerably: the house band is the control that catches a
+    # plausible-looking price computed from a stale book, which the exchange
+    # band at +/-10% is far too wide to catch.
+    gateway = RiskGateway([OrderQuantityCheck(max_quantity=1_000_000),
+                           PriceBandCheck(venue, house_band_pct=HOUSE_BAND_PCT)])
     # THE REQUOTE POLICY, per the docstring above. price_ticks=0 means any
     # price change at all triggers a requote, which is what micro_mm does and
     # what mm_backtest does; only the quantity rule differs between the two
@@ -274,6 +391,10 @@ def run_engine(events, snap_groups, params, t0, t1, ref_minor, sym, date,
     # the simulated exchange with the production engine driving it
     rep = EngineReplay(strategy=strat, adapter=adapter, oms=oms, symbol=sym,
                        cfg=cfg)
+    # ARM THE BAND PROVIDER. Before this line it returns None, which is
+    # correct: nothing has been published yet because nothing has run. From
+    # here the venue reads the exchange's live circuit limits.
+    _exchange.append(rep)
     # the date the trading-window check needs
     rep.session_date = str(date)
     # run it
@@ -359,6 +480,25 @@ def main():
 
     # one row per symbol-day
     rows = []
+    # ---- THE HEARTBEAT ---------------------------------------------------
+    # A full run is 12 names x 20 days x FOUR engine runs each, and until now
+    # it printed one line per DAY -- 48 engine runs apart. On a run that takes
+    # an hour that is indistinguishable from a hang. It now prints a line per
+    # symbol-day with how long it has taken and how long is left.
+    #
+    # NOTE `tail` HOLDS EVERYTHING UNTIL THE PROCESS ENDS, so piping this into
+    # `tail -60` hides the heartbeat completely. Run it without the pipe, or
+    # send it to a file and `tail -f` that.
+    t_started = time.time()
+    # how many symbol-days this run will attempt, for the percentage
+    planned = len(dates) * len([n_ for n_ in names
+                                if n_ in scales and n_ in profiles
+                                and n_ in windows])
+    # how many have finished
+    done_n = 0
+    # say the size of the job up front
+    print(f"  to do     : {planned} symbol-days, 4 engine runs each\n",
+          flush=True)
     # walk the calendar, opening each date's data once
     for di, date in enumerate(dates, 1):
         # the date's partitions
@@ -503,6 +643,31 @@ def main():
                 "reduce_cfo_px": reduce.stats.get("n_cfos_price_change", 0),
                 "reduce_cfo_up": reduce.stats.get("n_cfos_qty_up", 0),
                 "reduce_cfo_dn": reduce.stats.get("n_cfos_qty_down", 0),
+                # ---- HOW EVERY ORDER RECORD ENDED, PER RUN ---------------
+                # The order log already recorded this per order, but nothing
+                # carried it up to the CSV -- so the disposal of ~12,000
+                # records per policy could only be seen by loading a run by
+                # hand. Every key is prefixed with the run's own column stem,
+                # so the three policies and the backtest read the same way.
+                **{f"engine_end_{_k}": _v
+                   for _k, _v in _end_reasons(rep).items()},
+                **{f"hold_end_{_k}": _v
+                   for _k, _v in _end_reasons(hold).items()},
+                **{f"reduce_end_{_k}": _v
+                   for _k, _v in _end_reasons(reduce).items()},
+                **{f"backtest_end_{_k}": _v
+                   for _k, _v in _end_reasons(bt).items()},
+                # ---- ORDERS THAT ARRIVED MARKETABLE ----------------------
+                # A quote that left passive and landed through the touch.
+                # PSX matches these (Regulation 8.4.2); until 2026-09-18 both
+                # engines threw them away. Counted on both sides so the two
+                # can be checked against each other rather than assumed equal.
+                "backtest_crossed_arr": bt.stats.get("crossed_on_arrival", 0),
+                "engine_crossed_arr": rep.stats.get("crossed_on_arrival", 0),
+                "backtest_crossed_sh":
+                    bt.stats.get("crossed_on_arrival_shares", 0.0),
+                "engine_crossed_sh":
+                    rep.stats.get("crossed_on_arrival_shares", 0.0),
                 # ---- MESSAGES, SPLIT BY WHAT THEY ARE --------------------
                 # n_orders_sent is the SUM of new orders and amendments, which
                 # made the old table's "orders" column silently include its
@@ -626,7 +791,23 @@ def main():
                 "hold_held_suspended": hold._oms.plan_counts["held_suspended"],
                 "hold_no_change": hold._oms.plan_counts["no_change"],
             })
-        # progress
+            # ---- one line per symbol-day, as it finishes -----------------
+            # how many are complete
+            done_n += 1
+            # seconds since the run started
+            elapsed = time.time() - t_started
+            # seconds each symbol-day has taken on average so far
+            per = elapsed / done_n
+            # and the projection for what is left
+            left = per * (planned - done_n)
+            # the day's headline number, so a run that has gone wrong shows it
+            # here rather than an hour later
+            print(f"  [{done_n:>4}/{planned}] {sym:<7} {date}"
+                  f"  backtest {float(base_pnl):>9,.2f}"
+                  f"  engine {float(eng_pnl):>9,.2f}"
+                  f"  |  {elapsed/60:.1f}m elapsed,"
+                  f" ~{left/60:.0f}m left", flush=True)
+        # the date is finished
         print(f"  [{di}/{len(dates)}] {date} done", flush=True)
 
     # nothing ran: say so rather than emitting an empty file
@@ -903,6 +1084,64 @@ def main():
     print("  the messages and taking a third of the fills is not losing a")
     print("  fair contest -- it is barely competing, and that has to be")
     print("  explained before its P&L means anything.")
+
+    # ---- HOW EVERY ORDER RECORD ENDED, WITH NOTHING LEFT OVER ------------
+    # This used to be a "remainder" column of about 12,000 per policy that
+    # pooled four different outcomes, two of which carried no label at all.
+    # Every record now closes with exactly one reason, and the arithmetic is
+    # CHECKED below rather than asserted in prose.
+    print("\n  HOW EVERY ORDER RECORD ENDED")
+    print("  One record per order GENERATION, not per distinct order: an")
+    print("  amendment CLOSES the record it amends and OPENS a new one, so")
+    print("  these are versions of quotes, not orders needing disposal.")
+    print("    crossed     arrived marketable and was fully consumed on")
+    print("                contact (PSX 8.4.2). A partial crossing does NOT")
+    print("                appear here: the rest rested, so the record is")
+    print("                still open and ends some other way.")
+    print("    refused     the OLD post-only behaviour. Must be 0 unless")
+    print("                cfg[\"cross_on_arrival\"] was set False.")
+    print("    open        still resting at the exchange when the day closed")
+    print("    in flight   sent, but the day ended before it landed")
+    print("    unlabelled  MUST BE 0: a reason mm_backtest failed to set")
+    print(f"    {'policy':12} {'records':>9} {'cancelled':>10} {'amended':>9}"
+          f" {'filled':>8} {'taker':>7} {'crossed':>9} {'refused':>9}"
+          f" {'open':>7} {'in flight':>10} {'unlabelled':>11}")
+    # the backtest reads the same way, so it is printed in the same loop
+    for _label, _col in (list((l, c) for l, c, _ in POLICIES)
+                         + [("backtest    ", "backtest")]):
+        # the record total this run produced
+        _n = int(df[_col + "_end_records"].sum())
+        # the eight disjoint outcomes, in the order of the header
+        _v = [int(df[_col + "_end_" + _k].sum()) for _k in
+              ("cancelled", "amended", "filled", "taker", "crossed_filled",
+               "rejected_crossing", "open_at_close", "in_flight_at_close",
+               "unlabelled")]
+        # one line per run
+        print(f"    {_label} {_n:>9,} {_v[0]:>10,} {_v[1]:>9,} {_v[2]:>8,}"
+              f" {_v[3]:>7,} {_v[4]:>9,} {_v[5]:>9,} {_v[6]:>7,}"
+              f" {_v[7]:>10,} {_v[8]:>11,}")
+        # THE POINT OF THE TABLE: the parts must equal the whole, said as a
+        # failure line rather than left for the reader to add up by eye
+        if sum(_v) != _n:
+            print(f"      MISMATCH: parts sum to {sum(_v):,}, "
+                  f"records is {_n:,}")
+
+    # ---- ORDERS THAT ARRIVED MARKETABLE ---------------------------------
+    # How often the book moved far enough during the latency window that a
+    # quote which left passive landed through the touch. Both sides must
+    # agree: they run the same exchange off the same seeded latency.
+    _bx = int(df["backtest_crossed_arr"].sum())
+    _ex = int(df["engine_crossed_arr"].sum())
+    print("\n  ORDERS THAT ARRIVED MARKETABLE (PSX matches these; 8.4.2)")
+    print(f"    backtest {_bx:,} orders, "
+          f"{float(df['backtest_crossed_sh'].sum()):,.0f} shares traded")
+    print(f"    engine   {_ex:,} orders, "
+          f"{float(df['engine_crossed_sh'].sum()):,.0f} shares traded")
+    # a disagreement here is a divergence in the exchange, not the policy
+    if _bx != _ex:
+        print("    THE TWO SIDES DISAGREE. Same exchange, same latency seed:")
+        print("    they cannot legitimately differ. Diagnose before reading")
+        print("    anything else in this run.")
 
     # ---- THE SIDE-SHARING COUNT, once a defect and now a measurement ----
     # Backtester held ONE order per side until 2026-09-17, so a policy that

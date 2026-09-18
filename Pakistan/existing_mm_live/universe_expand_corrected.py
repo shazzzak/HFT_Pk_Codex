@@ -114,11 +114,43 @@ NAMES = ['AGHA', 'AGP', 'AHCL', 'AICL', 'AIRLINK', 'AKBL', 'APL', 'ASL',
 # so one cohort can be rerun under the current calibration without recomputing
 # the rest. Applied here, before anything reads NAMES, so the preflight, the
 # work list and every printed count reflect the reduced set.
-RUN_ONLY = ['AKBL', 'ATRL', 'BAFL', 'BOP', 'DGKC', 'ENGROH', 'FFC', 'FNEL',
-            'HASCOL', 'HBL', 'HUBC', 'KEL', 'LUCK', 'MARI', 'MEBL', 'MLCF',
-            'NBP', 'NCPL', 'NML', 'NPL', 'NRL', 'OGDC', 'PACE', 'PAEL',
-            'PIAHCLA', 'PIBTL', 'PIOC', 'PPL', 'PSO', 'PTC', 'SAZEW', 'SEARL',
-            'SYS', 'THCCL', 'TOMCL', 'TPL', 'TRG', 'UBL']
+# GATE-0.20 CONFIRMATION COHORT: the 113 names of the production book MINUS the
+# three cheap-tick blacklisted names (KEL, PIBTL, TPL). They are dropped rather
+# than excluded because this run carries a SINGLE arm: HONOUR_CHEAP_EXCLUDED
+# would force them to plain OBI and they would then be written out under the
+# QT_2t@20 label -- an OBI result wearing a skew name. Their config is already
+# settled (A.2: OBI wins, t = +4.61), so there is nothing to learn from them here.
+# Derived as the union of the two production PERNAME parquets under the corrected
+# calibration: universe_expand_PERNAME_20260913_1818 (38) and _1253 (75),
+# overlap 0, union exactly 113.
+# CHANGED 2026-09-18: all 113, not the 110 of the gate-0.20 confirmation.
+# KEL, PIBTL and TPL are back in. They are the cheap-tick exclusions, and
+# HONOUR_CHEAP_EXCLUDED already forces them to plain OBI in every arm -- but the
+# config assignment is built over the whole book, so they have to be IN the base
+# with their own numbers rather than absent from it.
+# Taken verbatim from universe_expand_PERSYMBOL_113_CORRECTED_20260913.csv, the
+# union of the two 2026-09-13 production halves, so the corrected base is
+# directly comparable to the one the shipped assignment was built from.
+# MTL stays out: 5-day volume profile, excluded from the run.
+RUN_ONLY = ['AGHA', 'AGP', 'AHCL', 'AICL', 'AIRLINK', 'AKBL',
+            'APL', 'ASL', 'ATRL', 'AVN', 'BAFL', 'BAHL',
+            'BBFL', 'BECO', 'BFBIO', 'BML', 'BNL', 'BOP',
+            'CEPB', 'CHCC', 'CNERGY', 'CPHL', 'CSAP', 'DCL',
+            'DFML', 'DGKC', 'EFERT', 'ENGROH', 'EPCL', 'FABL',
+            'FATIMA', 'FCCL', 'FCEPL', 'FCL', 'FECTC', 'FFC',
+            'FFL', 'FNEL', 'GAL', 'GCIL', 'GCWL', 'GGL',
+            'GHNI', 'GLAXO', 'HALEON', 'HASCOL', 'HBL', 'HCAR',
+            'HMB', 'HUBC', 'HUMNL', 'ILP', 'IMAGE', 'ISL',
+            'JVDC', 'KAPCO', 'KEL', 'KOHC', 'KOIL', 'KOSM',
+            'LCI', 'LOADS', 'LOTCHEM', 'LUCK', 'MARI', 'MCB',
+            'MEBL', 'MLCF', 'MUGHAL', 'NATF', 'NBP', 'NCPL',
+            'NETSOL', 'NML', 'NPL', 'NRL', 'OGDC', 'PACE',
+            'PAEL', 'PIAHCLA', 'PIBTL', 'PIOC', 'POL', 'POWER',
+            'PPL', 'PREMA', 'PRL', 'PSO', 'PSX', 'PTC',
+            'QUICE', 'SAZEW', 'SEARL', 'SGF', 'SGPL', 'SLGL',
+            'SNGP', 'SSGC', 'SYS', 'TBL', 'TELE', 'TGL',
+            'THCCL', 'TOMCL', 'TPL', 'TPLP', 'TREET', 'TRG',
+            'UBL', 'UNITY', 'WAVES', 'WTL', 'ZAL']
 # apply the filter immediately
 if RUN_ONLY is not None:
     # a typo must fail loudly, not silently run 37 names
@@ -196,34 +228,71 @@ HONOUR_CHEAP_EXCLUDED = True
 # parquets, and the checkpoint journal. Change it for a side experiment so the
 # results land in their own file series instead of the main one, and so the
 # journal cannot collide with the production run's.
-OUT_STEM = "universe_expand"
-# the four confirmation configs
-# UNIVERSE EXPANSION: two configs only. QT_2t is the deploy pick from the
-# full-year confirmation (8,736,780 PKR vs QBPS_2's 8,278,591; paired edge over
-# OBI +1.3036 bps/day, t=+9.42). OBI is kept as thr=0 because every downstream
-# diff is computed against the control, and because the 76 never-run names need
-# their OWN control -- QT_2t beating OBI on the existing 38 is not evidence that
-# it beats OBI on names the engine has never seen.
+# CHANGED 2026-09-18: its own series. The 2026-09-13 production parquets and the
+# gate20_confirm files stay untouched, so the corrected base and the uncorrected
+# one sit on disk side by side and every contrast can be computed between them.
+OUT_STEM = "universe_expand_c1"
+# ---- GATE-0.20 CONFIRMATION (2026-09-14) ----
+# ONE arm. The 30-name gate sweep put QT_2t@20 ahead of the incumbent QT_2t@15 on
+# bps (+0.148, t=+3.33), Sharpe (19.1 vs 17.7) and maxDD (-67k vs -113k), with PKR
+# flat. This run extends ONLY the new cell to the rest of the book.
+#
+# WHY NOT ALSO RUN OBI AND QT_2t@15: both already exist for all 113 under this
+# exact calibration, in the two production PERNAME parquets. Re-running them would
+# cost ~7h to reproduce numbers already on disk. Every contrast (@20 - @15,
+# @20 - OBI, paired by day) is computed against those files afterwards.
+#
+# THE ANCHOR: 30 of these 110 names were in the gate sweep. Their QT_2t@20 totals
+# must reproduce gate_sweep_PERNAME_20260914_0202 TO THE CENT. That is a genuine
+# calibration-and-engine anchor bought for zero extra compute -- if it fails, the
+# other 80 names are not trustworthy either, and nothing downstream should be used.
+# ---- ALL THREE SHIPPED ARMS, IN ONE RUN (2026-09-18) ----
+# The shipped assignment has three live buckets -- QT_2t@15 (68 names),
+# QT_2t@20 (13) and OBI (17), plus DROP (15) -- and they were produced by TWO
+# separate runs under two engines' worth of history: OBI and QT_2t@15 in the
+# 2026-09-13 production parquets, QT_2t@20 in gate20_confirm. Re-deciding the
+# assignment means comparing all three, so all three are computed here against
+# one calibration, one engine and one set of days. A contrast between arms from
+# different runs is exactly the kind of thing that reconciles perfectly and is
+# still wrong.
+#
+# thr=0 IS THE CONTROL and must stay first: every downstream diff is computed
+# against it, and the 113 names need their own control under the corrected
+# engine rather than borrowing the old one.
 THROTTLE_MODES = [
-    dict(_OBI),                                                   # OBI control
-    dict(_OBI, queue_skew_ticks=2.0, queue_skew_thresh=0.15),     # QT_2t
+    # thr=0 -- OBI control, no queue skew at all
+    dict(_OBI),
+    # thr=1 -- the incumbent: 2 ticks of skew, fires at 0.15 imbalance
+    dict(_OBI, queue_skew_ticks=2.0, queue_skew_thresh=0.15),
+    # thr=2 -- the gate-0.20 cell: same 2 ticks, less trigger-happy
+    dict(_OBI, queue_skew_ticks=2.0, queue_skew_thresh=0.20),
 ]
-THROTTLE_LABELS = ["OBI", "QT_2t"]
+# short label; lands in the CSV/parquet 'throttle' column
+THROTTLE_LABELS = ["OBI", "QT_2t@15", "QT_2t@20"]
 def _cfg_lab(thr):
     return THROTTLE_LABELS[thr]
 def _cfg_thr(thr):
+    # the parameter dict for this arm
     m = THROTTLE_MODES[thr]
+    # accumulate one token per active mechanism
     parts = []
-    if m.get("queue_skew_bps", 0.0) != 0.0:
+    # STAIRCASE first: it overrides ticks and bps inside quotes(), so the label
+    # must report it first too, or the CSV would describe a skew that never ran.
+    if m.get("queue_skew_stairs"):
+        # render the ladder compactly: 0.15:2t/0.20:3t/0.25:4t
+        parts.append("/".join(f"{t:g}:{k:g}t" for t, k in m["queue_skew_stairs"]))
+    # PRICE-RELATIVE mode
+    elif m.get("queue_skew_bps", 0.0) != 0.0:
         parts.append(f"{m['queue_skew_bps']:g}bps")
+    # FIXED-tick mode: report the gate too, since it is now a swept axis and
+    # "2t" alone no longer identifies the arm (2t@0.15 and 2t@0.20 differ).
     elif m.get("queue_skew_ticks", 0.0) != 0.0:
-        parts.append(f"{m['queue_skew_ticks']:g}t")
+        parts.append(f"{m['queue_skew_ticks']:g}t@{m.get('queue_skew_thresh', 0.15):g}")
+    # inventory taper, if it is ever switched back on
     if m.get("enable_inv_taper"):
         parts.append(f"tpr{m['inv_taper_pov_mult']:g}")
+    # "-" is the control's marker
     return "+".join(parts) if parts else "-"
-    if m.get("queue_skew_ticks", 0.0) != 0.0:
-        return f"{m['queue_skew_ticks']:g}t"
-    return "-"
 
 EXIT_INV_THRESHOLD = 1.0
 # OBI-defensive engage threshold (|imb-0.5|) and widen ticks
@@ -363,6 +432,11 @@ def _process(args):
         params["queue_skew_ticks"] = 0.0
         # and none in bps either
         params["queue_skew_bps"] = 0.0
+        # and no staircase either -- WITHOUT this line a stair arm would leave
+        # queue_skew_stairs set on an excluded name and the skew would still
+        # fire, because the stair branch in quotes() is tested BEFORE the ticks
+        # and bps branches. Clearing only ticks/bps would silently un-exclude it.
+        params["queue_skew_stairs"] = None
     # run
     dr = H.run_symbol_day(date, sym, dsets, params)
     if dr is None or dr.pnl() is None:
@@ -761,16 +835,77 @@ def main():
                   H.newest("volume_profile_*.csv").name,
                   H.newest("time_windows_*.csv").name,
                   H.newest("session_segments_*.csv").name]
-    # an 8-hex digest that changes the moment ANY calibration file changes
-    _cal_tag = hashlib.sha1("|".join(_cal_files).encode()).hexdigest()[:8]
+    # THE ARM SET IS PART OF THE JOURNAL'S IDENTITY. Resume keys a completed
+    # cell on (date, sym, thr) -- an INTEGER index into THROTTLE_MODES, with no
+    # record of what that index meant. Redefine the arms and thr=2 silently
+    # changes meaning, so a resume would fold results computed under one config
+    # into the row of another. It would reconcile perfectly, because each cell
+    # is internally consistent; the error is invisible in every anchor. Folding
+    # the arm definitions into the tag makes that class of mistake structurally
+    # impossible: change any arm and the journal name changes with it.
+    _arm_sig = "|".join(
+        f"{lab}:{sorted(m.items(), key=lambda kv: kv[0])!r}"
+        for lab, m in zip(THROTTLE_LABELS, THROTTLE_MODES))
+    # ---- THE ENGINE IS PART OF THE IDENTITY TOO, added 2026-09-18 --------
+    # The tag covered the calibration and the arms. It did NOT cover the engine,
+    # so a journal written by one mm_backtest was indistinguishable from one
+    # written by another -- the same class of mistake the arm signature above
+    # was added to prevent, one layer down.
+    #
+    # NOT HYPOTHETICAL. On 2026-09-18 mm_backtest changed how an order that
+    # arrives marketable is handled: PSX 8.4.2 leaves two outcomes and not
+    # three, so the exchange matches it, where the engine used to throw it away
+    # as a post-only reject. That moved 224 of 240 symbol-days on the
+    # reconcile-gate sample. A resume across that change would have folded two
+    # different models of the exchange into one result set, and every anchor
+    # would still have reconciled, because each cell is internally consistent.
+    #
+    # HASH WHAT WAS ACTUALLY IMPORTED, not a guessed path -- the same principle
+    # as naming the calibration files that were actually resolved. Content
+    # digests, not mtimes: an edited file with an unchanged name and timestamp
+    # still changes the tag.
+    import mm_backtest as _eng_mmb
+    import micro_mm as _eng_mmm
+    # one entry per module: filename and the sha1 of its bytes
+    _eng_files = []
+    # the exchange and the strategy decide every number in every cell
+    for _mod in (_eng_mmb, _eng_mmm):
+        # where the interpreter actually loaded it from
+        _path = getattr(_mod, "__file__", None)
+        # a module with no file cannot be hashed; record that rather than skip
+        # it, because a silently omitted component is the bug this prevents
+        if _path is None:
+            _eng_files.append(f"{_mod.__name__}:no-file")
+            continue
+        # digest the bytes
+        with open(_path, "rb") as _fh:
+            _eng_files.append(f"{Path(_path).name}:"
+                              f"{hashlib.sha1(_fh.read()).hexdigest()[:12]}")
+    # an 8-hex digest that changes if ANY calibration file, ANY arm, OR EITHER
+    # ENGINE FILE changes
+    _cal_tag = hashlib.sha1(
+        ("|".join(_cal_files) + "||" + _arm_sig
+         + "||" + "|".join(_eng_files)).encode()).hexdigest()[:8]
     # put the exact calibration in the run log, permanently
     print("\n  calibration in force:", flush=True)
     # one line per file so a stale one is visible at a glance
     for _f in _cal_files:
         # name the file
         print(f"    {_f}", flush=True)
-    # and the tag the journal is scoped to
-    print(f"  calibration tag: {_cal_tag}", flush=True)
+    # the arms in force, so the log alone identifies what was run
+    print("\n  arms in force:", flush=True)
+    # one line per arm: index, label, and the rendered mechanism string
+    for _i, _lab in enumerate(THROTTLE_LABELS):
+        # _cfg_thr renders stairs / ticks@gate / bps, so this cannot drift
+        print(f"    thr={_i}  {_lab:10s}  {_cfg_thr(_i)}", flush=True)
+    # the engine that will produce every cell, permanently in the run log
+    print("\n  engine in force:", flush=True)
+    # one line each, so a stale copy on PYTHONPATH is visible at a glance
+    for _f in _eng_files:
+        # filename and content digest
+        print(f"    {_f}", flush=True)
+    # and the tag the journal is scoped to (calibration AND arms AND engine)
+    print(f"  calibration+arm+engine tag: {_cal_tag}", flush=True)
     # the journal path, scoped to this calibration
     ckpt_path = RESULTS / f"{OUT_STEM}_CKPT.{_cal_tag}.jsonl"
     # a work item's identity for resume = (date, sym, thr) -- the only varying

@@ -266,33 +266,149 @@ def test_an_amendment_still_reprices_in_one_message():
 
 
 # ---------------------------------------------------------------------------
-# 4. a rejected order releases the side
+# 4. an order that arrives marketable TRADES, and releases the side
 # ---------------------------------------------------------------------------
-def test_a_crossing_order_that_is_rejected_frees_the_side():
-    """THE DANGEROUS FAILURE MODE OF THIS FIX.
+def test_a_crossing_order_executes_and_frees_the_side():
+    """THE DANGEROUS FAILURE MODE OF THE SEND-TIME RESERVATION.
 
-    The side is reserved at send time. If a reservation is not released when
-    the order is rejected at arrival, that side is occupied by something that
-    will never come live and never be cancelled -- the in-flight rule then
-    blocks every later cycle and the symbol goes dark for the rest of the
-    session, with no error raised anywhere. This test is the guard on that.
+    The side is reserved at send time. If that reservation is not released
+    when the order stops existing at arrival, the side is occupied by
+    something that will never come live and never be cancelled -- the
+    in-flight rule then blocks every later cycle and the symbol goes dark for
+    the rest of the session, with no error raised anywhere.
+
+    THIS TEST USED TO ASSERT A REJECTION. It no longer does, because PSX does
+    not reject a marketable limit order: Regulation 8.4.2 says an order that
+    cannot be executed immediately is queued, which leaves two outcomes and
+    not three. 8.5.1 and 8.9(b) list every order type and time-in-force term
+    the venue accepts and neither contains a post-only instruction. So the
+    order TRADES -- and the side must still be freed, which is what this
+    still guards.
     """
-    # an engine quoting a bid at 289.00
+    # an engine quoting a bid at 289.00 for 50 shares
     bt = build()
+    # send it; the side is reserved at this instant, before it lands
     bt._requote(OPEN_MS + 1_000)
-    # the side is reserved
+    # the reservation is in place
     assert bt._lead("BUY") is not None
-    # THE MARKET MOVES DOWN through our price while the order is on the wire,
-    # so on arrival our bid would be marketable and is rejected post-only
+    # THE MARKET FALLS THROUGH OUR PRICE while the order is on the wire, so
+    # our 289.00 bid arrives able to buy the 288.50 offer. 300 shares are
+    # resting there, more than our 50, so all of it executes.
     set_book(bt, bid=288.00, ask=288.50)
     # land it
     bt._activate_until(OPEN_MS + 2_000)
-    # rejected, and counted
-    assert bt.stats["rejected_crossing"] == 1
-    # AND THE SIDE IS FREE AGAIN
+    # it crossed on contact, and that is counted under its own name
+    assert bt.stats["crossed_on_arrival"] == 1
+    # all 50 shares traded
+    assert bt.stats["crossed_on_arrival_shares"] == 50
+    # the old post-only counter must NOT move: nothing was refused
+    assert bt.stats["rejected_crossing"] == 0
+    # we bought, so the position moved up by the full clip
+    assert bt.pos == 50
+    # A TAKER PAYS WHAT IS RESTING, not its own limit. Booking this at our
+    # 289.00 would invent 25 rupees of profit that never existed.
+    assert bt.fills[-1]["px"] == 288.50
+    # and the fill carries its own reason, so it can be measured separately
+    # from a passive fill and from a deliberate taker sweep
+    assert bt.fills[-1]["reason"] == "crossed_on_arrival"
+    # NOTHING RESTS, so the side is free again -- the original guard
     assert bt._lead("BUY") is None
     # so the next cycle quotes normally rather than being blocked forever
     bt._requote(OPEN_MS + 2_100)
+    # two orders sent in total: the one that crossed, and the replacement
+    assert bt.stats["n_orders_sent"] == 2
+
+
+def test_a_crossing_order_rests_what_it_could_not_fill():
+    """Regulation 8.4.4: the unfilled remainder keeps its place in the queue.
+
+    A marketable limit order is not a sweep. It takes what is there and the
+    rest RESTS -- so the side stays legitimately occupied, which is the one
+    case where a non-empty side after arrival is correct rather than a ghost.
+    """
+    # the same engine, wanting 50 shares at 289.00
+    bt = build()
+    # send it
+    bt._requote(OPEN_MS + 1_000)
+    # the market falls through our price, but only 20 shares are offered
+    set_book(bt, bid=288.00, ask=288.50, ask_qty=20)
+    # land it
+    bt._activate_until(OPEN_MS + 2_000)
+    # it crossed
+    assert bt.stats["crossed_on_arrival"] == 1
+    # but only the 20 that were actually there could trade
+    assert bt.stats["crossed_on_arrival_shares"] == 20
+    # and the engine counted that this one left something working
+    assert bt.stats["crossed_on_arrival_rested"] == 1
+    # we bought 20
+    assert bt.pos == 20
+    # THE REMAINDER RESTS: the side is occupied, and correctly so
+    assert bt._lead("BUY") is not None
+    # at our own limit price, which is where an unfilled remainder belongs
+    assert bt._lead("BUY").price == 289.00
+    # carrying only what did not trade
+    assert bt._lead("BUY").qty == 30
+    # and the lifecycle record is still OPEN, because the order still exists
+    assert bt._olog[bt._lead("BUY").oid]["end_reason"] is None
+
+
+def test_a_crossing_order_never_trades_through_its_own_limit():
+    """The whole difference between this and _taker_fill.
+
+    A deliberate sweep pays through every level it needs. A limit order that
+    merely arrived marketable stops at its own price -- otherwise the engine
+    books fills at prices we never agreed to pay, which is invented loss in
+    exactly the same way paying our own limit would be invented profit.
+    """
+    # wanting 50 at 289.00
+    bt = build()
+    # send it
+    bt._requote(OPEN_MS + 1_000)
+    # the market falls through us: 20 offered at 288.50, INSIDE our limit
+    set_book(bt, bid=288.00, ask=288.50, ask_qty=20)
+    # and a second offer at 289.60, OUTSIDE our limit -- a sweep would take
+    # this, a limit order must not
+    bt.book.o["H3"] = Order("SELL", 289.60, 100)
+    # land it
+    bt._activate_until(OPEN_MS + 2_000)
+    # only the level inside our limit traded
+    assert bt.stats["crossed_on_arrival_shares"] == 20
+    # every fill happened at or below what we were willing to pay
+    assert all(f["px"] <= 289.00 for f in bt.fills)
+    # the 30 we could not fill within our limit rests, rather than paying up
+    assert bt._lead("BUY").qty == 30
+
+
+def test_the_old_post_only_behaviour_still_frees_the_side_when_enabled():
+    """The escape hatch has to work, or it is not an escape hatch.
+
+    cfg["cross_on_arrival"]=False restores the pre-2026-09-18 behaviour so a
+    published number can be reproduced. It is the OLD BUG, not a cautious
+    setting -- but while it exists it must still release the reservation, or
+    turning it on to check an old figure silently kills the session.
+    """
+    # the same engine
+    bt = build()
+    # turn the venue-accurate behaviour off, as cfg would
+    bt.cross_on_arrival = False
+    # send the bid
+    bt._requote(OPEN_MS + 1_000)
+    # the market falls through our price while it is on the wire
+    set_book(bt, bid=288.00, ask=288.50)
+    # land it
+    bt._activate_until(OPEN_MS + 2_000)
+    # refused, and counted the old way
+    assert bt.stats["rejected_crossing"] == 1
+    # nothing traded
+    assert bt.pos == 0
+    # THE SIDE IS FREE AGAIN -- the guard this test has always really been
+    assert bt._lead("BUY") is None
+    # and the record says WHY it ended, rather than leaving a blank that reads
+    # identically to an order still resting at the close
+    assert bt.stats["crossed_on_arrival"] == 0
+    # so the next cycle quotes normally
+    bt._requote(OPEN_MS + 2_100)
+    # two orders sent in total
     assert bt.stats["n_orders_sent"] == 2
 
 
@@ -1237,3 +1353,108 @@ def test_both_policies_count_a_wait_the_same_way():
         # BOTH POLICIES RECORD THE WAIT. Neither sends anything, and neither
         # pretends the cycle was quiet for some other reason.
         assert oms.plan_counts["held_message_in_flight"] == before + 1, policy
+
+
+# ---------------------------------------------------------------------------
+# 13. THE ACKNOWLEDGEMENT WAIT
+# ---------------------------------------------------------------------------
+# After sending a CANCEL, mm_backtest holds that side until the exchange's
+# reply comes back -- the cancel's landing time plus one inbound latency.
+# Until then the old order may still be resting and may still fill, so putting
+# a fresh order there could leave more size working than intended.
+#
+# IT IS A RULE ABOUT HOW FAST YOU LEARN, NOT ABOUT MESSAGE TYPE. A
+# Cancel/Replace ('G') sets no wait on either side, because there is no
+# separate cancel to be told about. Only a genuine Cancel does.
+#
+# The harness drew the latency and stored it in self.ack_until, then never
+# read it back -- so the engine resumed quoting the instant the cancel landed.
+# On PPL 2026-06-19 the backtest waited 1,465 times and the engine none, which
+# is what put the two runs on different messages, different latency draws, and
+# therefore different fills.
+def test_a_reprice_sets_no_acknowledgement_wait():
+    """THE POINT ABOUT 'G'. One message, nothing to be told about, no wait."""
+    # a resting bid, amendments enabled so a reprice is one message
+    bt = build(use_cfo=True)
+    bt._requote(OPEN_MS + 1_000)
+    bt._activate_until(OPEN_MS + 2_000)
+    # nothing is waiting on an acknowledgement
+    assert bt.ack_until["BUY"] == 0
+    # the strategy reprices: ONE amendment goes out
+    bt.strat.want = {"BUY": (289.10, 50)}
+    bt._requote(OPEN_MS + 2_100)
+    # STILL no wait. This is why 'we use G so we do not need the wait' is
+    # already true, and why removing the wait would not change a reprice.
+    assert bt.ack_until["BUY"] == 0
+    assert bt.stats["requotes_blocked_by_ack"] == 0
+
+
+def test_a_cancel_does_set_an_acknowledgement_wait():
+    """And a genuine Cancel does, because there IS something to be told."""
+    # a resting bid
+    bt = build(use_cfo=True)
+    bt._requote(OPEN_MS + 1_000)
+    bt._activate_until(OPEN_MS + 2_000)
+    # the strategy wants nothing here now -- a halt, a stale feed, whatever.
+    # Pulling a side is a Cancel, not an amendment.
+    bt.strat.want = {}
+    bt._requote(OPEN_MS + 2_100)
+    # the cancel is on the wire and the side is held until it is acknowledged
+    assert bt.ack_until["BUY"] > OPEN_MS + 2_100
+    # and the wait is LONGER than the cancel's own landing time, because it
+    # includes the reply coming back
+    assert bt.ack_until["BUY"] > bt._lead("BUY").cancel_at
+
+
+def test_the_engine_honours_the_same_wait():
+    """Both sides must hold for the same reason, or the gate is comparing two
+    different rules and calling the difference a bug."""
+    # the engine harness with a resting bid
+    rep, oms, mm = _replay_on("exact")
+    rep._requote(OPEN_MS + 1_000)
+    rep._activate_until(OPEN_MS + 2_000)
+    # the strategy wants nothing: the order manager sends a cancel
+    mm.want = {}
+    rep._requote(OPEN_MS + 2_100)
+    # the wait was drawn and stored, exactly as the backtest does
+    assert rep.ack_until["BUY"] > OPEN_MS + 2_100
+    # the cancel lands, freeing the side as far as the exchange is concerned
+    rep._activate_until(int(rep.ack_until["BUY"]) - 1)
+    # the strategy wants a quote again, BEFORE the acknowledgement is due
+    mm.want = {"BUY": (289.00, 500)}
+    sent_before = rep.stats["n_orders_sent"]
+    rep._requote(int(rep.ack_until["BUY"]) - 1)
+    # NOTHING WENT OUT. Until this fix the engine quoted here and the backtest
+    # did not, which is the whole divergence.
+    assert rep.stats["n_orders_sent"] == sent_before
+    assert rep.stats.get("requotes_blocked_by_ack", 0) >= 1
+    # and the order manager was told, so nothing is stranded: once the wait
+    # expires the side quotes again
+    rep._requote(int(rep.ack_until["BUY"]) + 1)
+    assert rep.stats["n_orders_sent"] == sent_before + 1
+
+
+def test_a_held_message_does_not_strand_the_order_manager():
+    """The dangerous failure mode of holding a message back.
+
+    The manager marks its own state the moment it approves an action. Drop the
+    message without telling it and that side is blocked for the rest of the
+    session, with nothing ever arriving to clear it.
+    """
+    # a resting bid, then a cancel, then a blocked requote
+    rep, oms, mm = _replay_on("exact")
+    rep._requote(OPEN_MS + 1_000)
+    rep._activate_until(OPEN_MS + 2_000)
+    mm.want = {}
+    rep._requote(OPEN_MS + 2_100)
+    rep._activate_until(int(rep.ack_until["BUY"]) - 1)
+    mm.want = {"BUY": (289.00, 500)}
+    rep._requote(int(rep.ack_until["BUY"]) - 1)
+    # the manager has NOTHING working that it believes is in flight
+    assert not any(o.has_message_in_flight for o in oms.working_orders("PPL"))
+    # so the side is free the moment the wait expires, and stays productive
+    t = int(rep.ack_until["BUY"]) + 1
+    for i in range(5):
+        rep._requote(t); rep._activate_until(t + 300); t += 400
+    # something of ours is resting at the end of it
+    assert len(rep._side_orders("BUY")) >= 1

@@ -126,6 +126,64 @@ def first_divergence(a, b):
     return None
 
 
+
+def orders_frame(engine, source):
+    """One engine's ORDER log as a frame, oldest first.
+
+    Every order the run ever created, whether it filled or not: brand new
+    orders and the new generation each amendment produces. This is what the
+    fill log cannot show -- two runs can fill identically and still have put
+    different orders in different places, and the difference only appears
+    here.
+    """
+    # nothing sent all day is a legitimate run, not an error
+    if not engine._olog:
+        # an empty frame with every column the callers read
+        return pd.DataFrame({c: pd.Series(dtype="float64")
+                             for c in ("oid", "px", "qty", "t_sent", "t_live",
+                                       "t_end")}
+                            ).assign(source="", kind="", side="",
+                                     end_reason="")
+    # the log as recorded, one row per order
+    df = pd.DataFrame(list(engine._olog.values()))
+    # which run this came from
+    df.insert(0, "source", source)
+    # `kind` says whether this order was sent fresh or created by an
+    # amendment. RECORDED AT CREATION rather than inferred from the
+    # timestamps -- an amendment writes t_sent and t_live as the same instant
+    # and a new order does not, so it could be guessed, but a guess is what
+    # this file exists to avoid.
+    if "kind" not in df.columns:
+        # an older run of the research stack, before the field existed
+        df["kind"] = "?"
+    # oldest first, by when we decided to send it
+    return df.sort_values(["t_sent", "oid"]).reset_index(drop=True)
+
+
+def first_order_divergence(a, b):
+    """Index of the first order the two runs did not both send, or None.
+
+    Compared on what defines an order: when it was sent, which side, at what
+    price, for how much, and whether it was a fresh order or an amendment.
+    """
+    # the columns that define one
+    keys = ["t_sent", "side", "px", "qty", "kind"]
+    # walk forward over the shorter of the two
+    n = min(len(a), len(b))
+    # the first row that differs
+    for i in range(n):
+        # compare the five fields as a tuple
+        if tuple(a.loc[i, keys]) != tuple(b.loc[i, keys]):
+            # this is where they part
+            return i
+    # no row differed, so the divergence is that one log is longer
+    if len(a) != len(b):
+        # the first row the shorter one does not have
+        return n
+    # identical logs
+    return None
+
+
 def decompose(bt, rep):
     """The P&L difference split into trading and closing out.
 
@@ -374,6 +432,49 @@ def main():
         print("\n    engine:")
         print(b.loc[lo:hi, cols].to_string(index=True))
 
+    # ---- 4. the orders, which the fills cannot show ---------------------
+    # TWO RUNS CAN FILL IDENTICALLY AND STILL DIFFER. A day where every fill
+    # matches but the message counts do not has put different orders in
+    # different places; they simply happened not to be the ones that traded.
+    # That is a real difference in behaviour and it is invisible above.
+    oa, ob = orders_frame(bt, "backtest"), orders_frame(rep, "engine")
+    print("\n  THE ORDERS")
+    print(f"    backtest {len(oa):>6,}   engine {len(ob):>6,}")
+    # split by how each order came about
+    for kind in ("new", "amend", "?"):
+        # how many of this kind each side created
+        na = int((oa["kind"] == kind).sum())
+        nb = int((ob["kind"] == kind).sum())
+        # only print a kind that occurred
+        if na or nb:
+            print(f"    {kind:<8} backtest {na:>6,}   engine {nb:>6,}")
+    # and how each order ended, which is where a behavioural difference shows
+    print("\n  HOW THEY ENDED")
+    # every reason either side recorded
+    ra = oa["end_reason"].fillna("still resting").value_counts()
+    rb = ob["end_reason"].fillna("still resting").value_counts()
+    for reason in sorted(set(ra.index) | set(rb.index)):
+        print(f"    {reason:<16} backtest {int(ra.get(reason, 0)):>6,}"
+              f"   engine {int(rb.get(reason, 0)):>6,}")
+    # where they part company
+    odiv = first_order_divergence(oa, ob)
+    print("\n  FIRST ORDER DIVERGENCE")
+    # identical is the answer the gate is looking for
+    if odiv is None:
+        print("    none -- the two runs sent the same orders, in the same")
+        print("    order, at the same prices and sizes.")
+    else:
+        print(f"    order #{odiv + 1} of {len(oa)} (backtest) / {len(ob)} (engine)")
+        # the window either side
+        lo, hi = max(0, odiv - args.context), odiv + args.context + 1
+        # the columns worth seeing
+        ocols = ["kind", "t_sent", "side", "px", "qty", "t_live", "t_end",
+                 "end_reason", "oid"]
+        print("\n    backtest:")
+        print(oa.loc[lo:hi, ocols].to_string(index=True))
+        print("\n    engine:")
+        print(ob.loc[lo:hi, ocols].to_string(index=True))
+
     # ---- write ----------------------------------------------------------
     # both logs stacked, with the source column distinguishing them
     both = pd.concat([a, b], ignore_index=True)
@@ -381,6 +482,10 @@ def main():
     out_csv = EX.safe_out(f"fill_diff_{args.symbol}_{args.date}", "csv")
     both.to_csv(out_csv, index=False)
     print(f"\nwrote {out_csv}")
+    # the order logs too, which is where a fills-identical day is diagnosed
+    out_orders = EX.safe_out(f"order_diff_{args.symbol}_{args.date}", "csv")
+    pd.concat([oa, ob], ignore_index=True).to_csv(out_orders, index=False)
+    print(f"wrote {out_orders}")
     # the chart, beside it
     out_png = EX.safe_out(f"fill_diff_{args.symbol}_{args.date}", "png")
     make_chart(a, b, args.symbol, args.date, div, out_png)
