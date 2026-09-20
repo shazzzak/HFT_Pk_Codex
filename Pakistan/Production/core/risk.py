@@ -114,6 +114,10 @@ class RiskContext:
     working_notional_minor: int = 0
     # a reference price for the symbol in minor units, usually the mid
     reference_price_minor: Optional[int] = None
+    # Unfilled buys, including pending sends, cancels and replacement reservations.
+    working_buy_quantity: int = 0
+    # Unfilled sells are reserved independently; opposite sides cannot offset.
+    working_sell_quantity: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -449,10 +453,15 @@ class PositionLimitCheck(RiskCheck):
         # increases quantity does so exactly as a new order would
         if not isinstance(action, OrderRequest):
             return RiskDecision.allow(self.name)
-        # where the position lands if this order fills entirely
-        worst_case = ctx.position + action.side.sign * action.quantity
+        # Existing orders can execute without any offsetting opposite-side fills.
+        buys = ctx.working_buy_quantity + (action.quantity if action.side is Side.BUY else 0)
+        # A remaining-size replacement can follow fills of the old generation.
+        sells = ctx.working_sell_quantity + (action.quantity if action.side is Side.SELL else 0)
+        # Evaluate the direction this request can worsen; allow reducing orders
+        # when an independently breached opposite endpoint already exists.
+        worst_case = ctx.position + buys if action.side is Side.BUY else ctx.position - sells
         # breach of the ceiling in either direction
-        if abs(worst_case) > self._max:
+        if (worst_case > self._max if action.side is Side.BUY else worst_case < -self._max):
             return RiskDecision.reject(
                 self.name, f"position would reach {worst_case} from "
                            f"{ctx.position}, limit is +/-{self._max}")

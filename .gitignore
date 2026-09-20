@@ -5,6 +5,7 @@ __pycache__/
 # Backtesting Directories
 .backtest/
 .backtest_new/
+backtest/
 logs/
 
 # All DuckDB Files

@@ -119,7 +119,7 @@ except Exception as _e:                                       # noqa: BLE001
 from core.oms import OrderManager
 # the kill switch, the gateway, and the checks this run applies
 from core.risk import (KillSwitch, OrderQuantityCheck, PriceBandCheck,
-                       RiskGateway)
+                       RiskGateway, PositionLimitCheck)
 # the quote tolerance, which is how the engine is told to match mm_backtest
 from core.oms import QuoteTolerance
 
@@ -259,7 +259,7 @@ def _end_reasons(run):
 
 
 def run_engine(events, snap_groups, params, t0, t1, ref_minor, sym, date,
-               use_g, quantity_policy):
+               use_g, quantity_policy, position_limit=None):
     """The production order manager driving the same exchange.
 
     `quantity_policy` picks the REQUOTE RULE, and it is the whole point of
@@ -373,8 +373,22 @@ def run_engine(events, snap_groups, params, t0, t1, ref_minor, sym, date,
     # tighten this considerably: the house band is the control that catches a
     # plausible-looking price computed from a stale book, which the exchange
     # band at +/-10% is far too wide to catch.
-    gateway = RiskGateway([OrderQuantityCheck(max_quantity=1_000_000),
-                           PriceBandCheck(venue, house_band_pct=HOUSE_BAND_PCT)])
+    # Count real gateway decisions rather than leaving a disconnected zero counter.
+    rejected = []
+    # Retain the historical price-band and per-order checks.
+    checks = [OrderQuantityCheck(max_quantity=1_000_000), PriceBandCheck(venue, house_band_pct=HOUSE_BAND_PCT)]
+    # A supplied limit exercises working and in-flight exposure in the same gate.
+    if position_limit is not None:
+        # This is a declared test limit, not an inferred live capital allocation.
+        checks.append(PositionLimitCheck(position_limit))
+    # Keep rejection details for diagnosis and a truthful gate verdict.
+    def record_decision(action, decision):
+        # Only refusals need retaining for the reconciliation summary.
+        if not decision.allowed:
+            # Store the exact control and reason alongside the request identifier.
+            rejected.append({"id": action.cl_ord_id, "check": decision.check, "reason": decision.reason})
+    # Wire the risk decision sink before any order can be evaluated.
+    gateway = RiskGateway(checks, on_decision=record_decision)
     # THE REQUOTE POLICY, per the docstring above. price_ticks=0 means any
     # price change at all triggers a requote, which is what micro_mm does and
     # what mm_backtest does; only the quantity rule differs between the two
@@ -399,6 +413,10 @@ def run_engine(events, snap_groups, params, t0, t1, ref_minor, sym, date,
     rep.session_date = str(date)
     # run it
     rep.run(events, snap_groups)
+    # Publish actual refusals after the replay completes.
+    rep.engine_stats["gateway_rejections"] = len(rejected)
+    # Preserve reasons for the strict gate and human review.
+    rep.risk_rejections = rejected
     # the whole harness, for stats as well as P&L
     return rep
 

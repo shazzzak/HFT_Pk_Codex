@@ -199,6 +199,8 @@ class OrderManager:
         # That is the whole reason this is a list. With one order per side the
         # only way to show more size is to amend, and amending always pays.
         self._working: Dict[Tuple[str, Side], List[Order]] = {}
+        # Reserve proposed remaining size until the amendment is answered.
+        self._replacement_reservations: Dict[str, int] = {}
         # every order we have ever sent this session, by its OWN id
         self._orders: Dict[str, Order] = {}
         # message ids that refer to an existing order -- the ClOrdID of a cancel
@@ -258,6 +260,8 @@ class OrderManager:
     # ---- the diff ---------------------------------------------------------
     def _unwork(self, order: Order) -> None:
         """Take one order off its side, leaving the others where they are."""
+        # Terminal orders cannot acquire another generation in this OMS model.
+        self._replacement_reservations.pop(order.cl_ord_id, None)
         # the side's list, if it has one
         key = (order.symbol, order.side)
         # nothing recorded for this side
@@ -343,6 +347,10 @@ class OrderManager:
         It surrenders queue position on every top-up, which is precisely the
         cost the other design avoids and the thing worth measuring.
         """
+        # A suspended liability needs venue reconciliation before this side can quote.
+        if any(o.state is OrderState.SUSPENDED for o in self._working.get((symbol, side), ())):
+            # Keep the order indexed and reserved rather than silently replacing it.
+            return []
         # the list design
         if self._tol.quantity_policy == "queue_preserving":
             return self._plan_side_multi(symbol, side, want)
@@ -594,6 +602,21 @@ class OrderManager:
                            orig_cl_ord_id=order.cl_ord_id,
                            exchange_order_id=order.exchange_order_id or "")
 
+    # The application must serialize reconcile and inbound lifecycle events.
+    def reserved_quantity(self, symbol: str, side: Side) -> int:
+        """Conservative unfilled exposure, including suspended and pending orders.
+
+        Replacement quantity is new remaining size in this model. Reserving
+        old leaves plus that size covers fills before replacement acceptance.
+        This intentionally over-reserves the final old share when a full fill
+        would prevent replacement. Broker total-quantity semantics need a
+        separately verified adapter once the order-entry spec is available.
+        """
+        # Traverse only active orders for this symbol, never session history.
+        return sum(order.leaves_quantity + self._replacement_reservations.get(order.cl_ord_id, 0)
+                   # Suspended orders remain a liability until confirmed terminal.
+                   for order in self._working.get((symbol, side), ()) if not order.state.is_terminal)
+
     def reconcile(self, now_ms: int, date: str,
                   reference_prices: Optional[Dict[str, int]] = None
                   ) -> List[Action]:
@@ -629,7 +652,11 @@ class OrderManager:
                     # the state the risk controls judge against
                     ctx = RiskContext(date=date, timestamp_ms=now_ms,
                                       position=self._position.get(symbol, 0),
-                                      reference_price_minor=refs.get(symbol))
+                                      reference_price_minor=refs.get(symbol),
+                                      # Earlier approved actions in this cycle are already reserved.
+                                      working_buy_quantity=self.reserved_quantity(symbol, Side.BUY),
+                                      # Pending cancels retain their entire unfilled liability.
+                                      working_sell_quantity=self.reserved_quantity(symbol, Side.SELL))
                     # EVERY action clears the gateway. There is no other path.
                     decision = self._gateway.authorise(action, ctx)
                     # refused: record it and move on. A refused place means no
@@ -651,9 +678,8 @@ class OrderManager:
                     (cancels if action.is_cancel else places).append(action)
                     # this side did something this cycle
                     self.plan_counts["acted"] += 1
-        # CANCELS BEFORE PLACES, always. Within one cycle this keeps total
-        # resting size at or below the intended amount at every instant; the
-        # reverse order would briefly double it.
+        # Send cancels first, but retain their reservation until confirmation:
+        # network ordering alone does not prevent overlapping exposure.
         return cancels + places
 
     def _mark_sent(self, action: Action) -> None:
@@ -689,6 +715,8 @@ class OrderManager:
                 return
             # the old terms remain live until the exchange answers
             order.on_replace_sent()
+            # Old leaves remain executable until this new generation is accepted.
+            self._replacement_reservations[order.cl_ord_id] = action.quantity
             # the amendment's own id resolves to the same order, so the
             # exchange's reply -- which quotes the NEW ClOrdID -- can be matched
             self._alias[action.cl_ord_id] = order.cl_ord_id
@@ -779,6 +807,8 @@ class OrderManager:
         was_terminal = order.state.is_terminal
         # apply the new terms -- a no-op on an order that already finished
         order.on_replaced(price_minor, quantity)
+        # Confirmed terms now supply the reservation through ordinary leaves.
+        self._replacement_reservations.pop(order.cl_ord_id, None)
         # AN AMENDMENT THAT LOST ITS RACE. The order filled or was cancelled
         # while the message was on the wire, so nothing was applied. Worth a
         # line of its own: it is a real cost of the one-message reprice and the
@@ -839,6 +869,8 @@ class OrderManager:
         # terminal order would keep a raised flag and nothing would ever lower
         # it. A flag that is never lowered holds its side for the rest of the
         # session and raises nothing.
+        # A rejected amendment no longer reserves its proposed generation.
+        self._replacement_reservations.pop(order.cl_ord_id, None)
         order.replace_in_flight = False
         order.cancel_in_flight = False
         if order.state.is_terminal:
@@ -926,8 +958,12 @@ class OrderManager:
         This is the condition the kill switch is trying to reach, and the thing
         an operator actually wants to see after tripping it.
         """
-        # no working orders and no non-zero position
-        return (not self.working_orders()
+        # Suspended orders can resume, and terminal orders may still have an
+        # unanswered cancel or replacement. Neither is an operator-safe flat state.
+        return (not any(not order.state.is_terminal or order.has_message_in_flight
+                        # Scan session records because terminal races leave the working index.
+                        for order in self._orders.values())
+                # Cancelling all quotes does not liquidate filled inventory.
                 and all(p == 0 for p in self._position.values()))
 
     def _emit(self, event: str, payload: dict) -> None:

@@ -14,7 +14,7 @@
 #   send leg = decision_ms (5) + wire_out_median_ms (40) = 45 ms for 98% of
 #   messages, EXACTLY, with zero variance; the other 2% add Exp(mean 400 ms).
 #   ack leg  = wire_in_median_ms (40) for 98%; the other 2% add Exp(mean 10).
-#   So the body is a SPIKE, not a bell. Mean send = 52.9 ms, p99 = 321 ms.
+#   So the body is a SPIKE, not a bell. Mean send = 53.0 ms, p99 = 321 ms.
 #   `wire_out_median_ms` is a fixed value despite the name.
 #
 # ARMS: the latency model is the only thing that changes. Strategy params,
@@ -32,7 +32,19 @@ import time
 # log stamps
 from datetime import datetime
 # process pool
-from multiprocessing import Pool
+from multiprocessing import get_context
+# Copy selected settings before sending them to another process.
+from copy import deepcopy
+# Read and write manifests without importing the replay stack during reporting.
+from pathlib import Path
+# Serialize experiment provenance and failure records.
+import json
+# Identify the active sweep module for source hashing.
+import sys
+# Import engine dependencies explicitly for their provenance hashes.
+import importlib
+# Print immediately, keep long stages observable, and reuse tested reporting.
+from latency_sweep_support import print, Heartbeat, digest, provenance, write_report, analyse_cells, file_digest
 # numerics / frames
 import numpy as np
 import pandas as pd
@@ -161,6 +173,8 @@ def add_shape_arms(floor):
 add_shape_arms(LAT_FLOOR_MS)
 # the control that everything is paired against: production as shipped
 CONTROL = "lat40"
+# Keep the full default arm table separate from the worker's selected subset.
+ALL_ARMS = deepcopy(ARMS)
 
 # ---- STAGES ---------------------------------------------------------------
 # All 17 arms x 3 seeds is ~230,000 cells, about 34 hours at the measured 111
@@ -184,28 +198,32 @@ GROUPS = {
 }
 
 
-def validate_arms():
+def validate_arms(arms=None, floor=None):
+    # Fall back to module settings only for legacy direct calls.
+    arms = ARMS if arms is None else arms
+    # Display the actual shape floor selected for this invocation.
+    floor = LAT_FLOOR_MS if floor is None else floor
     # the control has to be production exactly, or every paired number is
     # measured against something that does not ship
-    assert ARMS[CONTROL] == BASE, "CONTROL arm must equal the production BASE"
+    assert arms[CONTROL] == BASE, "CONTROL arm must equal the production BASE"
     # every arm must differ from the control in at least one field, else it is
     # a duplicate spending a multiple-testing slot for nothing
-    for k, v in ARMS.items():
+    for k, v in arms.items():
         if k == CONTROL:
             continue
         assert v != BASE, f"arm {k} is identical to the control"
     # an arm that asks for spread with no headroom above the floor is a silent
     # no-op in the engine's eyes; catch it here rather than after nine hours
-    for k, v in ARMS.items():
+    for k, v in arms.items():
         if v.get("wire_out_sigma", 0.0) > 0.0:
             assert v["wire_out_median_ms"] > v.get("latency_floor_ms", 0.0), \
                 f"arm {k}: wire_out_median_ms must exceed latency_floor_ms"
     # print what will run, with the EFFECTIVE one-way send latency, because
     # decision_ms is folded in and 'wire 40' is really 45 ms on the wire
-    print(_ts() + f"validate_arms OK: {len(ARMS)} arms, control={CONTROL}")
-    print(_ts() + f"  {'arm':12s} {'send ms mean':>13s} {'ack ms mean':>12s} "
-                  f"{'tail p':>7s} {'send sd':>9s} {'send CV':>8s}")
-    for k, v in ARMS.items():
+    print(_ts() + f"validate_arms OK: {len(arms)} arms, control={CONTROL}")
+    print(_ts() + f"  {'arm':12s} {'send body ms':>13s} {'ack body ms':>12s} "
+                  f"{'tail p':>7s} {'body sd':>9s} {'body CV':>8s}")
+    for k, v in arms.items():
         # the body mean of the send leg (decision + wire), before the tail
         send = v["decision_ms"] + v["wire_out_median_ms"]
         # the spread the body carries: 0 for a point mass, else the lognormal sd
@@ -219,8 +237,8 @@ def validate_arms():
     # the mean there is almost nothing left to vary, so the only way to reach a
     # given spread is an extreme sigma -- which stops being a BODY and becomes
     # a second tail. Say so rather than letting it pass silently.
-    head = BASE["wire_out_median_ms"] - LAT_FLOOR_MS
-    print(_ts() + f"  floor {LAT_FLOOR_MS:.1f} ms -> only {head:.1f} of the "
+    head = BASE["wire_out_median_ms"] - floor
+    print(_ts() + f"  floor {floor:.1f} ms -> only {head:.1f} of the "
                   f"{BASE['decision_ms']+BASE['wire_out_median_ms']:.0f} ms send leg can vary")
     if head < 10.0:
         print(_ts() + "  WARNING: under 10 ms of headroom. The shape arms need sigma")
@@ -264,9 +282,13 @@ def per_name_setting():
         # lean at 0.20
         elif cfg == "QT_2t@20":
             out[s] = dict(queue_skew_ticks=2.0, queue_skew_thresh=0.20)
-        # lean at 0.15 (the default bucket)
-        else:
+        # Accept the documented 0.15 label explicitly.
+        elif cfg == "QT_2t@15":
             out[s] = dict(queue_skew_ticks=2.0, queue_skew_thresh=0.15)
+        # Unknown labels must not silently change the shipped strategy.
+        else:
+            # Identify the affected symbol and assignment label.
+            raise ValueError(f"Unknown assignment label for {s}: {cfg}")
     # the per-name override table
     return out
 
@@ -288,7 +310,7 @@ def _mid_at(eq_t, eq_mid, t):
 
 # ------------------------------------------------------------ attribution --
 def _attr(dr, H):
-    """Net P&L, opened notional, TRUE capture, and the CROSSING counters.
+    """Net P&L, opened notional, equity-mid capture proxy, and the CROSSING counters.
 
     CAPTURE IS COMPUTED HERE, NOT READ FROM fifo_attribution.
     An earlier version did `per[b].get("capture", 0.0)` -- but that function
@@ -308,7 +330,7 @@ def _attr(dr, H):
     # no fills -> nothing more to measure
     if f is None or len(f) == 0:
         return net, 0.0, float("nan"), n_cross, sh_cross, 0.0
-    # ---- TRUE CAPTURE: the half-spread earned at the instant of each fill.
+    # ---- LEGACY CAPTURE PROXY: the half-spread earned at the instant of each fill.
     # cap = sign * (mid_at_fill - price) * qty. A buy below the mid is positive,
     # a sell above the mid is positive. A CROSSING fill is on the WRONG side of
     # the mid, so this is the column that shows the damage.
@@ -326,9 +348,12 @@ def _attr(dr, H):
         for r in f.itertuples(index=False):
             # the mid in force when this fill happened
             m = _mid_at(eq_t, eq_mid, float(r.t))
-            # no mid -> this fill contributes nothing measurable
-            if m != m:
-                continue
+            # An unavailable fill mid invalidates the cell capture proxy.
+            if not np.isfinite(m):
+                # Preserve missingness rather than returning partial capture.
+                cap = float("nan")
+                # No later fill can repair this missing observation.
+                break
             # +1 if we bought, -1 if we sold
             sgn = 1.0 if r.side == "BUY" else -1.0
             # the half-spread earned (or paid, when negative)
@@ -369,17 +394,36 @@ def _attr(dr, H):
 _R = None; _H = None; _C = None
 
 
-def _init(calib):
-    # module handles set once per worker
-    global _R, _H, _C
-    # driver + harness
+# Install the parent's selected configuration before processing any job.
+def _init(calib, options):
+    # These values are private to this spawned process.
+    global _R, _H, _C, ARMS, SEEDS, LAT_FLOOR_MS
+    # Copy complete parameter dictionaries, not just arm names.
+    ARMS = deepcopy(options['arms'])
+    # Preserve the exact selected seed list.
+    SEEDS = list(options['seeds'])
+    # Preserve the selected shape floor as well as the derived sigmas.
+    LAT_FLOOR_MS = options['floor']
+    # Keep the parent-loaded calibration bundle unchanged.
+    _C = calib
+    # Tests can verify spawn transport without loading raw data dependencies.
+    if calib is None:
+        # Return only after installing the same configuration used by real jobs.
+        return
+    # Import replay dependencies after installing worker settings.
     import run_legacy_mm as R, mm_harness as H
-    # local parsed store
+    # Use the canonical parsed store for this process.
     R.PARSED_ROOT = PARSED_ROOT
-    # micro strategy path
+    # Select the existing micro strategy.
     R.USE_MICRO = True
-    # stash
-    _R = R; _H = H; _C = calib
+    # Retain the module handles for subsequent cells.
+    _R, _H = R, H
+
+
+# Return the settings actually visible in a worker process.
+def _worker_settings(_=None):
+    # Include parameter values so matching labels cannot hide a different experiment.
+    return {'arms': deepcopy(ARMS), 'seeds': list(SEEDS), 'floor': LAT_FLOOR_MS}
 
 
 def _one(arm, lat_kw, seed, date, sym, dsets):
@@ -424,36 +468,42 @@ def _one(arm, lat_kw, seed, date, sym, dsets):
                 crossed_shares=shcx, crossed_value=vcx)
 
 
+# Replay one complete date using the explicitly initialized experiment.
 def _work(job):
-    """One date, all arms, all seeds, all symbols."""
-    # unpack
+    # Jobs retain the original date-level scheduling granularity.
     date = job
-    # open the day's datasets once and reuse across every arm
+    # Open the historical market data once for this date.
     dsets = _R.open_datasets(date)
-    # a missing day contributes nothing
+    # Keep successful cells and failures separate.
+    rows, errors = [], []
+    # Missing input data must remain visible in the final run status.
     if dsets is None:
-        return []
-    # accumulated rows
-    rows = []
-    # each arm
-    for arm, lat_kw in ARMS.items():
-        # each seed
-        for seed in SEEDS:
-            # each name in the sweep universe
-            for sym in _C["universe"]:
-                #print symbol and date
-                print(_ts() + f" {arm=}, lat_kw_length={len(lat_kw)}, {seed=}, {sym=}, {date=}")
-                # a data error on one cell must not kill the run
-                try:
-                    r = _one(arm, lat_kw, seed, date, sym, dsets)
-                except Exception as e:
-                    print(_ts() + f"SKIP {arm}/s{seed} {date} {sym}: {e!r}")
-                    continue
-                # keep populated rows
-                if r is not None:
-                    rows.append(r)
-    # this date's rows
-    return rows
+        # Record the date-level failure rather than returning an empty success.
+        errors.append({'date': str(date), 'error': 'missing datasets'})
+    # Run only when all required date partitions exist.
+    else:
+        # Iterate the exact selected arm dictionaries received from the parent.
+        for arm, lat_kw in ARMS.items():
+            # Iterate only the selected seeds.
+            for seed in SEEDS:
+                # Evaluate every symbol in the declared universe.
+                for sym in _C['universe']:
+                    # Isolate failures while retaining their identities for audit.
+                    try:
+                        # Reuse the existing strategy and simulated exchange.
+                        row = _one(arm, lat_kw, seed, date, sym, dsets)
+                        # Treat an unrunnable cell as missing coverage, not zero profit.
+                        if row is None:
+                            # Refuse a silent exclusion from the compared portfolios.
+                            raise ValueError('cell unavailable: calibration, data, or P&L missing')
+                        # Retain the completed experiment cell.
+                        rows.append(row)
+                    # Record ordinary replay errors without hiding missing cells.
+                    except Exception as exc:
+                        # Preserve the complete failing cell key and reason.
+                        errors.append({'arm': arm, 'seed': seed, 'symbol': sym, 'date': str(date), 'error': repr(exc)})
+    # Acknowledge the actual settings used, even if the date had no usable data.
+    return {'date': str(date), 'settings_sha256': digest(_worker_settings()), 'rows': rows, 'errors': errors}
 
 
 # -------------------------------------------------------------- calibration -
@@ -478,156 +528,151 @@ def _calib():
 
 
 # ------------------------------------------------------------- the report --
+# Report saved cells using market dates as the sampling units.
 def _report(df):
-    """Paired, day-as-unit, against the production control."""
-    # daily portfolio totals per arm (seeds pooled into the same day)
-    g = (df.groupby(["arm", "seed", "date"], as_index=False)
-           .agg(pkr=("net_pkr", "sum"), opn=("opened_notional", "sum"),
-                cap=("capture_pkr", "sum"), cx=("crossed_orders", "sum"),
-                cxv=("crossed_value", "sum")))
-    # daily net bps -- a rate, not a level
-    g["bps"] = np.where(g["opn"] > 0, g["pkr"] / g["opn"] * 1e4, np.nan)
-    # daily capture bps, the mechanism column
-    g["cap_bps"] = np.where(g["opn"] > 0, g["cap"] / g["opn"] * 1e4, np.nan)
-    # crossed value as a share of traded value, the frequency column
-    g["cx_pct"] = np.where(g["opn"] > 0, g["cxv"] / g["opn"] * 100.0, np.nan)
-    # A DEAD COLUMN IS WORSE THAN A MISSING ONE. If capture never varies, say
-    # so instead of printing a tidy column of zeros that looks like a finding.
-    cap_all = df["capture_pkr"]
-    if cap_all.isna().all():
-        print(_ts() + "\n  !! capture_pkr is ALL NaN -- the equity path was empty.")
-        print(_ts() + "     The mechanism column is not measured. Fix before reading P&L.")
-    elif float(cap_all.abs().max()) == 0.0:
-        print(_ts() + "\n  !! capture_pkr is ALL ZERO -- that is a bug, not a result.")
-        print(_ts() + "     Do not read the capture column in this run.")
-    # the per-arm summary
-    print(_ts() + "\n===== LATENCY SWEEP: level, mechanism, and frequency =====")
-    print(_ts() + f"  {'arm':12s} {'net bps':>9s} {'capture bps':>12s} "
-                  f"{'crossed % of traded value':>26s} {'net PKR':>14s}")
-    # one line per arm, seeds pooled
-    for arm in ARMS:
-        a = g[g["arm"] == arm]
-        if len(a) == 0:
-            continue
-        print(_ts() + f"  {arm:12s} {a['bps'].mean():>9.3f} {a['cap_bps'].mean():>12.3f} "
-                      f"{a['cx_pct'].mean():>26.3f} {a['pkr'].sum():>14,.0f}")
-    # the paired comparison: same day, same seed, arm minus control
-    print(_ts() + "\n===== PAIRED vs the production control (same day, same seed) =====")
-    print(_ts() + f"  {'arm':12s} {'d net bps':>10s} {'se':>7s} {'t':>8s} "
-                  f"{'d capture bps':>14s} {'n pairs':>8s}")
-    # the control's own series, keyed by (seed, date)
-    ctl = g[g["arm"] == CONTROL].set_index(["seed", "date"])
-    # every other arm
-    for arm in ARMS:
-        if arm == CONTROL:
-            continue
-        # this arm's series on the same key
-        a = g[g["arm"] == arm].set_index(["seed", "date"])
-        # the days both produced
-        idx = a.index.intersection(ctl.index)
-        # not enough to test
-        if len(idx) < 3:
-            continue
-        # paired differences
-        d = (a.loc[idx, "bps"] - ctl.loc[idx, "bps"]).dropna()
-        dc = (a.loc[idx, "cap_bps"] - ctl.loc[idx, "cap_bps"]).dropna()
-        # mean, standard error, t
-        m = d.mean(); se = d.std(ddof=1) / np.sqrt(len(d)); t = m / se if se > 0 else np.nan
-        print(_ts() + f"  {arm:12s} {m:>10.3f} {se:>7.3f} {t:>8.2f} "
-                      f"{dc.mean():>14.3f} {len(d):>8d}")
-    # the power statement, printed BESIDE the result rather than argued after
-    sd = (g[g["arm"] == CONTROL]["bps"]).std(ddof=1)
-    n = len(ctl)
-    print(_ts() + f"\n  control daily bps sd = {sd:.3f}; with n={n} pairs the smallest")
-    print(_ts() + f"  effect this run can resolve at |t|=2 is "
-                  f"{2*sd/np.sqrt(max(n,1)):.3f} bps/day. A 'flat' reading below")
-    print(_ts() + "  that number means 'not measured', not 'not there'.")
-    # what to conclude, written before the numbers are seen
-    print(_ts() + "\n  PRE-REGISTERED READING: if net bps falls monotonically as latency")
-    print(_ts() + "  rises AND capture bps falls with it AND crossed % rises with it,")
-    print(_ts() + "  the mechanism is confirmed and the old 'latency-robust' note is")
-    print(_ts() + "  dead. If net moves but crossing does not, something else is doing")
-    print(_ts() + "  the work and this sweep has not found it.")
-    # the tidy daily frame, for plotting
-    return g
+    # Compute seed-level daily output and seed-averaged paired statistics.
+    daily, dates, summary = analyse_cells(df)
+    # Print corrected totals without summing simulations into fictitious P&L.
+    print(summary.to_string(index=False))
+    # Preserve the existing daily-table return contract.
+    return daily
 
 
 # ------------------------------------------------------------------- run ---
-def run_real(workers=WORKERS, max_days=MAX_DAYS, group="level", seeds=None,
-             floor=None):
-    # narrow to the chosen stage, always keeping the control so pairing works
-    global ARMS, SEEDS, LAT_FLOOR_MS
-    # a different floor changes what every shape arm means, so rebuild them
-    if floor is not None and floor != LAT_FLOOR_MS:
-        LAT_FLOOR_MS = float(floor)
-        add_shape_arms(LAT_FLOOR_MS)
-        print(_ts() + f"  floor set to {LAT_FLOOR_MS:.1f} ms -> shape arms rebuilt")
-    if group != "all":
-        keep = GROUPS[group]
-        # the control is mandatory in every stage
-        if CONTROL not in keep:
-            keep = [CONTROL] + keep
-        # rebuild the arm table in the group's order
-        ARMS = {k: ARMS[k] for k in keep}
-    # seeds can be cut for a first pass and raised for the confirmation
-    if seeds:
-        SEEDS = list(range(seeds))
-    # fail before spending hours
-    validate_arms()
-    # say what this will cost BEFORE it starts, using the measured throughput
-    # of the 113-name run (66,783 cells in 600.5 min at 9 workers)
-    print(_ts() + f"  stage '{group}': {len(ARMS)} arms x {len(SEEDS)} seeds")
-    # calibration pre-pass
-    print(_ts() + "pre-pass: calibration")
-    calib, all_dates = _calib()
-    # drop the trailing-median warm-up, then subsample
-    dates = all_dates[TRAIL_DAYS:]
-    # even subsample
-    if max_days and len(dates) > max_days:
-        step = max(1, len(dates) // max_days); dates = dates[::step][:max_days]
-    # the run identity: arms + seeds + names + dates + engine, so a resumed or
-    # re-plotted result can never be a union of two different definitions
-    import mm_backtest as _mb, micro_mm as _mm, inspect
-    eng = hashlib.sha1(
-        (inspect.getsource(_mb) + inspect.getsource(_mm)).encode()).hexdigest()[:12]
-    tag = hashlib.sha1(repr((sorted(ARMS), SEEDS, calib["universe"],
-                             dates, eng)).encode()).hexdigest()[:8]
-    # announce the plan
-    print(_ts() + f"  engine {eng} | tag {tag}")
-    # total cells and an up-front time estimate, so a 34-hour run announces
-    # itself rather than being discovered at hour three
-    cells = len(calib["universe"]) * len(dates) * len(ARMS) * len(SEEDS)
-    # measured throughput of the 113-name run: 66,783 cells in 600.5 minutes
-    hours = cells / 111.2 / 60.0
-    print(_ts() + f"  {len(calib['universe'])} names x {len(dates)} dates x "
-                  f"{len(ARMS)} arms x {len(SEEDS)} seeds = {cells:,} cells")
-    print(_ts() + f"  ESTIMATED {hours:.1f} hours at the measured 111 cells/min "
-                  f"({workers} workers). Ctrl-C now if that is wrong.")
-    # collect + clock
-    rows = []; t0 = time.perf_counter()
-    # pool over dates
-    with Pool(processes=workers, initializer=_init, initargs=(calib,)) as pool:
-        done = 0
-        for res in pool.imap_unordered(_work, dates):
-            rows.extend(res); done += 1
-            el = (time.perf_counter() - t0) / 60.0
-            print(_ts() + f"  date {done}/{len(dates)} ({el:.1f} min, "
-                          f"ETA {el/done*(len(dates)-done):.1f} min)")
-    # nothing produced
-    if not rows:
-        print(_ts() + "no rows."); return
-    # the per-cell frame
-    df = pd.DataFrame(rows)
-    # ensure the output directory
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    # write the cell-level artifact with the tag in its name
-    df.to_csv(OUT_DIR / f"latency_sweep_{tag}.csv", index=False)
-    # the paired report, and the daily frame it built
-    g = _report(df)
-    # the daily series too, for plotting
-    g.to_csv(OUT_DIR / f"latency_sweep_daily_{tag}.csv", index=False)
-    # where it went
-    print(_ts() + f"\n  outputs -> {OUT_DIR} (tag {tag})")
+# Build a fresh selection without narrowing the module's master arm table.
+def selected_options(group='level', seeds=3, floor=20.0):
+    # Validate command-line settings before any expensive data preparation.
+    if group not in GROUPS or seeds < 1 or not np.isfinite(floor) or floor < 0 or floor >= BASE['wire_out_median_ms']:
+        # Reject floors with no headroom for the defined shape experiments.
+        raise ValueError('Require a known arm group, seeds >= 1, and 0 <= shape floor < 40 ms')
+    # Start from all original non-shape arms on every invocation.
+    arms = {k: deepcopy(v) for k, v in ALL_ARMS.items() if not k.startswith('cv')}
+    # Recompute shape parameters using the selected floor.
+    for cv in TARGET_CVS:
+        # Solve sigma from the desired send-body coefficient of variation.
+        sigma = sigma_for_cv(cv, floor)
+        # Store the complete effective latency-model arguments.
+        arms[f'cv{int(cv*100)}'] = arm_kwargs(wire_out_sigma=sigma, wire_in_sigma=sigma, latency_floor_ms=floor)
+    # Select only the requested stage, with the control retained.
+    chosen = list(arms) if group == 'all' else GROUPS[group]
+    # Return a serializable object shared by parent, workers, and manifest.
+    return {'arms': {k: arms[k] for k in chosen}, 'seeds': list(range(seeds)), 'floor': float(floor)}
+
+
+# Execute a new experiment with explicit spawn-safe settings and strict coverage.
+def run_real(workers=WORKERS, max_days=MAX_DAYS, group='level', seeds=3, floor=20.0, output_dir=None, heartbeat_seconds=30.0):
+    # Refuse nonsensical worker and sampling settings immediately.
+    if workers < 1 or max_days < 0:
+        # Zero days means all eligible dates; negative dates are never meaningful.
+        raise ValueError('Require workers >= 1 and days >= 0')
+    # Resolve the actual experiment before starting the calibration pass.
+    options = selected_options(group, seeds, floor)
+    # Validate and print the actual settings, including full arm parameters.
+    validate_arms(options['arms'], options['floor'])
+    # State the scope before a potentially slow calibration pass.
+    print(_ts() + f" stage {group}: {len(options['arms'])} arms x {len(options['seeds'])} seeds")
+    # Keep stdout visible during calibration and between date completions.
+    with Heartbeat(heartbeat_seconds) as heartbeat:
+        # Identify the longest startup stage to the operator.
+        heartbeat.stage = 'calibration and trailing-size pre-pass'
+        # Detect an assignment edit during the pre-pass.
+        assignment_before = file_digest(ASSIGNMENT)
+        # Load the same effective calibration used by the existing sweep.
+        calib, all_dates = _calib()
+        # Reject a run whose assignment changed during setup.
+        if assignment_before != file_digest(ASSIGNMENT):
+            # Avoid attributing old settings to a new assignment hash.
+            raise RuntimeError('Assignment changed during calibration; restart with stable input')
+        # Exclude the trailing-calibration warm-up dates.
+        dates = all_dates[TRAIL_DAYS:]
+        # Preserve the original evenly spaced subsampling rule for comparability.
+        if max_days and len(dates) > max_days:
+            # Use the same sampling stride as the existing runner.
+            step = max(1, len(dates) // max_days)
+            # Keep no more than the selected number of dates.
+            dates = dates[::step][:max_days]
+        # Refuse an empty experiment before creating output artifacts.
+        if not dates or not calib['universe']:
+            # Explain that no simulation work can be performed.
+            raise ValueError('No eligible dates or symbols after warm-up')
+        # Hash the source modules directly controlling the simulation and its inputs.
+        modules = {name: importlib.import_module(name) for name in ('mm_backtest', 'micro_mm', 'mm_harness', 'run_legacy_mm', 'snapshot_prep', 'halt_state', 'config_pk', 'latency_sweep_support')}
+        # Include this exact runner whether invoked as a module or a script.
+        modules['latency_sweep'] = sys.modules[__name__]
+        # Preserve experiment constants and effective engine/strategy defaults.
+        constants = {'clip_mult': CLIP_MULT, 'trail_days': TRAIL_DAYS, 'cheap_excluded': sorted(CHEAP_EXCLUDED), 'parsed_root': str(PARSED_ROOT), 'engine_cfg': modules['run_legacy_mm'].CFG, 'micro_params': modules['run_legacy_mm'].MICRO_PARAMS}
+        # Build the experiment identity from full parameters and loaded values.
+        identity = provenance(options['arms'], options['seeds'], floor, dates, calib, ASSIGNMENT, modules, constants)
+        # Use a parameter-sensitive identifier rather than hashing labels alone.
+        tag = digest(identity)[:16]
+        # Keep each attempt separate even when its experiment identity is the same.
+        destination = Path(output_dir) if output_dir else OUT_DIR / f"latency_sweep_{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        # Refuse to overwrite a previous attempt.
+        destination.mkdir(parents=True, exist_ok=False)
+        # Initialize a machine-readable run status before workers start.
+        manifest = {'experiment_sha256': digest(identity), 'identity': identity, 'workers': workers, 'start_method': 'spawn', 'status': 'running'}
+        # Store the initial manifest for interrupted-run diagnosis.
+        (destination / 'manifest.json').write_text(json.dumps(manifest, indent=2, default=str))
+        # Count every cell that must be present for a passing comparison.
+        expected = len(dates) * len(calib['universe']) * len(options['arms']) * len(options['seeds'])
+        # Display the actual work count without promising a stale runtime estimate.
+        print(_ts() + f" {len(calib['universe'])} names x {len(dates)} dates x {len(options['arms'])} arms x {len(options['seeds'])} seeds = {expected:,} cells")
+        # State where partial evidence and the final report will be written.
+        print(_ts() + f' outputs -> {destination}')
+        # Accumulate completed rows and explicit failures.
+        rows, errors = [], []
+        # Preserve completed-date evidence if the process is interrupted later.
+        try:
+            # Use spawn on every platform so transport behavior is tested consistently.
+            with get_context('spawn').Pool(processes=workers, initializer=_init, initargs=(calib, options)) as pool:
+                # Consume dates as they complete, without blocking the heartbeat thread.
+                for done, result in enumerate(pool.imap_unordered(_work, dates), 1):
+                    # Verify the actual worker settings, not just the parent banner.
+                    if result['settings_sha256'] != digest(options):
+                        # A mismatched experiment must never enter the report.
+                        raise RuntimeError('Worker settings do not match the parent experiment')
+                    # Retain all successful cells from this date.
+                    rows.extend(result['rows'])
+                    # Retain every failed or unavailable cell.
+                    errors.extend(result['errors'])
+                    # Write completed-date rows without waiting for the whole experiment.
+                    pd.DataFrame(result['rows']).to_csv(destination / f"cells_{done:04d}.csv", index=False)
+                    # Write the current failure ledger after every date.
+                    (destination / 'errors.json').write_text(json.dumps(errors, indent=2))
+                    # Update the heartbeat with concrete completion counts.
+                    heartbeat.stage = f"replay: {done}/{len(dates)} dates, {len(rows):,}/{expected:,} cells, {len(errors)} failures"
+                    # Emit immediate progress in addition to the periodic heartbeat.
+                    print(_ts() + ' ' + heartbeat.stage)
+            # Retain the detailed output even when the experiment is incomplete.
+            df = pd.DataFrame(rows)
+            # Save completed cells before enforcing the pass condition.
+            df.to_csv(destination / 'cells.csv', index=False)
+            # Refuse to present incomplete portfolios as a passing comparison.
+            if errors or len(rows) != expected:
+                # Direct the user to the retained failure evidence.
+                raise RuntimeError(f'Incomplete sweep: {len(rows)}/{expected} cells; inspect errors.json')
+            # Identify the reporting phase for the heartbeat.
+            heartbeat.stage = 'validating coverage and writing paired statistics'
+            # Save corrected statistics without rerunning simulation or changing fills.
+            write_report(df, destination / 'report', source=destination / 'cells.csv')
+            # Mark the run complete only after reporting succeeds.
+            manifest['status'] = 'complete'
+        # Record interrupted and failed attempts, including their reason.
+        except BaseException as exc:
+            # Preserve a failed status instead of leaving a false success marker.
+            manifest['status'] = 'failed'
+            # Save the exception for post-run inspection.
+            manifest['error'] = repr(exc)
+            # Propagate failure to the terminal exit code.
+            raise
+        # Finalize run status regardless of success or failure.
+        finally:
+            # Record the achieved coverage alongside the planned workload.
+            manifest['completed_cells'] = len(rows)
+            # Record the expected coverage used by the pass condition.
+            manifest['expected_cells'] = expected
+            # Persist the final status without removing partial artifacts.
+            (destination / 'manifest.json').write_text(json.dumps(manifest, indent=2, default=str))
 
 
 # one symbol-day per arm, to check wiring on real data
@@ -719,60 +764,77 @@ def self_test():
     print(_ts() + "[self-test] ALL ASSERTIONS PASSED.")
 
 
-# entry point
-if __name__ == "__main__":
+# Parse CLI options only in the parent process.
+if __name__ == '__main__':
+    # Build one command-line interface for replay and saved-result analysis.
     ap = argparse.ArgumentParser()
-    ap.add_argument("--self-test", action="store_true")
-    ap.add_argument("--smoke", action="store_true")
-    ap.add_argument("--run", action="store_true")
-    ap.add_argument("--days", type=int, default=MAX_DAYS)
-    ap.add_argument("--workers", type=int, default=WORKERS)
-    # which stage to run; see GROUPS. Default is the level question.
-    ap.add_argument("--arms", default="level", choices=sorted(GROUPS))
-    # number of latency seeds; 1 for a first pass, 3 to confirm
-    ap.add_argument("--seeds", type=int, default=len(SEEDS))
-    # the measured minimum one-way latency. Changing it re-solves every sigma.
-    ap.add_argument("--floor", type=float, default=LAT_FLOOR_MS)
+    # Prevent combining a report with a new replay accidentally.
+    mode = ap.add_mutually_exclusive_group()
+    # Run lightweight latency-model checks without loading historical market data.
+    mode.add_argument('--self-test', action='store_true')
+    # Replay one liquid symbol-day using the selected arm group.
+    mode.add_argument('--smoke', action='store_true')
+    # Start a new full historical sweep only when requested explicitly.
+    mode.add_argument('--run', action='store_true')
+    # Reanalyse an existing cell-level CSV without another exchange replay.
+    mode.add_argument('--report', type=Path)
+    # Preview selected settings and verify a spawned worker without market data.
+    mode.add_argument('--dry-run', action='store_true')
+    # Retain the existing sampled-date count option; zero means all eligible dates.
+    ap.add_argument('--days', type=int, default=MAX_DAYS)
+    # Retain explicit worker-count control.
+    ap.add_argument('--workers', type=int, default=WORKERS)
+    # Select a named family of latency experiments.
+    ap.add_argument('--arms', default='level', choices=sorted(GROUPS))
+    # Select the number of Monte Carlo seeds used on each date.
+    ap.add_argument('--seeds', type=int, default=3)
+    # Set the floor used only by the shape experiments.
+    ap.add_argument('--floor', type=float, default=20.0)
+    # Choose a new output directory rather than overwriting previous results.
+    ap.add_argument('--output-dir', type=Path)
+    # Bound the interval between parent-process progress messages.
+    ap.add_argument('--heartbeat-seconds', type=float, default=30.0)
+    # Generate a chart when reanalysing saved results.
+    ap.add_argument('--plot', action='store_true')
+    # Parse the current command line.
     a = ap.parse_args()
-    # apply the floor before anything prints an arm table
-    if a.floor != LAT_FLOOR_MS:
-        LAT_FLOOR_MS = a.floor
-        add_shape_arms(LAT_FLOOR_MS)
-    if a.smoke:
+    # Reanalysis derives arms and seeds from the CSV, never CLI defaults.
+    if a.report:
+        # Generate a unique output path unless the user selected one.
+        destination = a.output_dir or OUT_DIR / f"latency_report_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        # Read existing observations and produce corrected statistics only.
+        write_report(pd.read_csv(a.report), destination, source=a.report, plot=a.plot)
+    # Verify worker transport before committing to an expensive run.
+    elif a.dry_run:
+        # Resolve complete effective settings locally.
+        options = selected_options(a.arms, a.seeds, a.floor)
+        # Print selected arm and latency parameters.
+        validate_arms(options['arms'], options['floor'])
+        # Use the real initializer under the same explicit spawn context as production runs.
+        with get_context('spawn').Pool(1, initializer=_init, initargs=(None, options)) as pool:
+            # Ask the worker which settings it actually received.
+            received = pool.apply(_worker_settings)
+        # Fail if any parameter, seed, or floor changed in transit.
+        if digest(received) != digest(options):
+            # Prevent a parent-only configuration from appearing to pass.
+            raise RuntimeError('Spawned worker settings mismatch')
+        # Confirm the exact tested worker configuration.
+        print(f"Spawn check passed: {len(received['arms'])} arms; seeds={received['seeds']}; shape floor={received['floor']} ms")
+    # Historical replay is opt-in and receives every CLI setting explicitly.
+    elif a.run:
+        # Start the requested sweep with no hidden inherited globals.
+        run_real(a.workers, a.days, a.arms, a.seeds, a.floor, a.output_dir, a.heartbeat_seconds)
+    # Smoke uses the same selected arm parameters as a full run.
+    elif a.smoke:
+        # Resolve the requested subset before the one-day replay.
+        options = selected_options(a.arms, a.seeds, a.floor)
+        # Install the same settings on the direct-call smoke path.
+        _init(None, options)
+        # Reuse the existing liquid-symbol wiring check.
         smoke()
-    elif a.self_test or not a.run:
+    # No run mode defaults to offline model checks.
+    else:
+        # Install all arms because model self-tests exercise level, tail, and shape.
+        _init(None, selected_options('all', a.seeds, a.floor))
+        # Run the retained offline latency-model assertions.
         self_test()
-    if a.run:
-        run_real(workers=a.workers, max_days=a.days, group=a.arms, seeds=a.seeds,
-                 floor=a.floor)
-
-# ============================================================================
-# THE ENGINE CHANGE THIS SWEEP CANNOT MAKE FOR YOU
-# ----------------------------------------------------------------------------
-# The body of the distribution has ZERO variance: 98% of messages take exactly
-# 45.0 ms. Real network latency has a body with spread -- a lognormal or gamma
-# shape -- and the spread matters here specifically, because whether an order
-# arrives marketable depends on how far the price moved during ITS flight, not
-# during the average flight. A constant body understates the frequency of both
-# the early and the late arrivals.
-#
-# To test that, LatencyModel needs one more parameter. In mm_backtest.py,
-# LatencyModel.draw_out currently reads:
-#
-#     base = self.decision_ms + self.wire_out_median_ms
-#     if self.rng.random() < self.tail_prob:
-#         base += self.rng.exponential(self.wire_out_tail_ms)
-#     return base
-#
-# The production version draws the body as well:
-#
-#     base = self.decision_ms + self.rng.lognormal(
-#         mean=np.log(self.wire_out_median_ms), sigma=self.wire_out_sigma)
-#     if self.rng.random() < self.tail_prob:
-#         base += self.rng.exponential(self.wire_out_tail_ms)
-#     return base
-#
-# with wire_out_sigma=0.0 reproducing today's behaviour exactly, so the change
-# is byte-identical until an arm turns it on. Do NOT fit sigma from a guess --
-# it comes from FIX gateway timestamps once the live feed is running.
-# ============================================================================
