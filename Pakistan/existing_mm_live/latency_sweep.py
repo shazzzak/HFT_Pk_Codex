@@ -441,6 +441,8 @@ def _work(job):
         for seed in SEEDS:
             # each name in the sweep universe
             for sym in _C["universe"]:
+                #print symbol and date
+                print(_ts() + f" {arm=}, lat_kw_length={len(lat_kw)}, {seed=}, {sym=}, {date=}")
                 # a data error on one cell must not kill the run
                 try:
                     r = _one(arm, lat_kw, seed, date, sym, dsets)
