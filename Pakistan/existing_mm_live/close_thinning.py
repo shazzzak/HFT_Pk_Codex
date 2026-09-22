@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # close_thinning.py -- WHEN do books go one-sided before the bell?
 # Decides whether "cross to flatten at T-120s" can work: on the days that CLOSED
 # one-sided, was the book already one-sided at T-120s (no counterparty ever ->
@@ -29,7 +31,8 @@ import run_legacy_mm as R
 from mm_backtest import Book
 
 # point the driver at the parsed data root on this machine
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # symbols under study
 SYMBOLS = ["PPL", "UBL"]
 # how many seconds before the close to study

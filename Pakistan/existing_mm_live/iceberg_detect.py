@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # iceberg_detect.py -- iceberg / hidden-refill detector.
 # Rides the ALREADY-reconstructed order book (mm_backtest.Book, driven by
@@ -37,9 +39,11 @@ def _ts():
 
 
 # directory for diagnostic outputs
-OUT_DIR = Path("/Users/shazzak/Capital Stake - Results/diagnostics")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+OUT_DIR = Path(str(_hft_paths.RESULTS_ROOT / 'diagnostics'))
 # local parsed store (run_legacy_mm's default points at Google Drive, which is empty)
-LOCAL_STORE = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+LOCAL_STORE = Path(str(_hft_paths.PARSED_ROOT))
 # a refill must arrive within this many milliseconds of the level being hit
 REFILL_MS = 100
 # a sweep counts as low-impact if it printed at this many price levels or fewer

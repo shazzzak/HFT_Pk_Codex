@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # diag_spread_by_bucket.py -- MEASURE, don't assume: what are PSX touch spreads
 # on the top-10 spot names, by session bucket? Answers SZ's question directly:
 # "PSX spreads are typically not that narrow, so the tight-book viability bypass
@@ -27,7 +29,8 @@ import pandas as pd
 import run_legacy_mm as R
 import mm_harness as H
 
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 
 # ------------------------------ config ---------------------------------------
 # top-10 spot names (the working watchlist)

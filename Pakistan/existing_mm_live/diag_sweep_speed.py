@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # diag_sweep_speed.py -- find WHY each backtest is slow. Times one symbol-day's
 # stages, audits event-stream dtypes (the datetime-object-cast hypothesis), and
@@ -25,9 +27,11 @@ import persist_fills as PF
 import fill_attribution as FA
 
 # raw store
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # feature store
-FS = Path("/Users/shazzak/Capital Stake - Results/feature_store")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FS = Path(str(_hft_paths.RESULTS_ROOT / 'feature_store'))
 
 # one representative day + the high-fill symbol
 DATE, SYM = "2026-06-30", "PPL"

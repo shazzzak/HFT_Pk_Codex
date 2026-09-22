@@ -1,9 +1,12 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # describe_pace_features.py -- print the column names + types of PACE's feature
 # store, so we know exactly what's available for the session_scale back-solve.
 # Run from anywhere:  python describe_pace_features.py
 
 # glob for the PACE feature-store parquet files (Hive-style date=... files)
-PACE_GLOB = "/Users/shazzak/Capital Stake - Results/feature_store/PACE/*.parquet"
+# Resolve this filesystem path through the canonical checkout/data configuration.
+PACE_GLOB = str(_hft_paths.RESULTS_ROOT / 'feature_store/PACE/*.parquet')
 
 # try DuckDB first (matches the CLI DESCRIBE you asked for)
 try:

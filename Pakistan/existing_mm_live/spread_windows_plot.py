@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # spread_windows_plot.py -- time series of four spread measures for ONE symbol-day:
 #   1. avg spread over the trailing TIME_WINDOW_S seconds   (true rolling time window)
 #   2. avg spread over the trailing TICK_WINDOW ticks/events (true rolling count window)
@@ -26,7 +28,8 @@ import run_legacy_mm as R
 
 # ------------------------------- knobs (edit) --------------------------------
 # raw parsed store
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # which symbol to plot
 SYMBOL = "PACE"
 # which trading day (YYYY-MM-DD); pick a lock-heavy day for PACE

@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # pnl_tearsheet.py -- QuantStats tearsheets from the per-day P&L CSV produced by
 # daily_pnl_charts.py. Converts daily PKR P&L into daily RETURNS on a per-symbol
 # capital-at-risk base (max_inv x median price), because QuantStats' Sharpe/Sortino/
@@ -27,11 +29,13 @@ import quantstats as qs
 import run_legacy_mm as R
 
 # where daily_pnl_charts.py wrote its output
-PNL_DIR = Path("/Users/shazzak/Capital Stake - Results/daily_pnl")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+PNL_DIR = Path(str(_hft_paths.RESULTS_ROOT / 'daily_pnl'))
 # the per-day CSV
 CSV = PNL_DIR / "daily_pnl.csv"
 # feature store (for median price per symbol -> capital base)
-FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'feature_store'))
 # output dir for the tearsheets
 OUT_DIR = PNL_DIR / "tearsheets"
 # ensure it exists

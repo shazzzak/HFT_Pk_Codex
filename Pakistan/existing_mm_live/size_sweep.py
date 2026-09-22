@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # size_sweep.py -- HOW BIG should a quote be, per symbol? Sweeps the clip size:
 #   * fixed50            : the 50-share control (reproduces the stored MID+BOTH runs)
 #   * 0.5x .. 2.0x MEDIAN TRADE SIZE, where the median is computed per symbol from a
@@ -42,11 +44,14 @@ from micro_mm import MicrostructureMM
 import confirm_micro_vs_naive as C
 
 # raw store
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # feature store (Path B context)
-FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'feature_store'))
 # where outputs go (absolute; the CSV name carries the run timestamp)
-OUT_DIR = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+OUT_DIR = Path(str(_hft_paths.RESULTS_ROOT))
 
 # symbols under test (PACE included deliberately: it loses at any size -- the
 # sweep shows whether sizing changes that or just scales the loss)

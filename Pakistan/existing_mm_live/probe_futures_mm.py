@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # probe_futures_mm.py -- the mechanics the futures MM engine must get right,
 # that may DIFFER from spot. Read-only. Answers, per the active-month futures:
 #   1. tick size (spot is 0.01; futures may differ -> half-spread/edge math)
@@ -25,7 +27,8 @@ except Exception:
     PARSED = ""
 # fallback to the CURRENT literal only if config_pk did not supply one
 if not PARSED:
-    PARSED = "/Users/shazzak/HFT Data/Pakistan/Capital Stake - Parsed"
+    # Resolve this filesystem path through the canonical checkout/data configuration.
+    PARSED = str(_hft_paths.PARSED_ROOT)
 # fail loudly and immediately rather than inside a DuckDB glob 40 lines later
 if not Path(PARSED).is_dir():
     raise SystemExit(f"PARSED store not found: {PARSED}\n"

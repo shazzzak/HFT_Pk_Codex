@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # futures_sameday_flatten_run.py -- FUTURES MM with SAME-DAY FLATTEN + residual
 # spot hedge. Tests SZ's liquidity thesis: a liquid instrument lets you complete
 # round trips intraday (flatten at the close) -> near-zero drift -> clean spread;
@@ -70,9 +72,11 @@ except Exception:
     # config_pk not importable from this working directory
     _P = _Rr = None
 # the parsed store, as a Path (run_legacy_mm treats it as one)
-PARSED_ROOT = Path(_P) if _P else Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+PARSED_ROOT = Path(_P) if _P else Path(str(_hft_paths.PARSED_ROOT))
 # where result CSVs are written
-RESULTS = Path(_Rr) if _Rr else Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS = Path(_Rr) if _Rr else Path(str(_hft_paths.RESULTS_ROOT))
 # push the parsed store onto the driver module, as every other script does
 R.PARSED_ROOT = PARSED_ROOT
 # fail here, with the path named, rather than inside a DuckDB glob later

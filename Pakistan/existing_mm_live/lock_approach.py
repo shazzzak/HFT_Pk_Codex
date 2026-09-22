@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # lock_approach.py -- two measurements that set the cliff design from data, not guess:
 #   (1) BAND-IN-SPREADS per symbol: (limit_up - limit_dn) / (2 * median spread).
 #       This is the "runway" from mid-band to a lock. cliff = clip(0.10*runway, 3, 10).
@@ -25,7 +27,8 @@ import matplotlib.pyplot as plt
 import run_legacy_mm as R
 
 # raw store
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # the three run symbols: PACE (locky) + PPL/UBL (reference)
 SYMBOLS = ["PACE", "PPL", "UBL"]
 # tolerance (price units) for calling the touch "at" the published limit

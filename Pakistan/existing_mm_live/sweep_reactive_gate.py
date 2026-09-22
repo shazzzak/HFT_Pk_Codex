@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # sweep_reactive_gate.py -- DOES THE REACTIVE JUMP GATE ADD VALUE?
 #
 # PSX jumps have NO book precursor (validated), so we cannot predict them. This
@@ -38,9 +40,12 @@ from micro_mm import MicrostructureMM
 import confirm_micro_vs_naive as C
 
 # raw store + results
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
-FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
-RESULTS = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'feature_store'))
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS = Path(str(_hft_paths.RESULTS_ROOT))
 
 # ------------------------------ experiment knobs ------------------------------
 # SPLIT RUN part 1: the reject/blowup names (jumps hurt these most)

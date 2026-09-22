@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # run_markout.py -- TABLE B: after a run of k consecutive same-side aggressor
 # ORDERS (sweep-collapsed distinct orders), how much does price move IN THE RUN'S
@@ -40,9 +42,11 @@ def _ts():
 
 
 # NEW data store (moved this session)
-LOCAL_STORE = Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+LOCAL_STORE = Path(str(_hft_paths.PARSED_ROOT))
 # results root (watchlist name list)
-RESULTS_ROOT = Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS_ROOT = Path(str(_hft_paths.RESULTS_ROOT))
 # output directory
 OUT_DIR = RESULTS_ROOT / "diagnostics"
 # forward horizons in seconds (the ones SZ named)

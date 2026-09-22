@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # lock_distance_plot.py -- HOW MANY SPREADS is price from the 10% lock, over a day,
 # and WHEN does it breach the trigger threshold -- comparing two ways to measure it:
 #   * INSTANTANEOUS spread as the yardstick  (what the trigger uses today; jumpy)
@@ -27,7 +29,8 @@ import run_legacy_mm as R
 
 # ------------------------------- knobs (edit) --------------------------------
 # raw parsed store
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # which symbol
 SYMBOL = "PACE"
 # auto-pick the most informative day (most two-sided ticks that ACTUALLY breaches);
@@ -52,7 +55,8 @@ CLIFF_PCT = 0.5
 # skip days with fewer than this many two-sided ticks (degenerate/halt days)
 MIN_TICKS = 300
 # where the image goes (absolute, overwritten each run)
-OUT = Path("/Users/shazzak/Capital Stake - Results/exports/lock_distance.png")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+OUT = Path(str(_hft_paths.RESULTS_ROOT / 'exports/lock_distance.png'))
 # -----------------------------------------------------------------------------
 
 

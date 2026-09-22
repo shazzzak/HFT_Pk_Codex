@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # verify_snapshot_fix.py -- confirm the snapshot optimization preserves fills.
 # Run from existing_mm_live/:  python verify_snapshot_fix.py
 # WANT: 480 fills (unchanged) and a much lower time / higher events/sec.
@@ -12,7 +14,8 @@ from mm_backtest import Backtester, LatencyModel
 from micro_mm import MicrostructureMM
 
 # point loader at the raw store
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # one representative PPL day
 dsets = R.open_datasets("2026-06-30")
 # load the three tables

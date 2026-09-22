@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # analyze_bucket_attribution.py -- THIN CONSUMER of mm_harness.
 #
 # Replaces the standalone attribute_fills_fifo.py + decompose_buckets.py: all the
@@ -155,7 +157,8 @@ def main():
                       f"ETA {H._fmt(el/sd*(total-sd))}", flush=True)
 
     # the results directory
-    res = Path("/Users/shazzak/Capital Stake - Results")
+    # Resolve this filesystem path through the canonical checkout/data configuration.
+    res = Path(str(_hft_paths.RESULTS_ROOT))
     # the per-symbol-day panel as a frame
     ex = pd.DataFrame(exec_rows)
     # timestamped panel output path

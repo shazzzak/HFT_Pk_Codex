@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # trace_exit_fills.py -- the smallest possible check: does exit_ticks_inside=1
 # make our EXIT fills happen at self-harming prices, or is the P&L collapse an
 # accounting artifact? Reads the engine's OWN fills + equity + eod directly.
@@ -19,7 +21,8 @@ import pandas as pd
 import mm_harness as H
 import run_legacy_mm as R
 
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 
 # ------------------------------ config ---------------------------------------
 # one liquid name, one day (index into the trading calendar after the warmup)

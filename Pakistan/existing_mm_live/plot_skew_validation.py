@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # plot_skew_validation.py
 # Visual validation of the micro_mm.py inventory-skew fix.
 # Figure 1: EOD signed-position distribution per symbol, one overlaid histogram
@@ -144,7 +146,8 @@ def plot_pnl_gap(pnl_df, out_path="pnl_midmark_vs_liquidated.png"):
 # ------------------------------ entrypoint ---------------------------------
 if __name__ == "__main__":
     # default paths match confirm_micro_vs_naive.py's output directory.
-    _res = "/Users/shazzak/Capital Stake - Results"
+    # Resolve this filesystem path through the canonical checkout/data configuration.
+    _res = str(_hft_paths.RESULTS_ROOT)
     # override on CLI: python plot_skew_validation.py eod.csv pnl.csv
     eod_path = sys.argv[1] if len(sys.argv) > 1 else f"{_res}/eod_positions.csv"
     # second positional arg is the P&L summary CSV.

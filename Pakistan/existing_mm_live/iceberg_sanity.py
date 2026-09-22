@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # iceberg_sanity.py -- does M1/M2 "absorption" hold price, or was the depth illusory?
 # For every sweep we record the post-sweep mid and the mid 5s/30s/60s later, then
@@ -35,9 +37,11 @@ def _ts():
 
 
 # output directory
-OUT_DIR = Path("/Users/shazzak/Capital Stake - Results/diagnostics")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+OUT_DIR = Path(str(_hft_paths.RESULTS_ROOT / 'diagnostics'))
 # local parsed store (run_legacy_mm's default points at the empty Google Drive)
-LOCAL_STORE = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+LOCAL_STORE = Path(str(_hft_paths.PARSED_ROOT))
 # M1/M2 gate (same as the detector)
 M1_MAX = 2
 # minimum expected levels to count a sweep as "big"

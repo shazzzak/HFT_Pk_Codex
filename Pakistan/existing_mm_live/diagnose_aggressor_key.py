@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # diagnose_aggressor_key.py -- figure out which field identifies an aggressor
 # order, so the sweep-depth grouping is correct. Run from anywhere.
 #
@@ -16,7 +18,8 @@ pd.set_option("display.max_columns", 30)
 
 # the parsed trades glob -- hive layout is <ROOT>/trades/date=*/*.parquet
 # (table name comes BEFORE the date= partition, not after)
-GLOB = "/Users/shazzak/Capital Stake - Parsed/trades/date=*/*.parquet"
+# Resolve this filesystem path through the canonical checkout/data configuration.
+GLOB = str(_hft_paths.PARSED_ROOT / 'trades/date=*/*.parquet')
 # the symbol to inspect (liquid spot name)
 SYM = "UBL"
 

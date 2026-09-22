@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # calibrate_time_windows.py -- per-name EOD unwind windows from a PARTICIPATION cap.
 #
 # The rule (optimal-execution style, replaces the old fixed 5min/1min):
@@ -34,10 +36,13 @@ import run_legacy_mm as R
 import confirm_micro_vs_naive as C
 
 # raw store
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # shortlist + output dir
-WATCHLIST = Path("/Users/shazzak/Capital Stake - Results/mm_watchlist_final.csv")
-OUT_DIR = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+WATCHLIST = Path(str(_hft_paths.RESULTS_ROOT / 'mm_watchlist_final.csv'))
+# Resolve this filesystem path through the canonical checkout/data configuration.
+OUT_DIR = Path(str(_hft_paths.RESULTS_ROOT))
 
 # ------------------------------ policy knobs ---------------------------------
 # maximum participation of the closing volume we allow our unwind to be.

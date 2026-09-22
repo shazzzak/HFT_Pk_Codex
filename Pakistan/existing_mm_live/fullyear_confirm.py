@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # skew_sweep_2d.py -- 2D sweep of inventory-exit aggressiveness x OBI-defensive
 # skew, to test whether shortening hold time (the confirmed driver of diffusive
 # markout) and avoiding adverse-imbalance fills improves net edge.
@@ -77,8 +79,10 @@ def print(*args, **kwargs):
         _real_print(_ts(), *args, **kwargs)
 
 # store paths
-R.PARSED_ROOT = Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Parsed")
-RESULTS = Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS = Path(str(_hft_paths.RESULTS_ROOT))
 
 # ------------------------------ config ---------------------------------------
 # the top-10 production book

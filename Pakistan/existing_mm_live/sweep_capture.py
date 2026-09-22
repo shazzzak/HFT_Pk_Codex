@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # sweep_capture.py -- 2D capture calibration for micro on REAL queue fills,
 # full 207 days, per symbol. Sweeps min_edge_pct x improve_ticks.
@@ -34,11 +36,13 @@ import persist_fills as PF
 import fill_attribution as FA
 
 # raw store (moved location)
-PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # override loader root in-process
 R.PARSED_ROOT = PARSED_ROOT
 # feature store (context join source)
-FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'feature_store'))
 
 # pilot symbols
 SYMBOLS = ["PPL", "UBL"]
@@ -190,7 +194,8 @@ def main():
     # assemble
     df = pd.DataFrame(records)
     # save raw
-    out = Path("/Users/shazzak/Capital Stake - Results/capture_sweep.csv")
+    # Resolve this filesystem path through the canonical checkout/data configuration.
+    out = Path(str(_hft_paths.RESULTS_ROOT / 'capture_sweep.csv'))
     df.to_csv(out, index=False)
     # summary per (symbol, edge, improve)
     summary = (df.groupby(["symbol", "min_edge_pct", "improve_ticks"])
@@ -203,7 +208,8 @@ def main():
     # fee-hurdle flag
     summary["capture_ge_fee"] = summary["mean_capture"] >= FEE_RT_BPS
     # save summary
-    summary.to_csv(Path("/Users/shazzak/Capital Stake - Results/capture_sweep_summary.csv"), index=False)
+    # Resolve this filesystem path through the canonical checkout/data configuration.
+    summary.to_csv(Path(str(_hft_paths.RESULTS_ROOT / 'capture_sweep_summary.csv')), index=False)
     # per-symbol report
     for sym in SYMBOLS:
         # this symbol's grid

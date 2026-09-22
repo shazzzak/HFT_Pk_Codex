@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # daily_pnl_charts.py -- per-DAY P&L series for naive + micro configs, both symbols,
 # to expose whether a few outlier days (e.g. the Iran/oil halt days) dominate the
 # total P&L that the confirmation reported as an average.
@@ -23,9 +25,11 @@ from mm_backtest import Backtester, LatencyModel, NaiveSymmetricMM
 from micro_mm import MicrostructureMM
 
 # raw store
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # results dir for the CSV + charts
-OUT_DIR = Path("/Users/shazzak/Capital Stake - Results/daily_pnl")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+OUT_DIR = Path(str(_hft_paths.RESULTS_ROOT / 'daily_pnl'))
 # make sure it exists
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 

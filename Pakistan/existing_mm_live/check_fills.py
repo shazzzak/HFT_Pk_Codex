@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # check_fills.py
 # Reconciliation preview for the persisted real fills, BEFORE running attribution.
 # Confirms persist_fills.py produced 4 (strategy x symbol) fill sets and that the
@@ -10,7 +12,8 @@ import duckdb
 from pathlib import Path
 
 # Root of the persisted fills (outside the git project).
-FILLS_ROOT = Path("/Users/shazzak/Capital Stake - Results/fills")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FILLS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'fills'))
 
 # Known backtest fill counts (207 days) for the reconciliation check.
 # From the earlier full-period runs: attribution counts should match these.

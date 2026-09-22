@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # trades_by_phase.py -- is AFTER_HOUR_TRADING a real exit venue or just quote churn?
 # Decides how the corrected EOD flatten should mark: if after-hours has genuine
 # fixed-price executions, the realistic model flattens INTO after-hours at the
@@ -21,7 +23,8 @@ import numpy as np
 import run_legacy_mm as R
 
 # point the driver at the parsed data root
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # symbols under study
 SYMBOLS = ["PPL", "UBL"]
 # how many days to sample (a handful is plenty to characterise phases); None = all

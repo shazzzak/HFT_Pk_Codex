@@ -1,9 +1,12 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # futures_top20.py -- FIX for the broken top-20 query: trades/min across all
 # futures names in the most recent full month, to pick the tradeable universe.
 # Read-only. Run:  python futures_top20.py
 from pathlib import Path
 import duckdb, pandas as pd
-PARSED="/Users/shazzak/Capital Stake - Parsed"
+# Resolve this filesystem path through the canonical checkout/data configuration.
+PARSED=str(_hft_paths.PARSED_ROOT)
 con=duckdb.connect(); pd.set_option("display.width",170,"display.max_columns",30)
 TRADES=f"{PARSED}/trades/date=*/*.parquet"
 

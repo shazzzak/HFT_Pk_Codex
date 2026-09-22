@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # daily_pnl_plot.py -- is the P&L a steady grind or a few outlier days?
 # Reads the per-day P&L that confirm ALREADY saves: eod_positions.csv has one row
 # per (symbol, variant, date) and its 'liquidated' column IS that day's P&L in PKR
@@ -24,13 +26,15 @@ import matplotlib.pyplot as plt
 
 # ------------------------------- knobs (edit) --------------------------------
 # where confirm wrote the per-day file
-EOD_CSV = Path("/Users/shazzak/Capital Stake - Results/eod_positions.csv")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+EOD_CSV = Path(str(_hft_paths.RESULTS_ROOT / 'eod_positions.csv'))
 # which variants to draw (keep it few or the chart gets unreadable)
 VARIANTS = ["naive", "MID", "MID+BOTH"]
 # symbols to plot (one row of panels each)
 SYMBOLS = ["PPL", "UBL", "PACE"]
 # output image (absolute, overwritten)
-OUT = Path("/Users/shazzak/Capital Stake - Results/exports/daily_pnl.png")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+OUT = Path(str(_hft_paths.RESULTS_ROOT / 'exports/daily_pnl.png'))
 # -----------------------------------------------------------------------------
 
 

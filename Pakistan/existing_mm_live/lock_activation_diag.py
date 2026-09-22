@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # lock_activation_diag.py -- WHY does the lock trigger fire so often on names that
 # rarely lock? Replays the EXACT lock-zone math from micro_mm._trigger_state over
 # each continuous two-sided book snapshot and records, at every ramp/cliff
@@ -36,7 +38,8 @@ from micro_mm import (LOCK_START_FRAC, LOCK_START_MIN_SPR, LOCK_START_MAX_SPR,
                       LOCK_CLIFF_FRAC, LOCK_CLIFF_MIN_SPR, LOCK_CLIFF_MAX_SPR)
 
 # raw store
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # symbols: PACE (locky) + PPL/UBL (rarely lock -- where spurious fires would show)
 SYMBOLS = ["PPL", "UBL", "PACE"]
 # tolerance (price) for calling the touch pinned at the limit

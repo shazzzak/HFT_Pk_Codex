@@ -1,6 +1,6 @@
-# config.py -- single source of truth for every filesystem path the HFT scripts
+# config_pk.py -- single source of truth for every filesystem path the HFT scripts
 # use. Import from here instead of hardcoding strings at the top of each script:
-#     from config import PARSED_ROOT, RESULTS_ROOT, FEATURE_STORE, FILLS_DIR
+#     from config_pk import PARSED_ROOT, RESULTS_ROOT, FEATURE_STORE, FILLS_DIR
 # When you move machines or reorganise, change paths HERE only.
 #
 # NOTE on the two fills folders: FILLS_DIR points at the queue-position attribution
@@ -17,7 +17,11 @@ PARSED_ROOT = Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Parsed")
 # everything the backtests/tools write
 RESULTS_ROOT = Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results")
 # project code root
-PROJECT_ROOT = Path("/Users/shazzak/PycharmProjects/HFT")
+PROJECT_ROOT = Path("/Users/shazzak/PycharmProjects/HFT_Pk_Codex")
+# Country-specific code and the production application live in this checkout only.
+PAKISTAN_ROOT = PROJECT_ROOT / "Pakistan"
+# Generated Codex artifacts belong outside the source repository.
+CODEX_RESULTS_ROOT = Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results Codex")
 
 # ---------------------------------------------------- derived data paths -----
 # per-symbol feature store (feature_store/{SYM}/date=YYYY-MM-DD.parquet)

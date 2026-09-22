@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # throttle_markout_diagnostic.py
 # ----------------------------------------------------------------------------
@@ -67,10 +69,12 @@ import matplotlib.pyplot as plt
 
 # ---- paths (match the project layout) ----
 # feature store root: .../feature_store/{SYM}/date=YYYY-MM-DD/*.parquet
+# Resolve this filesystem path through the canonical checkout/data configuration.
 FEATURE_STORE = Path(
-    "/Users/shazzak/Capital Stake - Results/feature_store")
+    str(_hft_paths.RESULTS_ROOT / 'feature_store'))
 # results output
-RESULTS = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS = Path(str(_hft_paths.RESULTS_ROOT))
 # PSX tick size in price units (0.01 PKR) -- the tradeability yardstick
 TICK = 0.01
 # the markout horizon column we test (finest available in the store)

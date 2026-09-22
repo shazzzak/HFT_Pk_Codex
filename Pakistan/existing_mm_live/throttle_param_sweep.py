@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # throttle_param_sweep.py
 # ----------------------------------------------------------------------------
@@ -47,7 +49,8 @@ import run_legacy_mm as R
 # OUTPUT PATHS
 # ---------------------------------------------------------------------------
 # Results live OUTSIDE the git project.
-OUT_DIR = Path("/Users/shazzak/Capital Stake - Results/throttle_param_sweep")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+OUT_DIR = Path(str(_hft_paths.RESULTS_ROOT / 'throttle_param_sweep'))
 # JSONL checkpoint journal (one line per completed (config,date,name) cell).
 JOURNAL = OUT_DIR / "throttle_param_sweep_CKPT.jsonl"
 # Final labeled per-(config,name,day) CSV the analysis consumes.

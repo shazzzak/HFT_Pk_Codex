@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # sweep_min_edge.py -- find the net-P&L-maximizing min_edge_pct per symbol,
 # on REAL queue fills across all 207 days (not single-day, not per-fill-bps).
@@ -36,11 +38,13 @@ import persist_fills as PF
 import fill_attribution as FA
 
 # raw store (moved location)
-PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # override loader root in-process
 R.PARSED_ROOT = PARSED_ROOT
 # feature store (for the fill-time context join)
-FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'feature_store'))
 
 # pilot symbols (the two with feature stores + validated fills)
 SYMBOLS = ["PPL", "UBL"]
@@ -162,7 +166,8 @@ def main():
     # assemble
     df = pd.DataFrame(records)
     # save the raw per-day records for later inspection
-    out = Path("/Users/shazzak/Capital Stake - Results/min_edge_sweep.csv")
+    # Resolve this filesystem path through the canonical checkout/data configuration.
+    out = Path(str(_hft_paths.RESULTS_ROOT / 'min_edge_sweep.csv'))
     df.to_csv(out, index=False)
 
     # ---- summary: aggregate over dates, per (symbol, min_edge) ----

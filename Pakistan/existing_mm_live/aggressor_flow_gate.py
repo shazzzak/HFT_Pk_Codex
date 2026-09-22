@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # aggressor_flow_gate.py
 # ----------------------------------------------------------------------------
@@ -53,8 +55,10 @@ except Exception:
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
-OUT_DIR = Path("/Users/shazzak/Capital Stake - Results/diagnostics")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'feature_store'))
+# Resolve this filesystem path through the canonical checkout/data configuration.
+OUT_DIR = Path(str(_hft_paths.RESULTS_ROOT / 'diagnostics'))
 HEADLINE_MS = 5000                      # markout horizon (matches the throttle gate)
 HORIZONS_MS = [1000, 5000, 30000]
 N_STDS = [1.0, 1.5, 2.0, 2.5]           # fire thresholds (standard deviations from 0)

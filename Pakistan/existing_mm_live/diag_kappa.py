@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # diagnose the negative-kappa result: (1) what fraction of trades have a
 # RESOLVABLE resting_order_id, (2) what fraction of ORDER_ADDs match a fill,
 # (3) the fill RATE (not intensity) by distance bin -- the honest picture.
@@ -5,7 +7,8 @@ import sys; sys.path.insert(0,".")
 import numpy as np, pandas as pd
 import run_legacy_mm as R
 from pathlib import Path
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 SYM="PPL"; N_DAYS=5
 DELTA_BINS=np.array([0.5,1,1.5,2,3,4,5,7,10,15,20])
 

@@ -1,3 +1,4 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
 # ============================================================================
 # make_csv_slices.py -- convert the bits of the store I need into readable CSV
 # ============================================================================
@@ -56,8 +57,9 @@ import pandas as pd
 
 # WHERE THE COPIED DATA LIVES. Deliberately NOT config_pk's PARSED_ROOT: this
 # reads the copy you made, so the real store is not touched at all.
-DEFAULT_ROOT = ("/Users/shazzak/PycharmProjects/HFT/Pakistan/Production/"
-                "Delete")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+# Resolve the copied data beside this checkout, without depending on PYTHONPATH.
+DEFAULT_ROOT = str(Path(__file__).resolve().parents[1] / "Delete")
 
 # the four dates that cover all four day types
 DEFAULT_DATES = ("2026-03-11", "2026-03-13", "2026-03-25", "2026-03-27")

@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # diag_adverse_selection.py -- WHY does micro drift short while naive stays flat?
 # Tests three code-identified suspects, per fill, against book context:
 #   (1) GATE SELECTION: are micro's fills concentrated in wide-spread / toxic
@@ -32,9 +34,11 @@ import fill_attribution as FA
 import persist_fills as PF
 
 # raw store
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # feature store (context columns)
-FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'feature_store'))
 # pilot symbols
 SYMBOLS = ["PPL", "UBL"]
 # per-symbol session_scale (1x point); the fix is applied in micro_mm already

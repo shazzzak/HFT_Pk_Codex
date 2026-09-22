@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # preflight_coverage.py -- verify the 38 names have what the sweep needs BEFORE
 # committing to the full run. Catches the silent skips (_process returns None)
@@ -27,7 +29,8 @@ NAMES = ['AKBL', 'ATRL', 'BAFL', 'BOP', 'DGKC', 'ENGROH', 'FFC', 'FNEL',
 # trailing-median window (matches the sweep)
 TRAIL_DAYS = 10
 # feature-store root (matches persist / harness)
-FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'feature_store'))
 
 
 def main():

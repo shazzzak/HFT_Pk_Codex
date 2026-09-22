@@ -12,6 +12,8 @@ Only three things changed from the generic version, all forced by your schema:
   (3) trade-conditioning column is time_since_trade_ms.
 Everything else (day-as-unit SE, per-day edge histogram, checkpointing) is unchanged.
 """
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 
 # os for path checks and partition enumeration.
 import os
@@ -32,16 +34,19 @@ import matplotlib.pyplot as plt
 # =====================================================================
 
 # Root of the feature store (outside the git project).
-DATA_ROOT = "/Users/shazzak/Capital Stake - Results/feature_store"
+# Resolve this filesystem path through the canonical checkout/data configuration.
+DATA_ROOT = str(_hft_paths.RESULTS_ROOT / 'feature_store')
 
 # Where per-partition summaries and plots are written.
-OUT_DIR = "/Users/shazzak/Capital Stake - Results/markout_validation"
+# Resolve this filesystem path through the canonical checkout/data configuration.
+OUT_DIR = str(_hft_paths.RESULTS_ROOT / 'markout_validation')
 
 # DuckDB memory ceiling (keep below physical RAM).
 DUCKDB_MEMORY_LIMIT = "8GB"
 
 # DuckDB spill directory for large sorts/hashes.
-DUCKDB_TEMP_DIR = "/Users/shazzak/Capital Stake - Results/duckdb_spill"
+# Resolve this filesystem path through the canonical checkout/data configuration.
+DUCKDB_TEMP_DIR = str(_hft_paths.RESULTS_ROOT / 'duckdb_spill')
 
 # Thread count (modest to bound concurrent buffer memory).
 DUCKDB_THREADS = 4

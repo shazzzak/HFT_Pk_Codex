@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # verify_snapshot_equivalence.py -- prove the pandas->native snapshot() refactor
 # gives IDENTICAL fills to the old code. Compares NEW-code backtests against the
 # fills persisted by persist_fills.py (OLD-code output) across days.
@@ -17,9 +19,11 @@ from mm_backtest import Backtester, LatencyModel, NaiveSymmetricMM
 from micro_mm import MicrostructureMM
 
 # Point the loader at the raw parsed store (in-process override).
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # Root of the OLD-code fills persisted earlier (the reference to match against).
-FILLS_ROOT = Path("/Users/shazzak/Capital Stake - Results/fills")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FILLS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'fills'))
 
 # The two strategies whose fills were persisted.
 STRATEGIES = ["naive", "micro"]

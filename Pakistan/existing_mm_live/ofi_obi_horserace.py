@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ofi_obi_horserace.py -- DECISION GATE: does OFI (or an OBI/OFI blend) predict
 # the next mid-move better than OBI alone? This is Step-2 research. It reads the
 # feature store, builds a forward-return label, and horse-races the directional
@@ -33,7 +35,8 @@ import numpy as np
 import pandas as pd
 
 # feature-store location (same convention as build_feature_store.py)
-RESULTS_ROOT = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS_ROOT = Path(str(_hft_paths.RESULTS_ROOT))
 # feature_store/{symbol}/date=*/*.parquet
 FS_ROOT = RESULTS_ROOT / "feature_store"
 

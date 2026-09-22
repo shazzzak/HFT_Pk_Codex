@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # run_persistence.py -- TABLE A: does a run of same-side aggressor trades predict
 # the NEXT trade's side on PSX? Replicates the Aldridge FBL ladder
@@ -41,11 +43,14 @@ def _ts():
 
 
 # local parsed store (run_legacy_mm default points at the empty Google Drive)
-LOCAL_STORE = Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+LOCAL_STORE = Path(str(_hft_paths.PARSED_ROOT))
 # results root (for the watchlist name list)
-RESULTS_ROOT = Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS_ROOT = Path(str(_hft_paths.RESULTS_ROOT))
 # output directory
-OUT_DIR = Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results/diagnostics")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+OUT_DIR = Path(str(_hft_paths.RESULTS_ROOT / 'diagnostics'))
 # run-length buckets to report (5 = exactly 5; 6 = 6-or-more)
 RUN_BUCKETS = [1, 2, 3, 4, 5, 6]
 # default sampled days

@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # inspect_fills_schema.py -- does the on-disk fills parquet already carry a
 # fill-instant mid (mid / bb / ba)? If so, zeroing the decomposition residual is
 # a one-line change (read the stored mid instead of looking it up). Prints the
@@ -9,8 +11,8 @@
 import duckdb
 
 # the fills file to inspect (one naive-strategy symbol-day)
-PARQUET = ("/Users/shazzak/Capital Stake - Results/"
-           "fills/naive/UBL/date=2025-09-01.parquet")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+PARQUET = (str(_hft_paths.RESULTS_ROOT / 'fills/naive/UBL/date=2025-09-01.parquet'))
 
 # open an in-memory DuckDB connection
 con = duckdb.connect()

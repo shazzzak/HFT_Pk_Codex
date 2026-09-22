@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # lock_confirm.py -- are the one-sided-close days actually LOCKS (price pinned at
 # the +/-10% band) and, if so, is the loss concentrated in the TRAPPED-sign subset
 # (short into limit-up / long into limit-down, where there's no counterparty)?
@@ -24,9 +26,11 @@ import run_legacy_mm as R
 from mm_backtest import Book
 
 # point the driver at the parsed data root on this machine
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # results directory holding the per-day eod_positions.csv
-RES = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RES = Path(str(_hft_paths.RESULTS_ROOT))
 # which config's pos_at_close to use (mid_is_none is a market fact, same across configs)
 CONFIG_LABEL = "MID+band150 me=0.0005"
 # how close (in ticks) the present side must sit to a limit to call it "at the lock"

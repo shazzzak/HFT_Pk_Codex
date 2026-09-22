@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # obi_depth_gate.py
 # ----------------------------------------------------------------------------
@@ -51,7 +53,8 @@ except Exception:
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-OUT_DIR = Path("/Users/shazzak/Capital Stake - Results/diagnostics")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+OUT_DIR = Path(str(_hft_paths.RESULTS_ROOT / 'diagnostics'))
 # cumulative OBI depths to compare (1..N).
 DEPTHS = [1, 3, 5, 7]
 # markout horizons (ms); 5s headline (matches the throttle gate).

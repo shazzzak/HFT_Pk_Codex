@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # markout_horizon_diag.py
 # ----------------------------------------------------------------------------
@@ -39,7 +41,8 @@ def _ts():
 # CONFIG
 # ---------------------------------------------------------------------------
 # Where the profile CSV + plots land.
-OUT_DIR = Path("/Users/shazzak/Capital Stake - Results/diagnostics")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+OUT_DIR = Path(str(_hft_paths.RESULTS_ROOT / 'diagnostics'))
 # parallelism (match the sweeps) and day sample (a profile needs ~30 days, not 197).
 WORKERS = 9
 MAX_DAYS = 30

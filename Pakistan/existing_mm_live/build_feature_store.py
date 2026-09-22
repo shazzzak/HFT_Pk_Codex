@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # build_feature_store.py -- PSX Event-Driven Feature Extractor (merged v2)
 # ============================================================================
@@ -34,11 +36,13 @@ from mm_backtest import Backtester, LatencyModel
 # PATHS
 # ---------------------------------------------------------------------------
 # Raw parsed store (moved out of CloudStorage).
-PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # Override the loader's root IN THIS PROCESS ONLY (run_legacy_mm.py untouched).
 R.PARSED_ROOT = PARSED_ROOT
 # Results OUTSIDE the git project (git never sees multi-GB parquet).
-RESULTS_ROOT = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS_ROOT = Path(str(_hft_paths.RESULTS_ROOT))
 # Feature-store subtree: feature_store/{symbol}/date={date}.parquet
 FS_ROOT = RESULTS_ROOT / "feature_store"
 
@@ -357,6 +361,12 @@ def build_one(date, sym, dsets):
 # MAIN
 # ---------------------------------------------------------------------------
 def main():
+    # Print effective input/output roots before loading any historical data.
+    print(f"parsed_root={PARSED_ROOT.resolve()} results_root={RESULTS_ROOT.resolve()} feature_store={FS_ROOT.resolve()}", flush=True)
+    # Refuse a loader root that diverged from the canonical feature-store input.
+    if R.PARSED_ROOT.resolve() != _hft_paths.PARSED_ROOT.resolve():
+        # A missing or different data source must not silently change the experiment.
+        raise RuntimeError("feature-store loader differs from config_pk.PARSED_ROOT")
     # All trading dates in the store.
     dates = R.discover_dates()
     # Announce scope and destination.

@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # onesided_close_cost.py -- STEP 1, measured not inferred: how much do the
 # one-sided-close days (mid_at_close is None) actually cost, per config?
 # equity_mid_mark is None exactly when the closing book is one-sided (mm_backtest
@@ -16,7 +18,8 @@ import numpy as np
 from pathlib import Path
 
 # results dir
-res = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+res = Path(str(_hft_paths.RESULTS_ROOT))
 # per-day records
 df = pd.read_csv(res / "eod_positions.csv")
 

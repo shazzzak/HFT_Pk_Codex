@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # confirm the tail is multi-day session-length heterogeneity, not a data leak:
 # show, per day, the continuous session length (minutes) and the first-trade vs
 # continuous-open gap, for one symbol across all days.
@@ -5,7 +7,8 @@ import sys; sys.path.insert(0, ".")
 import numpy as np, pandas as pd
 import run_legacy_mm as R
 from pathlib import Path
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 REQ_SNAP = ["symbol", "msg_seq", "orig_time", "phase"]
 REQ_TR = ["symbol", "transact_time", "exec_type"]
 SYM = "TRG"

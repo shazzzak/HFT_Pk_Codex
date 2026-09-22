@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # confirm_micro_vs_naive.py -- validation gate: does capture-recalibrated micro
 # beat naive, per symbol, on 207 days? Measures P&L two ways and reconciles:
 #   Path A -- Backtester true EOD P&L in PKR (bt.eod["equity_liquidated"]).
@@ -28,9 +30,11 @@ import fill_attribution as FA
 import persist_fills as PF
 
 # raw store
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # feature store (Path B context)
-FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'feature_store'))
 
 # pilot symbols + PACE, the measured locky/thin name that exercises the triggers
 SYMBOLS = ["PPL", "UBL", "PACE"]
@@ -335,7 +339,8 @@ def main():
         })
     # frame + save
     df = pd.DataFrame(rows)
-    out = Path("/Users/shazzak/Capital Stake - Results/confirm_micro_vs_naive.csv")
+    # Resolve this filesystem path through the canonical checkout/data configuration.
+    out = Path(str(_hft_paths.RESULTS_ROOT / 'confirm_micro_vs_naive.csv'))
     df.to_csv(out, index=False)
     # ---- LOUD: any day where the headline liquidated P&L was None ----------
     # These days are excluded from total_pnl_pkr, so if the count is nonzero the
@@ -429,7 +434,8 @@ def main():
         print("  NOTE: mid/liquidated day-set mismatch (mid None on some days):")
         print(_mism[["symbol", "variant", "mid_days", "pnl_days"]].to_string(index=False))
     # write both next to the confirm CSV, where the plotter looks by default.
-    res = Path("/Users/shazzak/Capital Stake - Results")
+    # Resolve this filesystem path through the canonical checkout/data configuration.
+    res = Path(str(_hft_paths.RESULTS_ROOT))
     # per-day positions -> the drift-toward-flat histogram.
     eod_df.to_csv(res / "eod_positions.csv", index=False)
     # P&L summary -> the mid-mark vs liquidated carry-gap bars.

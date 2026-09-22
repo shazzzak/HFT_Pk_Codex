@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # sweep_middle_capacity.py -- THE INVERSE of the failed close-sizing test.
 #
 # The bucket-sizing result showed: the CLOSE has high volume but TOXIC flow
@@ -34,9 +36,12 @@ from mm_backtest import Backtester, LatencyModel
 from micro_mm import MicrostructureMM
 import confirm_micro_vs_naive as C
 
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
-FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
-RESULTS = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'feature_store'))
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS = Path(str(_hft_paths.RESULTS_ROOT))
 
 # ------------------------------ knobs ----------------------------------------
 NAMES = ["ENGROH", "LUCK", "UBL", "PSO", "PPL", "HBL", "SAZEW", "MLCF",

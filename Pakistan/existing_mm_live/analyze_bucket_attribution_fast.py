@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # analyze_bucket_attribution_fast.py -- PARALLEL twin of the attribution consumer.
 #
 # WHY: the serial version took ~152 min for the full run. The engine's snapshot
@@ -253,7 +255,8 @@ def main():
 
     # ---- outputs (identical to the serial version) ----
     # results directory
-    resd = Path("/Users/shazzak/Capital Stake - Results")
+    # Resolve this filesystem path through the canonical checkout/data configuration.
+    resd = Path(str(_hft_paths.RESULTS_ROOT))
     # panel frame
     ex = pd.DataFrame(exec_rows)
     # panel path

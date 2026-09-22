@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 #!/usr/bin/env python3
 # ============================================================================
 # leadlag_screen.py -- PREREQUISITE SCREEN for a cross-asset (sector-leader)
@@ -50,9 +52,11 @@ try:
 except Exception:
     PARSED_ROOT = RESULTS_ROOT = ""
 if not PARSED_ROOT:
-    PARSED_ROOT = "/Users/shazzak/HFT Data/Pakistan/Capital Stake - Parsed"
+    # Resolve this filesystem path through the canonical checkout/data configuration.
+    PARSED_ROOT = str(_hft_paths.PARSED_ROOT)
 if not RESULTS_ROOT:
-    RESULTS_ROOT = "/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results"
+    # Resolve this filesystem path through the canonical checkout/data configuration.
+    RESULTS_ROOT = str(_hft_paths.RESULTS_ROOT)
 
 # PSX OFFICIAL SECTORS, parsed from the exchange's daily quotation sheet
 # (Section 4, MARKET IN DETAIL) for 2026-09-14. All 113 production names

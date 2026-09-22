@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # calibrate_pace_scale.py -- back-solve PACE's session_scale so the inventory skew
 # at MAX inventory ~ 1x PACE's median spread. EXACT sigma: we run PACE through the
 # REAL MicrostructureMM.observe() (subclassed only to record self.sigma each event),
@@ -23,9 +25,11 @@ from mm_backtest import Backtester, LatencyModel
 from micro_mm import MicrostructureMM
 
 # raw store
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # PACE feature-store glob (median spread + price come from here)
-PACE_FS_GLOB = "/Users/shazzak/Capital Stake - Results/feature_store/PACE/*.parquet"
+# Resolve this filesystem path through the canonical checkout/data configuration.
+PACE_FS_GLOB = str(_hft_paths.RESULTS_ROOT / 'feature_store/PACE/*.parquet')
 # the symbol we're calibrating
 SYM = "PACE"
 # how many days to sample for the sigma median (sigma is a fast EMA -> stable;

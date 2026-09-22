@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # boost_qdr_markout_diagnostic.py
 # ----------------------------------------------------------------------------
@@ -68,9 +70,11 @@ except Exception:
 # CONFIG
 # ---------------------------------------------------------------------------
 # Feature-store root: feature_store/{SYM}/date=YYYY-MM-DD.parquet (date in FILENAME).
-FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'feature_store'))
 # Where CSVs + PNGs land (SZ copies what he wants into existing_mm_live/).
-OUT_DIR = Path("/Users/shazzak/Capital Stake - Results/diagnostics")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+OUT_DIR = Path(str(_hft_paths.RESULTS_ROOT / 'diagnostics'))
 # Markout horizons present in the feature store (ms). 5s is the headline.
 HORIZONS_MS = [1000, 5000, 30000]
 # Headline horizon for the printed summary + plots.

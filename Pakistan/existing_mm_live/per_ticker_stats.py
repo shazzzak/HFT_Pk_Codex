@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 #!/usr/bin/env python3
 # per_ticker_stats.py -- per-ticker risk/return from the fullyear PERNAME parquet.
 # Two views: (1) per ticker OVERALL (buckets collapsed), (2) per ticker x bucket.
@@ -13,11 +15,13 @@ import os
 
 # ---- EDIT: parquet path + which config to profile ----
 # path to the PERNAME parquet from the full-year run
-PERNAME = "/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results/fullyear_confirm_PERNAME_20260911_1456.parquet"
+# Resolve this filesystem path through the canonical checkout/data configuration.
+PERNAME = str(_hft_paths.RESULTS_ROOT / 'fullyear_confirm_PERNAME_20260911_1456.parquet')
 # which throttle config to profile ("QBPS_2","QT_2t","QT_1t","OBI",... or None = all)
 CONFIG = "QBPS_2"
 # all outputs go here (RESULTS_ROOT), per standing preference -- never relative paths
-OUT_DIR = "/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results"
+# Resolve this filesystem path through the canonical checkout/data configuration.
+OUT_DIR = str(_hft_paths.RESULTS_ROOT)
 # annualization factor for Sharpe/Sortino (trading days/yr)
 ANN = np.sqrt(252.0)
 

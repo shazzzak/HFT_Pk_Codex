@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # aggressor_flow_full.py
 # ----------------------------------------------------------------------------
@@ -47,7 +49,8 @@ def print(*a, **k):
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-OUT_DIR = Path("/Users/shazzak/Capital Stake - Results/diagnostics")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+OUT_DIR = Path(str(_hft_paths.RESULTS_ROOT / 'diagnostics'))
 HALFLIVES_S = [2.0, 5.0, 15.0]          # EMA fade speeds to sweep (seconds)
 FIRE_PCTS = [80.0, 90.0, 95.0]          # fire on the top (100-pct)% of |flow| that
                                         # day/bucket -> a fixed FRACTION always fires,

@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # lean_vs_lambda.py -- PRE-REGISTERED payoff test for the microprice defensive
 # lean. Question: does leaning defensively (lambda<0) pay SPECIFICALLY on the
@@ -32,7 +34,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-RESULTS = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS = Path(str(_hft_paths.RESULTS_ROOT))
 
 
 def main():

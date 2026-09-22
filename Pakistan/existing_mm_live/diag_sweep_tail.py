@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # diag_sweep_tail.py -- find out what the 360-430 min sweep tail REALLY is.
 #
 # The phase diagnostic showed CONTINUOUS_AUCTION ends 15:29:59 and after-hours is
@@ -20,7 +22,8 @@ import run_legacy_mm as R
 # store path
 from pathlib import Path
 # point at the parsed store
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 
 # full trade columns
 REQ_TRADES_FULL = ["symbol", "transact_time", "capture_ts", "price", "qty",

@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # eod_pos_summary.py -- the decisive check the terminal P&L can't give:
 # did the skew fix move TERMINAL INVENTORY, or is it inert on position too?
 # Pre-fix baseline (from the diagnosis, me=0.0005):
@@ -13,7 +15,8 @@ import pandas as pd
 from pathlib import Path
 
 # results dir
-res = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+res = Path(str(_hft_paths.RESULTS_ROOT))
 # per-day EOD positions emitted by confirm_micro_vs_naive.py
 df = pd.read_csv(res / "eod_positions.csv")
 # half of the 500-share inventory cap, for the "beyond half-cap" stat

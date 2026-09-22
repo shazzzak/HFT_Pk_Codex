@@ -15,6 +15,8 @@ per-fill economics now reconcile to the backtest by construction. The `reason` c
 (through/at_queue/at_optimistic/crossing_add) enables P&L split by fill rule.
 
 """
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 
 # numeric + frames
 import numpy as np
@@ -45,7 +47,8 @@ USE_TREC_FEE = True
 FEE_TOTAL_PCT = FEE_TOTAL_TREC if USE_TREC_FEE else FEE_TOTAL_RETAIL
 
 # glob to the parsed misc partitions (edit if your path differs)
-MISC_GLOB = "/Users/shazzak/Capital Stake - Parsed/misc/date=*/*.parquet"
+# Resolve this filesystem path through the canonical checkout/data configuration.
+MISC_GLOB = str(_hft_paths.PARSED_ROOT / 'misc/date=*/*.parquet')
 
 # derive market-wide halt dates from data instead of hardcoding them
 def load_market_halt_dates(con):
@@ -216,14 +219,17 @@ def attribute_by_regime(fills, n_terciles=3):
 # =====================================================================
 
 # glob roots for the parsed trades and ob_snapshot partitions
-TRADES_ROOT = "/Users/shazzak/Capital Stake - Parsed/trades"
-OB_ROOT     = "/Users/shazzak/Capital Stake - Parsed/ob_snapshot"
+# Resolve this filesystem path through the canonical checkout/data configuration.
+TRADES_ROOT = str(_hft_paths.PARSED_ROOT / 'trades')
+# Resolve this filesystem path through the canonical checkout/data configuration.
+OB_ROOT     = str(_hft_paths.PARSED_ROOT / 'ob_snapshot')
 # markout horizon in milliseconds (must match the label horizon: markout_5000ms_bps)
 HORIZON_MS = 5000
 
 # root of the REAL persisted fills written by persist_fills.py (engine's
 # queue-gated fills, feature context pre-joined) -- the trades proxy is retired
-FILLS_ROOT = "/Users/shazzak/Capital Stake - Results/fills"
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FILLS_ROOT = str(_hft_paths.RESULTS_ROOT / 'fills')
 
 # read the per-(strategy, symbol, day) REAL fill table and re-attach the
 # per-stock phase timeline + prev_close/suspended flags that add_state() needs
@@ -274,7 +280,8 @@ def build_fills_for_partition(con, strategy, sym, dt):
     return df
 
 # where per-day fill parquets and final results are written
-RESULTS_DIR = "/Users/shazzak/Capital Stake - Results/fill_attribution"
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS_DIR = str(_hft_paths.RESULTS_ROOT / 'fill_attribution')
 
 
 # assemble the whole run: connect, load halts, build+checkpoint fills, attribute, save

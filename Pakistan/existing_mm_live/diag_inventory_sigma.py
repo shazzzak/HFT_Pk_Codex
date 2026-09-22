@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # diag_inventory_sigma.py -- confirm micro's inventory-carry problem and calibrate
 # the session_scale skew fix, per symbol, from MEASURED sigma.
 #
@@ -30,9 +32,11 @@ from mm_backtest import Backtester, LatencyModel
 from micro_mm import MicrostructureMM
 
 # raw store
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # feature store (for sigma + spread measurement)
-FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'feature_store'))
 
 # pilot symbols
 SYMBOLS = ["PPL", "UBL"]

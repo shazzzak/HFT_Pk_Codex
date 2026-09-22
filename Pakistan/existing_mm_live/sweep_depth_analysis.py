@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # sweep_depth_analysis.py -- how deep do aggressor orders cut into the book?
 #
 # QUESTION: is futures flow more aggressive/institutional than spot? A trade that
@@ -57,9 +59,11 @@ import futures_mm_run as F
 import confirm_micro_vs_naive as C
 
 # raw store + results
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # where PNGs + CSV are written
-RESULTS = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS = Path(str(_hft_paths.RESULTS_ROOT))
 
 # full trade columns needed for sweep grouping: aggressor side + BOTH order refs
 # + initiator (the aggressor order id) + exec_type to filter to real trades

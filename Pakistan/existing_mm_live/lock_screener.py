@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # lock_screener.py -- pick a thin/locky third name that will actually EXERCISE the
 # time-to-close and distance-to-lock triggers. For each watchlist symbol it counts,
 # from raw snapshots (no book reconstruction): (a) how often the CONTINUOUS_AUCTION
@@ -19,11 +21,14 @@ import numpy as np
 import run_legacy_mm as R
 
 # point the driver at the parsed data root
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # feature-store root (to confirm each candidate is runnable in confirm's Path B)
-FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'feature_store'))
 # the watchlist CSV (symbol column + context columns)
-WATCHLIST = Path("/Users/shazzak/Capital Stake - Results/mm_watchlist_final.csv")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+WATCHLIST = Path(str(_hft_paths.RESULTS_ROOT / 'mm_watchlist_final.csv'))
 # tolerance (in price units) for calling the touch "at" the published limit
 LOCK_TOL = 0.01
 # cap days for a fast first pass; None = all 207 (definitive but ~5x slower)

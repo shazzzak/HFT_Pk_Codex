@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # universe_run.py -- the universe screen: does MID (microprice off + both triggers)
 # make markets on each of the 38 shortlist names, and how big is the per-fill edge?
 # Runs TWO configs per name -- naive (dumb baseline) and MID -- at a 1x MEDIAN-TRADE-
@@ -31,13 +33,17 @@ from micro_mm import MicrostructureMM
 import confirm_micro_vs_naive as C
 
 # raw store
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # feature store (Path B context)
-FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'feature_store'))
 # shortlist
-WATCHLIST = Path("/Users/shazzak/Capital Stake - Results/mm_watchlist_final.csv")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+WATCHLIST = Path(str(_hft_paths.RESULTS_ROOT / 'mm_watchlist_final.csv'))
 # results dir (outputs + the scales CSV live here)
-RESULTS = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS = Path(str(_hft_paths.RESULTS_ROOT))
 
 # trailing window (days) for the median trade size + ADV (walk-forward)
 TRAIL_DAYS = 10

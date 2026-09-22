@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # diag_markout_recon.py -- settle three questions raised by the spot capture/
 # markout decomposition run:
 #
@@ -28,8 +30,10 @@ import mm_harness as H
 import run_legacy_mm as R
 
 # store paths
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
-RESULTS = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS = Path(str(_hft_paths.RESULTS_ROOT))
 
 # ------------------------------ config ---------------------------------------
 # the top-10 book (same as production)

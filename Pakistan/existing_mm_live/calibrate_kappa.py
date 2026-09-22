@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # calibrate_kappa.py -- fit the Avellaneda-Stoikov fill-intensity decay per
 # symbol, so the currently-INERT base half-spread term in micro_mm.py can be
 # activated with a data-derived kappa instead of the placeholder 1.5.
@@ -54,8 +56,10 @@ import pandas as pd
 import run_legacy_mm as R
 
 # store + results
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
-RESULTS = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS = Path(str(_hft_paths.RESULTS_ROOT))
 
 # ------------------------------ config ---------------------------------------
 # symbols to calibrate

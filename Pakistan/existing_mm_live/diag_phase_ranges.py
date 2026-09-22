@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # diag_phase_ranges.py -- show each snapshot PHASE's time span per symbol, so we
 # can see (a) whether an after-hours / close-auction phase exists after the main
 # continuous session, and (b) whether CONTINUOUS_AUCTION snapshot timestamps
@@ -15,7 +17,8 @@ import pandas as pd
 pd.set_option("display.width", 200)
 
 # the snapshot glob (hive layout: table before date=)
-GLOB = "/Users/shazzak/Capital Stake - Parsed/ob_snapshot/date=*/*.parquet"
+# Resolve this filesystem path through the canonical checkout/data configuration.
+GLOB = str(_hft_paths.PARSED_ROOT / 'ob_snapshot/date=*/*.parquet')
 # a couple of symbols to inspect
 SYMS = ["TRG", "PPL"]
 

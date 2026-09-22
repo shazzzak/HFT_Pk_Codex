@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # persist_fills.py -- SYSTEM FILE (goes in existing_mm_live/, run repeatedly)
 # ============================================================================
@@ -50,11 +52,13 @@ import run_legacy_mm as R
 # PATHS
 # ---------------------------------------------------------------------------
 # Raw parsed store (the moved location; run_legacy_mm's constant is stale).
-PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # Override the loader's root IN THIS PROCESS ONLY (run_legacy_mm.py untouched).
 R.PARSED_ROOT = PARSED_ROOT
 # Results root (outside the git project).
-RESULTS_ROOT = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS_ROOT = Path(str(_hft_paths.RESULTS_ROOT))
 # The feature store built by build_feature_store.py (fill-time context source).
 FS_ROOT = RESULTS_ROOT / "feature_store"
 # Where the real-fill parquets land: fills/{strategy}/{sym}/date={dt}.parquet

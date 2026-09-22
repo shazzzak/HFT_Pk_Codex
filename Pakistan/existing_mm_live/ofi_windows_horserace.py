@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ofi_windows_horserace.py -- the FAIR OFI race: trailing-WINDOWED OFI vs OBI.
 #
 # The original horserace raced SINGLE-EVENT OFI increments (a trailing window of
@@ -32,7 +34,8 @@ import pandas as pd
 import mm_harness as H
 
 # results root + feature store (same convention as build_feature_store.py)
-RESULTS_ROOT = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS_ROOT = Path(str(_hft_paths.RESULTS_ROOT))
 FS_ROOT = RESULTS_ROOT / "feature_store"
 
 # the five race symbols (same as the original horserace)

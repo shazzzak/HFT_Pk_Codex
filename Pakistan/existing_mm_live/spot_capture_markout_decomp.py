@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # spot_capture_markout_decomp.py -- the honest per-bucket decomposition:
 #   capture, FIFO markout (to actual matched exit), fees, net-bps, med-hold,
 #   with markout further SPLIT into jump vs diffusion components, across a
@@ -625,7 +627,8 @@ def main():
         else:
             print(f"\n  daily test skipped (only {len(dm)} days)")
     # save the per-day series for further inspection
-    resd = Path("/Users/shazzak/Capital Stake - Results")
+    # Resolve this filesystem path through the canonical checkout/data configuration.
+    resd = Path(str(_hft_paths.RESULTS_ROOT))
     # one file per clip multiple
     for cm in CLIP_MULTS:
         s = pd.Series(daily_markouts[cm]).sort_index()

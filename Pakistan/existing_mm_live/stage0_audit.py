@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # =============================================================================
 # stage0_audit.py  (v2 -- bucket-aware)
 # QBPS_2 pre-deploy audit + universe-expansion screen test
@@ -52,7 +54,8 @@ import matplotlib.pyplot as plt
 # CONFIG
 # -----------------------------------------------------------------------------
 # the one results directory every output goes to (house rule: never relative)
-RESULTS = Path("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS = Path(str(_hft_paths.RESULTS_ROOT))
 # per-side all-in TREC fee from mm_backtest.FEE_TOTAL_TREC
 # = LAGA 0.000035 + SECP 0.0000065 + IPF 0.0000062 + clearing 0.00003
 FEE_PCT_PER_SIDE = 0.0000777

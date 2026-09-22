@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # probe_spot_width.py -- how wide is the SHARE book, in bps, for the names that
 # also have an active-month deliverable future? And which of the two is cheaper
 # to cross?
@@ -42,9 +44,11 @@ except Exception:
     PARSED, RESULTS = "", ""
 # current literals only as a fallback
 if not PARSED:
-    PARSED = "/Users/shazzak/HFT Data/Pakistan/Capital Stake - Parsed"
+    # Resolve this filesystem path through the canonical checkout/data configuration.
+    PARSED = str(_hft_paths.PARSED_ROOT)
 if not RESULTS:
-    RESULTS = "/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results"
+    # Resolve this filesystem path through the canonical checkout/data configuration.
+    RESULTS = str(_hft_paths.RESULTS_ROOT)
 # fail immediately with the path named, not inside a glob
 if not Path(PARSED).is_dir():
     raise SystemExit(f"PARSED store not found: {PARSED}")

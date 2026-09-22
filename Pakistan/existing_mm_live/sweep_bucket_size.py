@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # sweep_bucket_size.py -- JOB 1 of the volume-sizing experiment: can we extend
 # profitability by quoting LARGER clips in the high-volume end-of-day buckets?
 #
@@ -37,9 +39,12 @@ from micro_mm import MicrostructureMM
 # scorer + formatter
 import confirm_micro_vs_naive as C
 
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
-FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
-RESULTS = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'feature_store'))
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS = Path(str(_hft_paths.RESULTS_ROOT))
 
 # ------------------------------ experiment knobs ------------------------------
 # the top-10 winners (where the P&L is; extending THESE is the prize)

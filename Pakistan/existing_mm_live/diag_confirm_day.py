@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # diag_confirm_day.py -- time EACH sub-step of the confirmation's per-day path,
 # to find the ~12s that score_bps did NOT account for. Replicates exactly what
 # confirm_micro_vs_naive.run_one + score_bps do for ONE naive-PPL day, timing
@@ -18,8 +20,10 @@ import persist_fills as PF
 import fill_attribution as FA
 
 # raw store + feature store
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
-FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'feature_store'))
 
 # one naive-PPL day (the first cell that ran at ~14s/day)
 DATE, SYM = "2026-06-30", "PPL"

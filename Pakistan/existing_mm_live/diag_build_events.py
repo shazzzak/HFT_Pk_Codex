@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # diag_build_events.py -- isolate build_events timing + snapshot count, to see
 # whether it is slow (large snapshot volume -> many prep_snapshot calls) or hung.
 # Run from existing_mm_live/:  python diag_build_events.py
@@ -12,7 +14,8 @@ import pandas as pd
 import run_legacy_mm as R
 
 # raw store
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # the day under test
 DATE, SYM = "2026-06-30", "PPL"
 

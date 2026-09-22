@@ -1,6 +1,9 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 import pandas as pd
 
-d = pd.read_parquet("/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results/fullyear_confirm_DAILY_20260911_1456.parquet")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+d = pd.read_parquet(str(_hft_paths.RESULTS_ROOT / 'fullyear_confirm_DAILY_20260911_1456.parquet'))
 CFG = "throttle"
 
 # portfolio daily P&L + notional per (config, date): sum across buckets (+names if present)

@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # build_feature_store_futures.py -- build the feature store for the DELIVERY
 # FUTURES, reusing the EXACT spot builder (build_one) so futures scoring routes
 # through the engine's own Book -- the same price basis the backtest uses. This
@@ -27,9 +29,11 @@ import duckdb
 import build_feature_store as BFS
 import run_legacy_mm as R
 
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 PARSED = str(R.PARSED_ROOT)
-RESULTS = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS = Path(str(_hft_paths.RESULTS_ROOT))
 # SEPARATE store root so futures never collide with spot feature_store/
 FS_FUT = RESULTS / "feature_store_fut"
 

@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # persist_fills_v2.py -- Stage 1 persistence of LIQUIDATION-INCLUSIVE fills.
 # ============================================================================
@@ -36,11 +38,13 @@ import run_legacy_mm as R
 import persist_fills as PF
 
 # raw parsed store (same override the original uses)
-PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
 # override the loader root in-process only
 R.PARSED_ROOT = PARSED_ROOT
 # results root
-RESULTS_ROOT = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS_ROOT = Path(str(_hft_paths.RESULTS_ROOT))
 # feature store (context source for the mid0/mid_h join)
 FS_ROOT = RESULTS_ROOT / "feature_store"
 # NEW tree -- never touches the existing fills/ folder

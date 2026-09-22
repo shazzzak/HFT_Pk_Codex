@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # explore_futures.py -- LEARN the futures data before building any arb backtest.
 # Read-only DuckDB queries against the parsed store. Safe to run alongside other
 # jobs. Answers: what markets exist, which symbols trade as futures, how liquid
@@ -13,7 +15,8 @@ import duckdb
 import pandas as pd
 
 # parsed store (Hive-partitioned by date under each table dir)
-PARSED = "/Users/shazzak/Capital Stake - Parsed"
+# Resolve this filesystem path through the canonical checkout/data configuration.
+PARSED = str(_hft_paths.PARSED_ROOT)
 con = duckdb.connect()
 pd.set_option("display.width", 160, "display.max_columns", 40)
 

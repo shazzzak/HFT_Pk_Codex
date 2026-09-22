@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # ============================================================================
 # throttle_sweep_recover.py -- rebuild a PERNAME CSV from a checkpoint journal
 # if a run DIED before its final write (OOM, PyCharm quit, power loss). Works
@@ -20,7 +22,8 @@ from datetime import datetime
 import pandas as pd
 
 # results dir
-RESULTS = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS = Path(str(_hft_paths.RESULTS_ROOT))
 
 
 def main():

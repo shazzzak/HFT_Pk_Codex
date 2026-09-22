@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # probe_futures_width.py -- how wide is the ACTIVE-MONTH futures book, and what
 # does CROSSING it cost, for every futures root, across many days?
 #
@@ -51,7 +53,8 @@ except Exception:
     PARSED = ""
 # current literal only as a fallback
 if not PARSED:
-    PARSED = "/Users/shazzak/HFT Data/Pakistan/Capital Stake - Parsed"
+    # Resolve this filesystem path through the canonical checkout/data configuration.
+    PARSED = str(_hft_paths.PARSED_ROOT)
 # fail immediately with the path named, not inside a glob
 if not Path(PARSED).is_dir():
     raise SystemExit(f"PARSED store not found: {PARSED}")

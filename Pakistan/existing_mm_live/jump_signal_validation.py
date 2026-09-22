@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # jump_signal_validation.py -- v2: does any LEADING microstructure feature spike
 # BEFORE a price jump on PSX? Rewritten to read the FEATURE STORE's already-built,
 # event-resolution features (ofi_l1, qdr_bid, qdr_ask, ewma_trade_flow, vpin,
@@ -34,8 +36,10 @@ import pandas as pd
 import numpy as np
 
 # feature store + results
-FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
-RESULTS = Path("/Users/shazzak/Capital Stake - Results")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'feature_store'))
+# Resolve this filesystem path through the canonical checkout/data configuration.
+RESULTS = Path(str(_hft_paths.RESULTS_ROOT))
 
 # ------------------------------ experiment knobs ------------------------------
 # blowup/reject names (jumps kill us) + liquid anchors for contrast

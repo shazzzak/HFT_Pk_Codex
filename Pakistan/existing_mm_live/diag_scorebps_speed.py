@@ -1,3 +1,5 @@
+# Share the configured data and current checkout roots; never fall back to a legacy tree.
+import config_pk as _hft_paths
 # diag_scorebps_speed.py -- find why Path B (score_bps) is ~12s/day.
 # Times the feature-store READ vs the join vs the economics, on ONE naive-PPL day.
 # Run from existing_mm_live/:  python diag_scorebps_speed.py
@@ -17,8 +19,10 @@ import persist_fills as PF
 import fill_attribution as FA
 
 # raw store + feature store
-R.PARSED_ROOT = Path("/Users/shazzak/Capital Stake - Parsed")
-FS_ROOT = Path("/Users/shazzak/Capital Stake - Results/feature_store")
+# Resolve this filesystem path through the canonical checkout/data configuration.
+R.PARSED_ROOT = Path(str(_hft_paths.PARSED_ROOT))
+# Resolve this filesystem path through the canonical checkout/data configuration.
+FS_ROOT = Path(str(_hft_paths.RESULTS_ROOT / 'feature_store'))
 
 # one high-fill day for naive PPL
 DATE, SYM = "2026-06-30", "PPL"
