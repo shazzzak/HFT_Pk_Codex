@@ -117,6 +117,14 @@ def evaluate_symbol(frame, horizons, min_train, window, liquidity, progress=None
                 variants["concentration"] = concentration
                 # Retain side-specific location rather than assigning a trust label to a wall.
                 variants["concentration_location"] = concentration+[f"{metric}_{side}_{key}" for metric in ("touch_share","log_hhi_distance") for side in ("bid","ask")]
+            # New liquidity stores retain coverage-aware cost and observed flow comparisons.
+            if "walk_buy_1x_coverage" in frame.columns:
+                # Observed partial cost is never represented as a fully executable order cost.
+                variants["observed_walk"] = [f"walk_{side}_{multiple}x_{metric}" for side in ("buy","sell") for multiple in (1,3,5) for metric in ("partial_impact_bps","coverage")]
+                # Partial observation windows retain an explicit duration control.
+                variants["attributed_flow"] = ["dyn_observed_ms"]+[f"dyn_{side}_{metric}_shares" for side in ("buy","sell") for metric in ("added","added_at_consumed_price","executed","cancelled","unresolved_trade")]
+                # Retain observed depth separately from whether its price extent covers the band.
+                variants["band_depth"] = [f"depth_observed_pkr_{side}_{band}t" for side in ("bid","ask") for band in (1,5,20)]+[f"depth_extent_covers_{side}_{band}t" for side in ("bid","ask") for band in (1,5,20)]
             # Every model must use exactly the same valid rows for an honest comparison.
             required = list(dict.fromkeys(base+[item for cols in variants.values() for item in cols]))
             # Fixed clock horizons answer the immediate-markout question directly.
@@ -389,3 +397,24 @@ def plot_results(summary,deciles,output):
         ax.legend()
         # Export a standalone figure beside the underlying metrics.
         fig.tight_layout(); fig.savefig(Path(output)/"concentration_oos_gain.png",dpi=160); plt.close(fig)
+
+    # Compare the three new liquidity arms on the shared depth-three baseline.
+    selected = summary[summary.variant.isin(["band_depth","observed_walk","attributed_flow"]) & (summary.scope=="portfolio") & (summary.geometry=="ALL") & (summary.subset=="all_l1") & (summary.depth=="3")]
+    # Old feature stores legitimately lack these arms.
+    if not selected.empty:
+        # Keep horizon comparisons in one standalone diagnostic figure.
+        fig,ax = plt.subplots(figsize=(8,5))
+        # Plot every added family without hiding poor outcomes.
+        for variant,part in selected.groupby("variant"):
+            # Preserve temporal order rather than alphabetical horizon labels.
+            part=part.sort_values("horizon_ms")
+            # Gains are against the common OBI/control baseline, not against each other.
+            ax.plot(part.horizon_ms,part.mean_normalized_gain,marker="o",label=variant)
+        # Zero marks no incremental predictive improvement.
+        ax.axhline(0,color="black",linewidth=.8)
+        # Describe the actual metric without implying execution profitability.
+        ax.set(xlabel="Selected-clock horizon (ms)",ylabel="Held-out MSE gain / training variance",title="Depth-three liquidity and attributed-flow comparisons")
+        # Keep all experimental family names visible.
+        ax.legend()
+        # Export the plot beside the complete hypothesis table.
+        fig.tight_layout(); fig.savefig(Path(output)/"liquidity_oos_gain.png",dpi=160); plt.close(fig)

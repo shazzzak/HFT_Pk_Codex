@@ -7,6 +7,10 @@ import numpy as np
 import pandas as pd
 # Reuse the exact historical order-book update implementation.
 from mm_backtest import Book
+# Measure observed cumulative depth and fully covered static execution costs.
+from liquidity_features import liquidity_features
+# Preserve causal event attribution separately from reconstructed book state.
+from liquidity_dynamics import LiquidityDynamics
 # Share validated geometry and clock-horizon label definitions.
 from book_density import density_features, attach_density_labels
 
@@ -42,13 +46,15 @@ def research_touch(book):
 
 
 # Collect fixed selected-clock samples without requesting or simulating any orders.
-def collect(events, snapshots, tick, grid_ms, max_age_ms, horizons, progress=None, pd_decay_k=0.1):
+def collect(events, snapshots, tick, grid_ms, max_age_ms, horizons, progress=None, pd_decay_k=0.1, walk_clip_shares=None, dynamic_window_ms=1000):
     # Grid and freshness must be explicit positive clock quantities.
     if grid_ms <= 0 or max_age_ms <= 0:
         # Refuse an accidental every-event or unbounded-staleness experiment.
         raise ValueError("positive grid and maximum age required")
     # A new book isolates each instrument/day and avoids cross-session carry-in.
     book = Book()
+    # Dynamic history is local to this instrument/day and reset at reconstruction boundaries.
+    dynamics = LiquidityDynamics(dynamic_window_ms)
     # Retain a compact event-mid timeline and sampled geometry separately.
     samples, timeline = [], []
     # Start without trusted phase, touch or prior-state information.
@@ -87,16 +93,22 @@ def collect(events, snapshots, tick, grid_ms, max_age_ms, horizons, progress=Non
                         bids, asks = book.ranked_depth(None, include_deep=False)
                         # Validate the explicit tick schedule before recording any feature.
                         cached = density_features(bids, asks, tick, pd_decay_k=pd_decay_k)
+                        # Optional legacy callers omit static sizing; production runs supply frozen clips.
+                        if walk_clip_shares is not None:
+                            # Derive costs only from known-price depth already validated above.
+                            cached.update(liquidity_features(bids,asks,tick,walk_clip_shares))
                         # The label touch must agree with the selected known-price book.
                         if not bids or not asks or abs(bids[0][0]-previous["bid"]) > 1e-7 or abs(asks[0][0]-previous["ask"]) > 1e-7:
                             # A deep aggregate cannot supply a fabricated top-of-book quote.
                             raise ValueError("known-price depth disagrees with historical touch")
                     # Keep prior-only feature state and freshness metadata in each sample.
-                    samples.append(dict(cached, ts=next_grid, epoch=previous["epoch"], mid=previous["mid"], spread_bps=previous["spread_bps"], quote_age_ms=age, realized_vol_bps=np.sqrt(variance)*10000, ofi_ewma=flow))
+                    samples.append(dict(cached, **dynamics.features(next_grid), ts=next_grid, epoch=previous["epoch"], mid=previous["mid"], spread_bps=previous["spread_bps"], quote_age_ms=age, realized_vol_bps=np.sqrt(variance)*10000, ofi_ewma=flow))
                 # Advance by clock time, independent of how many market events occurred.
                 next_grid += grid_ms
         # Apply the same primitive market updates as Backtester.run, with no own orders.
         for _, _, _, kind, obj in grouped:
+            # Copy only the directly referenced order before the original Book mutates it.
+            attribution = dynamics.before(book,kind,obj)
             # Snapshots replace historical state through the original book implementation.
             if kind == "S":
                 # Use the loader's unique snapshot key, never a reused FIX sequence number.
@@ -113,6 +125,8 @@ def collect(events, snapshots, tick, grid_ms, max_age_ms, horizons, progress=Non
             else:
                 # Unknown message semantics invalidate the feature stream.
                 raise ValueError(f"unsupported event kind {kind}")
+            # Preserve direct executions/cancellations separately from resets and unresolved events.
+            dynamics.after(book,kind,obj,attribution,timestamp)
             # Count actual consumed events for the parent heartbeat.
             completed += 1
         # Use known-price touch for both event labels and predictive controls.
@@ -123,6 +137,10 @@ def collect(events, snapshots, tick, grid_ms, max_age_ms, horizons, progress=Non
         valid = bool(not opaque and book.phase == "CONTINUOUS_AUCTION" and bid is not None and ask is not None and bq > 0 and aq > 0 and 0 < bid < ask)
         # Long observation gaps are conservatively censored, not called proven feed failures.
         gap = last_time is not None and timestamp-last_time > max_age_ms
+        # Never carry event statistics across invalid or unobserved book intervals.
+        if not valid or gap:
+            # This is an observation boundary, not proof of cancellation or execution.
+            dynamics.reset(timestamp)
         # Break label continuity on invalid books, phase interruptions or observation gaps.
         if not valid or not previous_valid or gap:
             # A later valid target cannot bridge an excluded interval.

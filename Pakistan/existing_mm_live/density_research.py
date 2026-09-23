@@ -65,6 +65,8 @@ class Reporter:
     def __init__(self):
         # Keep all duration measurements on one monotonic clock.
         self.started,self.last = time.monotonic(),0.0
+        # Track each phase separately so analysis ETA excludes earlier extraction time.
+        self.phase_key,self.phase_started = None,self.started
         # Rotate active symbols so concurrent workers do not flood the terminal.
         self.rotation = 0
         # Copy only diagnostic state across the parent timer boundary.
@@ -122,7 +124,28 @@ class Reporter:
         # A run ETA uses completed comparable cells only; pre-completion estimates are unknown.
         elapsed = now-self.started
         # Do not extrapolate one worker's event fraction to the whole portfolio.
-        eta = f"~{elapsed/done*(total-done)/60:.0f}m" if done and total>done and item.get("cell_phase",False) else "pending"
+        # Group all worker stages under extraction; keep serial analysis as its own phase.
+        phase_key = "Extraction" if item.get("cell_phase",False) else item["stage"]
+        # Reset the phase stopwatch at the first report of a new phase.
+        if phase_key != self.phase_key:
+            # Retain total elapsed separately for the existing user-facing clock.
+            self.phase_key,self.phase_started = phase_key,now
+        # Walk-forward progress includes completed symbols plus the current date fraction.
+        progress = done+(fraction or 0.) if phase_key=="Walk-forward" else done
+        # Parent hashing stages report their own file denominator instead of symbol counts.
+        target = total
+        # Use parent-stage counters when no portfolio denominator exists.
+        if not total and item["total"]:
+            # This estimate covers only the named stage, not unknown later work.
+            progress,target = item["done"],item["total"]
+        # Estimate remaining comparable work from elapsed time in this phase only.
+        phase_elapsed = now-self.phase_started
+        # No truthful rate is available at a phase's very first report.
+        eta = f"~{phase_elapsed/progress*(target-progress)/60:.0f}m" if progress>0 and target>progress and phase_elapsed>0 else "estimating"
+        # A completed nonempty phase has no remaining work in that phase.
+        if target and progress>=target:
+            # Subsequent phases receive their own estimates when they begin.
+            eta = "0m"
         # Finishing the entire requested phase means no work remains in that phase.
         if total and done == total:
             # This can describe phase completion, not necessarily completion of later analysis.
@@ -226,7 +249,7 @@ def build_cell(job,folder,settings,status):
             # Announce the true event denominator before the collector starts.
             post("Replay",0,len(events),True)
             # Extract separate versioned features; no orders are ever submitted or simulated.
-            frame,coverage = collect(events,groups,settings["tick_size"],settings["grid_ms"],settings["max_age_ms"],settings["horizons"],lambda done,total: post("Replay",done,total),pd_decay_k=settings.get("pd_decay_k",0.1))
+            frame,coverage = collect(events,groups,settings["tick_size"],settings["grid_ms"],settings["max_age_ms"],settings["horizons"],lambda done,total: post("Replay",done,total),pd_decay_k=settings.get("pd_decay_k",0.1),walk_clip_shares=job.get("clip"),dynamic_window_ms=settings.get("dynamic_window_ms",1000))
             # Keep source-selection loss explicit for thin or halted instruments.
             result.update(coverage)
             # Identify the actual timeline used for both predictors and future markouts.
@@ -263,6 +286,12 @@ def build_cell(job,folder,settings,status):
                     for horizon in settings["horizons"]:
                         # Count actual jointly usable rows rather than imputing unavailable values.
                         result["coverage"].append(dict(depth=tag,horizon_ms=horizon,source_rows=len(frame),valid_depth=int(frame[f"valid_{tag}"].sum()),valid_label=int(frame[f"markout_{horizon}ms_bps"].notna().sum()),paired_rows=int((frame[f"valid_{tag}"] & frame[f"markout_{horizon}ms_bps"].notna()).sum())))
+                # Summarize new static and dynamic feature coverage without suppressing incomplete walks.
+                result["liquidity_quality"] = dict(rows=len(frame),dynamic_full_rows=int(frame.dyn_full_window.sum()))
+                # Full-size prices exist only where the displayed known-price book covers the order.
+                if "walk_buy_1x_complete" in frame:
+                    # Keep each direction and size's complete count in cell evidence.
+                    result["liquidity_quality"].update({f"{side}_{multiple}x_complete":int(frame[f"walk_{side}_{multiple}x_complete"].sum()) for side in ("buy","sell") for multiple in (1,3,5)})
                 # All-known-price depth may equal top ten; preserve that scope limitation.
                 result["all_equals_top10_fraction"] = float(((frame.visible_bid_levels<=10)&(frame.visible_ask_levels<=10)).mean())
     # Every exception is retained verbatim rather than becoming an implicit skip.
@@ -347,6 +376,36 @@ def analyse(folder,metadata,settings,reporter):
     return dict(fitted_symbols=sum(item["fits"]>0 for item in fitted_symbols),hypotheses=len(summary),heldout_dates=int(daily.date.nunique()),inference_eligible=int(summary.p_approx.notna().sum()))
 
 
+# Validate frozen production sizing independently of historical data acquisition.
+def attach_production_clips(clip_data,jobs):
+    # Build a validated map before any output directory or worker is created.
+    clip_map = {}
+    # Reject duplicate or malformed sizing records instead of selecting one arbitrarily.
+    for entry in clip_data["jobs"]:
+        # Keep dates and symbols explicit in the sizing identity.
+        identity = (str(entry["symbol"]),str(entry["date"]))
+        # A production share clip must be a finite positive integer.
+        value = entry["clip"]
+        # Boolean values and duplicates are not valid production sizing.
+        if identity in clip_map or isinstance(value,bool) or not isinstance(value,(int,float)) or not np.isfinite(value) or value<=0 or int(value)!=value:
+            # Refuse ambiguous or malformed manifest data before replay.
+            raise ValueError("invalid/duplicate production clip: "+str(identity))
+        # Preserve the exact approved research sizing quantity.
+        clip_map[identity] = int(value)
+    # Every requested symbol-day requires explicit sizing coverage.
+    missing = [(job["symbol"],job["date"]) for job in jobs if (job["symbol"],job["date"]) not in clip_map]
+    # Missing sizes cannot silently use another symbol's or day's clip.
+    if missing:
+        # Bound error output while exposing the absent coverage.
+        raise ValueError(f"clip manifest missing {len(missing)} selected jobs; examples: {missing[:5]}")
+    # Attach the frozen production quantity to each worker's immutable input.
+    for job in jobs:
+        # Ignore unrelated gate configuration fields in this research job.
+        job["clip"] = clip_map[(job["symbol"],job["date"])]
+    # Return the same explicit job list with validated clip values attached.
+    return jobs
+
+
 # Freeze the intended experiment and give large work to the user's terminal.
 def main():
     # Explicit arguments make repeated runs comparable and auditable.
@@ -357,6 +416,10 @@ def main():
     parser.add_argument("--symbols")
     # Use existing assignment identifiers only to choose the declared research universe.
     parser.add_argument("--assignment",type=Path,default=C.RESULTS_ROOT/"config_assignment_20260915_0043.csv")
+    # Read only symbol/date/clip from a frozen production gate manifest.
+    parser.add_argument("--clip-manifest",type=Path,required=True)
+    # Freeze the causal event-volume lookback independently of label horizons.
+    parser.add_argument("--dynamic-window-ms",type=int,default=1000)
     # Twenty days provides a pipeline pilot; longer held-out histories are required for inference.
     parser.add_argument("--days",type=int,default=20)
     # End-date pinning prevents later data arrivals from silently changing a rerun's scope.
@@ -393,6 +456,10 @@ def main():
     if not np.isfinite(args.pd_decay_k) or args.pd_decay_k < 0:
         # Never silently accept a malformed experiment setting.
         parser.error("pd-decay-k must be finite and nonnegative")
+    # Dynamic windows must use a positive explicit wall-clock duration.
+    if args.dynamic_window_ms<=0:
+        # Invalid windows must fail before expensive data work.
+        parser.error("positive dynamic-window-ms required")
     # Parse a unique ordered horizon grid in real milliseconds.
     horizons = sorted(set(int(value) for value in args.horizons_ms.split(",")))
     # Nonpositive horizons are contemporaneous rather than future markouts.
@@ -431,8 +498,20 @@ def main():
     dates = available[-args.days:]
     # Preserve every planned cell, including unavailable symbol-days.
     jobs = [dict(symbol=symbol,date=date) for date in dates for symbol in symbols]
+    # Freeze manifest bytes at selection time so later edits cannot silently change sizes.
+    clip_hash = digest(args.clip_manifest)
+    # Interpret only data fields, never executable parameters from external manifests.
+    clip_data = json.loads(args.clip_manifest.read_text())
+    # Validate every selected job before creating outputs or reading market rows.
+    try:
+        # Attach only the explicit production clips from the frozen data manifest.
+        attach_production_clips(clip_data,jobs)
+    # Convert malformed sizing into an actionable command-line error.
+    except ValueError as error:
+        # Never fall back to a guessed or uniform clip.
+        parser.error(str(error))
     # Record every parameter affecting extraction, labels, models or classification.
-    settings = dict(pd_decay_k=args.pd_decay_k,feature_dir=str(feature_dir),clock=args.clock,tick_size=args.tick_size,grid_ms=args.grid_ms,max_age_ms=args.max_age_ms,horizons=horizons,min_train_days=args.min_train_days,train_window=args.train_window,symbols=symbols,dates=dates)
+    settings = dict(clip_manifest=str(args.clip_manifest.resolve()),clip_manifest_sha256=clip_hash,dynamic_window_ms=args.dynamic_window_ms,pd_decay_k=args.pd_decay_k,feature_dir=str(feature_dir),clock=args.clock,tick_size=args.tick_size,grid_ms=args.grid_ms,max_age_ms=args.max_age_ms,horizons=horizons,min_train_days=args.min_train_days,train_window=args.train_window,symbols=symbols,dates=dates)
     # Never overwrite a prior experiment or an interrupted run's evidence.
     args.output_dir.mkdir(parents=True,exist_ok=False)
     # Create a fresh versioned dataset directory without replacing existing data.
@@ -451,6 +530,8 @@ def main():
     source_paths = {path for path in code_root.rglob("*.py") if not {"docs","__pycache__",".git",".codex",".agents"}.intersection(path.relative_to(code_root).parts)}
     # Preserve source inventory separately so newly added modules are detected at the end.
     paths = set(source_paths)
+    # Sizing is a consumed research input with the same integrity requirements as data.
+    paths.add(args.clip_manifest.resolve())
     # Assignment bytes matter only when they actually selected the research universe.
     if not args.symbols and not args.smoke:
         # A later assignment change must not silently alter the frozen universe selection.
@@ -461,6 +542,10 @@ def main():
     paths.update(data_paths)
     # Initial hashing is read-only and exposes its stage through the global reporter.
     hashes = freeze(paths,reporter,"Input hashing")
+    # A changed sizing file invalidates selection before any workers start.
+    if hashes[str(args.clip_manifest.resolve())] != clip_hash:
+        # Never proceed with clips that do not match the frozen bytes.
+        raise ValueError("clip manifest changed during setup")
     # Persist the experiment before any future labels are computed.
     save(args.output_dir/"manifest.json",dict(settings=settings,jobs=jobs,hashes=hashes,python=sys.version,numpy=np.__version__,pandas=pd.__version__,parsed_root=str(C.PARSED_ROOT),clock=args.clock,clock_limit="capture time is observation availability, not proof of exchange-time precision or executable alpha",all_depth="all reconstructed known-price levels; unpriced deep aggregates excluded",live_approved=False))
     # Collect metadata from every planned job, not just successful feature partitions.
