@@ -1,9 +1,12 @@
-# show_snapshot_internals.py -- gather what's needed to optimize snapshot()
-# run from existing_mm_live/:  python show_snapshot_internals.py
-import subprocess
-# tail of snapshot() (the AGG loop end + book assignment)
-print("=== snapshot() tail (325-345) ===")
-print(subprocess.run(["sed","-n","325,345p","mm_backtest.py"],capture_output=True,text=True).stdout)
-# how snap_groups is constructed and passed to run()
-print("=== snap_groups / build_events grouping in run_legacy_mm.py ===")
-print(subprocess.run(["grep","-n","snap_groups","run_legacy_mm.py"],capture_output=True,text=True).stdout)
+
+import duckdb, config_pk
+g = str(config_pk.PARSED_ROOT / 'trades' / '*' / '*.parquet')
+q = duckdb.connect().execute(f'''
+  SELECT date, COUNT(*) AS trades,
+         SUM(CASE WHEN resting_order_id IS NOT NULL
+                   AND CAST(resting_order_id AS VARCHAR) <> '' THEN 1 ELSE 0 END) AS with_id
+  FROM read_parquet('{g}', hive_partitioning=1)
+  GROUP BY date ORDER BY date''').df()
+q['pct'] = (q.with_id / q.trades * 100).round(2)
+print(q.to_string(index=False))
+print(f'\nOVERALL {q.with_id.sum()/q.trades.sum()*100:.2f}% of {q.trades.sum():,} trades carry a resting order id')
