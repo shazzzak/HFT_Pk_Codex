@@ -24,6 +24,10 @@ from stock_search_engine import ARMS, CHEAP, Engine, make_strategy
 from stock_search_accounting import attribute
 # Use strict evidence writes and the tested distance formula.
 from stock_search_util import save, distance_share, digest
+# Keep raw pointers exact without the old parser-ID dependency.
+from psx_reference_rows import reference
+# Screen the complete channel before filtering to one symbol.
+from psx_sequence_audit import audit_date
 
 # Receive shared progress storage in each spawned worker.
 def initialize(progress):
@@ -44,6 +48,12 @@ def cell(task):
     try:
         # Show loading while parquet decoding is in progress.
         PROGRESS[key] = ('loading', 0.0)
+        # Missing messages on any symbol can invalidate this channel's reconstruction.
+        quality=audit_date((str(PARSED_ROOT),job['date']))
+        # Refuse a P&L result when source completeness is not established.
+        if not quality['sequence_complete']:
+            # Preserve unknown profit as a failure; do not replay a guessed book.
+            raise ValueError('DATA_QUALITY_BLOCKED: '+str(quality))
         # Open original parsed exchange data.
         datasets = R.open_datasets(job['date'])
         # Fail explicitly if a requested partition is absent.
@@ -51,8 +61,14 @@ def cell(task):
             # Never silently drop a requested day.
             raise ValueError('Missing parsed date')
         # Load REG rows from all three tables, requiring the market column.
-        frames = [R.read_symbol(datasets[name], list(dict.fromkeys(cols + ['market'])), job['symbol'], market='REG') for name, cols in (('ob_updates', R.REQ_UPDATES), ('ob_snapshot', R.REQ_SNAP), ('trades', R.REQ_TRADES))]
-        # Use the unchanged canonical event builder.
+        frames = [R.read_symbol(datasets[name], list(dict.fromkeys(cols + ['market'] + (['channel', 'buy_ref', 'sell_ref'] if name != 'ob_snapshot' else []))), job['symbol'], market='REG') for name, cols in (('ob_updates', R.REQ_UPDATES), ('ob_snapshot', R.REQ_SNAP), ('trades', R.REQ_TRADES))]
+        # Preserve original exchange IDs for audit while matching queues by source reference.
+        frames[0]['exchange_order_id']=frames[0]['order_id']
+        # Adds identify themselves; cancellations identify their referenced original add.
+        frames[0]['order_id']=[f"ref:{reference(r.channel)}:{reference(r.appl_seq) if r.event=='ORDER_ADD' else (reference(r.buy_ref) or reference(r.sell_ref))}" for r in frames[0].itertuples()]
+        # Trades with one reference get the same canonical ID as their original order.
+        frames[2]['resting_order_id']=[f"ref:{reference(r.channel)}:{reference(r.buy_ref) or reference(r.sell_ref)}" if bool(reference(r.buy_ref)) != bool(reference(r.sell_ref)) else None for r in frames[2].itertuples()]
+        # Retain event clocks; snapshot liquidity is ignored by the exact book.
         events, snapshots, trades = R.build_events(*frames)
         # Derive the original continuous-session bounds.
         continuous = frames[1][frames[1]['phase'] == 'CONTINUOUS_AUCTION']

@@ -360,8 +360,12 @@ def _ensure_cols(df: pd.DataFrame, cols: dict[str, str]) -> pd.DataFrame:
         else:
             # Column exists: enforce dtype safely
             # Nullable ints: to_numeric first so junk becomes NA, then cast.
-            if dtype in ("Int64", "Float64"):
-                # coerce bad literals (e.g. 'N') to NA before casting
+            if dtype == "Int64" and c in ("appl_seq", "msg_seq", "buy_ref", "sell_ref", "resting_ref"):
+                # Never round application pointers through a nullable float column.
+                df[c] = pd.array(df[c], dtype="Int64")
+            # Preserve legacy coercion for unrelated numeric schema fields.
+            elif dtype in ("Int64", "Float64"):
+                # Coerce non-reference numeric literals as before.
                 df[c] = pd.to_numeric(df[c], errors="coerce").astype(dtype)
             # Plain float: to_numeric already yields float64.
             elif dtype == "float64":
@@ -606,7 +610,8 @@ def _build_trades(recs, adds_index: dict) -> pd.DataFrame:
     for c in ("price", "qty"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     for c in ("appl_seq", "msg_seq", "buy_ref", "sell_ref"):
-        df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+        # Parse nullable integer strings exactly; malformed pointers must fail.
+        df[c] = pd.array(df[c], dtype="Int64")
 
     df["channel"] = pd.to_numeric(df["channel"], errors="coerce").astype("Int64")
 
@@ -626,8 +631,9 @@ def _build_trades(recs, adds_index: dict) -> pd.DataFrame:
     df["resting_ref"] = ref.where(ref.fillna(0) > 0).astype("Int64")
     df.loc[is_auction, "resting_ref"] = pd.NA             # Fix 8
 
+    # Keep 18-digit references integer-exact when constructing lookup keys.
     keys = zip(df["channel"].astype("object"),
-               df["resting_ref"].astype("float").fillna(-1).astype(int))
+               df["resting_ref"].fillna(-1).astype("int64"))
 
     # PRODUCTION FIX: Extract index [0] to avoid Tuple injection.
     # Use pd.NA instead of None to ensure zero-overhead casting to string[pyarrow] later.
@@ -685,7 +691,8 @@ def _build_ob_updates(recs, adds_index: dict) -> pd.DataFrame:
     for c in ("price", "qty"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     for c in ("appl_seq", "msg_seq", "buy_ref", "sell_ref"):
-        df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+        # Parse nullable integer strings exactly; malformed pointers must fail.
+        df[c] = pd.array(df[c], dtype="Int64")
 
     df["channel"] = pd.to_numeric(df["channel"], errors="coerce").astype("Int64")
 
@@ -935,11 +942,10 @@ def _write_chunk(buf, n_chunk, adds_index, out_dir, day, totals, t0):
     print(f"    parse  {time.time() - _tp:.1f}s", flush=True)
     _tp = time.time()
     print(f"chunk {n_chunk:>3}: building frames …", flush=True)
-    # Trades: resolves each trade's resting order via adds_index.
-    df_trades  = _build_trades(trades, adds_index)
-    # Updates: POPULATES adds_index from ADD rows, then resolves cancels
-    # against it -- so this must run before/with the trades lookup path.
-    df_ob_upd  = _build_ob_updates(ob_upd, adds_index)
+    # Populate this chunk's add-reference index before resolving executions.
+    df_ob_upd = _build_ob_updates(ob_upd, adds_index)
+    # Resolve partial and complete trades against prior and same-chunk adds.
+    df_trades = _build_trades(trades, adds_index)
     # Full-book snapshots (35=W): the biggest table by far, ~2M rows/chunk.
     df_ob_snap = _build_ob_snapshot(ob_snap)
     # Everything else: session status, heartbeats, channel stats.

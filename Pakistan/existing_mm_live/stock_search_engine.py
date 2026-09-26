@@ -5,7 +5,11 @@ import math
 # Use the unchanged matching engine and latency implementation.
 from mm_backtest import Backtester
 # Exclude unpriced aggregate statistics from touch and queue position.
-from stock_search_book import PricedBook
+from stock_search_exact_book import ExactBook
+# Validate each event before the original simulator can process fills.
+from psx_reference_book import ReferenceBook
+# Read original application references consistently.
+from psx_reference_rows import normalize
 # Use the isolated source copy with the narrowly defined signal substitution.
 from stock_search_micro import MicrostructureMM
 # Pin all requested common control settings.
@@ -60,8 +64,8 @@ class Engine(Backtester):
     def __init__(self, strategy, cfg):
         # Keep the original engine initialization intact.
         super().__init__(strategy, cfg)
-        # Keep all historical mutations, using consistent executable price views.
-        self.book = PricedBook()
+        # Use exact referenced quantities; snapshots supply phase/bands, never liquidity.
+        self.book = ExactBook()
         # Do not permit opening buffers that are absent from the fill ledger.
         if self.pos != 0 or self.cash != 0:
             # Such a simulation needs explicit opening-lot accounting first.
@@ -151,3 +155,27 @@ class Engine(Backtester):
     def _cross_on_arrival(self, *args, **kwargs):
         # Do not add a new arrival-time risk rejection.
         return self._record(super()._cross_on_arrival, *args, **kwargs)
+
+    # Validate the same source mutations before any simulator execution can use them.
+    def run(self, events, snapshots):
+        # A separate proof ledger checks the next event before pending orders activate.
+        proof=ReferenceBook()
+        # Stream validation without materializing another full event list.
+        def checked():
+            # Preserve the caller's observation and event order.
+            for event in events:
+                # Read the existing event-kind contract.
+                kind=event[3]
+                # Snapshots cannot validate or reset the reference ledger.
+                if kind in ('U','T'):
+                    # Reject a missing or inconsistent reference before a fill is simulated.
+                    proof.apply(normalize(event[4],'trades' if kind=='T' else 'ob_updates'))
+                # Only a validated market mutation may enter the original engine.
+                yield event
+        # Keep unknown results as failed cells; never book a zero-P&L replacement.
+        return super().run(checked(), snapshots)
+
+    # Phase-only snapshots do not change queue membership or priority.
+    def _on_snapshot_queue_reset(self):
+        # Leave the actual reference-based queue untouched.
+        return None

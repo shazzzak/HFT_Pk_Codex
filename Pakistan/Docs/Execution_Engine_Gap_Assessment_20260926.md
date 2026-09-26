@@ -1,0 +1,55 @@
+# Execution-engine gap assessment — 26 September 2026
+
+## Scope and conclusion
+
+Read-only review of the current `HFT_Pk_Codex/Pakistan/Production` engine, its sibling `existing_mm_live` research dependencies, and selected saved evidence. No engine, strategy, reconstruction or input-data changes were made for this assessment. New reports and bounded-test artifacts are separate from the user's running P&L experiment.
+
+The engine is beyond a skeleton: order management, risk, durable state, market-data state machines, operational control logic and durable-account replay integration exist. However, the current corrected clean-window P&L replay and the production durable-account replay are different integration paths. Neither a profitable clean-window result nor simulator parity establishes live execution realism.
+
+All line numbers below refer to files under `/Users/shazzak/PycharmProjects/HFT_Pk_Codex/Pakistan/Production`, except explicitly identified sibling research files.
+
+## Implemented, tested and still missing
+
+| Area | Implementation evidence | Verification and remaining gate |
+|---|---|---|
+| Canonical roots and provenance | `../existing_mm_live/config_pk.py:16` defines parsed data; lines 18 and 24 distinguish standard and Codex results. `run_legacy_mm.py:54` imports the configured root. `sim/account_replay_gate.py:215–217` checks checkout/data-root consistency. `clean_window_research/clean_window_run.py:41–60` verifies calibration hashes and raw file membership/size/mtime. | No actual active-loader root mismatch was demonstrated in this review. Avoid claiming all roots are inconsistent. The clean-window raw check uses metadata, not every parquet's content hash. Next: inventory resolved runtime roots, source lineage and artifact ownership across all entry points, then decide where stronger immutable input manifests are needed. Do not change the active run. |
+| Fill records and attribution | `../existing_mm_live/stock_search_engine.py:123–157` records pre-fill BBO, `mid0`, `mid_source` through passive, taker and crossing hooks. `stock_search_accounting.py` consumes those records. | Recording exists; independent alignment audit of every fill path remains. Check same-timestamp ordering, arrivals between source events, missing/locked/crossed books, IOC level fills, fees and excluded-window labels. Do not substitute a nearest equity-table midpoint. |
+| Order lifecycle | `core/oms.py`; `sim/replay.py`; `tests/test_replay.py` cover add/ack/reject, cancel/fill races, partials, amendments and priority assumptions. | Review found implementation and tests, but the full pytest suite could not run because this environment lacks pytest. Focused standard-library integration tests passed. Broker-specific message normalization, report identities and real-session behavior remain unvalidated. |
+| Durable outbound/inbound state | `core/recovery_store.py:31–90` uses exclusive ownership, SQLite transactions and synchronous flushing. `core/durable_runtime.py:190–217` commits an attempted send before calling transport; `apply_report` processes normalized reports. | Six actual subprocess crash/recovery boundaries passed during this review. This validates those software scenarios, not all device/power-loss behavior or the live FIX transport. Unknown send outcomes retain exposure; blind retries are deliberately prohibited. |
+| Recovery reconciliation | `core/durable_runtime.py:328–346` requires a named operator, a complete external snapshot and a synchronization barrier; compares positions and cash. | It currently requires drained orders: no unresolved local order and an empty external open-order set. Recovery of a live working-order inventory and broker-supported authoritative synchronization must be designed and tested. `sim/account_replay.py:160–164` also refuses nonzero opening simulator cash/position without an explicit bootstrap. |
+| Account risk | `core/account_risk.py` implements funded capacity, aggregate exposure, old/proposed order reservations, fees, losses, short permissions, stale marks and persistent halts. | Nine account-replay unit tests passed; one includes the existing eleven-scenario financial matrix. This is not nine plus eleven independent test methods. `sim/account_replay.py:209` assembles an isolated symbol-day: broad chronological multi-symbol account replay with competing capital/exposure is a remaining gate. |
+| Durable/account replay integration | `sim/account_replay.py:148–189` connects replay to `AccountRiskManager` and durable dispatch. `sim/account_replay_gate.py:73 onward` compares baseline and funded-account fills/accounting, restarts the ledger and tests an intentionally unfunded account. | Integration already exists. Its baseline is `sim.gate`/general `mm_backtest`; it is not the corrected `clean_window_research.WindowEngine`. Need explicitly comparable input, reconstruction, account and closing contracts before treating parity as validation of the new research path. |
+| Market-data recovery and published snapshots | `venues/psx_market_data.py:34` contains tick recovery; `PSXSnapshotState` starts at line 297. | Its own contract explicitly says published snapshots are not spliced with ticks without a verified bridge. The historical quiet-cutover method is not a demonstrated live snapshot/tick synchronization protocol. Verify channel epochs, retransmission, freshness and the live reconstruction boundary with actual venue/broker evidence. |
+| Control loop and operations | `core/control_loop.py` implements readiness checks, explicit arming, unsafe-feed withdrawal, stop and controlled liquidation through injected interfaces. | A live executable host, actual transport/session connectivity, broker reconciliation provider, operator authentication and deployment/runbooks were not identified in the inspected modules. Readiness callbacks are interfaces, not proof that these external systems are implemented. |
+| Fill realism, capacity and strategy validation | Queue and latency simulation, crossing paths and fill reason tags already exist. | Still require controlled crossing attribution, intraday capacity/concentration, queue uncertainty bounds, measured latency/fill calibration and chronological walk-forward selection. None of these individually proves profits will survive actual execution. |
+
+## Important difference between the two replay paths
+
+The user's current run uses `clean_window_research.WindowEngine`, derived from `stock_search_engine.Engine` and the research backtester. It reconstructs independently flat usable windows and exits before retrospectively known boundaries. It does not instantiate the production `AccountRiskManager`/durable store simply because those classes exist elsewhere in Production.
+
+`sim.account_replay.AccountReplay` instead derives from `sim.replay.EngineReplay` and integrates the durable production manager. It uses the general simulator's book and event loading through `sim.gate`. The account gate is per stock-day with isolated ledgers; cross-symbol financial fixtures do not establish complete portfolio-wide event replay.
+
+Consequently, the next integration deliverable must declare the exact shared reconstruction/event stream and ending/accounting conventions. With nonbinding limits, assert order/fill/accounting parity under matched conventions. With binding limits, assert intentional suppression, retained reservations and exact ledger outcomes rather than expecting equal P&L. Test crash/restart at meaningful points on that same stream.
+
+## Evidence obtained now
+
+- `python -m unittest tests.test_account_replay_unittest -v`: **9 tests passed**, 5.484 seconds. Includes synthetic full-event-loop/gate checks and the eleven financial scenarios invoked by `test_account_regression_matrix`.
+- `sim/recovery_check.py --iterations 1`: **6/6 subprocess crash/recovery cases passed**: before/after batch commit, after attempt commit, during transport, before/after fill commit.
+- Selected pytest invocation: **not executed successfully**; interpreter returned `No module named pytest`. No dependency was installed or altered during the active P&L run.
+- A historical archived `Production_docs_20260921/risk_gate_full_20260921/summary.json` reports 240 completed and zero failed cells, with `live_approved=false`. Its complete source/input identity was not revalidated here; it is historical evidence, not a current-release pass.
+- Source fingerprints captured before and after the assessment matched exactly (`cmp` exit 0). Detailed logs and both fingerprint lists are retained in `/Users/shazzak/HFT Data/Pakistan/Capital Stake - Results Codex/Engine_Gap_Assessment_20260926`.
+
+## Documentation corrections needed after the freeze
+
+The Production README is not a reliable current component inventory. It says market-data/control/strategy pieces are not built despite corresponding implementation files. It says amendment replay is unsupported despite amendment tests and current replay paths. Its claim that the queue is modeled “exactly” is stronger than the evidence, particularly with anonymous liquidity and uncertain snapshot timing. Preserve it during this run; update it against verified implementation afterward.
+
+## Ordered next work
+
+1. **Finish a runtime provenance inventory:** canonical paths, code fingerprints, dataset partitions, frozen calibration, assignments and output ownership for each active entry point. Record inconsistencies before changing anything.
+2. **Audit saved execution records independently:** reconcile quantities/cash/fees to fills; verify precise fill-time BBO/mid and participation denominators; separate accepted/excluded research windows and missing intervals. This is read-only work that can proceed alongside the current run.
+3. **Run controlled attribution after defining matched input scope:** crossing-on/off, fill reasons and intraday capacity; distinguish different included periods from execution changes. Hold sizing, seed, costs and configuration fixed.
+4. **Close the integration gap:** connect a declared common book/event contract to the existing durable/account replay; test funded parity, binding limits, nonzero starting holdings, retained working orders and chronological multi-symbol exposure. Benchmark journal growth and replay cost before broadening.
+5. **Validate selection chronologically:** freeze training/assignment dates, evaluate later periods, then run separately identified strategy experiments. Do not carry forward a selection result as validated merely because the same strategy names remain.
+6. **Continue live application assembly while access is pending:** host event loop, FIX session/transport adapter, inbound report normalization, authoritative reconciliation barrier, operator controls, observability and deployment. Use simulated contracts now; venue acceptance and real execution calibration remain separate gates.
+
+No live trading authorization is implied. No queue, profitability or completeness claim should be inferred from test names or the existence of a module.

@@ -68,6 +68,8 @@
 # ============================================================================
 
 import ast        # parses the stringified tuple in trades.resting_order_id
+# Validate finite cancellation quantities before changing queue position.
+import math
 import heapq      # priority queue for our in-flight orders/cancels
 from dataclasses import dataclass
 
@@ -1990,14 +1992,30 @@ class Backtester:
                     # priced best-first, so no later order can cross either
                     break
 
+    # A historical quantity reduction preserves the remaining order's queue priority.
     def _on_market_cancel(self, r):
-        """A historical order was cancelled. If it was queued AHEAD of one
-        of our orders, our queue position just improved: remove it from
-        every ahead dict it appears in. (It can only match at one price,
-        so at most one dict actually contains it.)"""
+        # Resolve the actual cancelled historical order or known-price initial pool.
         oid = str(r.order_id)
-        for o in self._all_orders():
-            o.ahead.pop(oid, None)
+        # A cancellation supplies the removed quantity, not permission to delete its remainder.
+        qty = float(r.qty)
+        # Refuse malformed reductions instead of silently improving our queue.
+        if not math.isfinite(qty) or qty <= 0:
+            # Invalid source quantity cannot create a simulated fill advantage.
+            raise ValueError("Invalid market cancellation quantity")
+        # Every live simulated order keeps its own view of historical quantity ahead.
+        for order in self._all_orders():
+            # Only the referenced ahead entry can be affected.
+            if oid in order.ahead:
+                # Preserve the remaining quantity at exactly its existing queue location.
+                remaining = order.ahead[oid] - qty
+                # A partial cancellation does not reset time priority.
+                if remaining > 0:
+                    # Update this entry in place without reinserting it.
+                    order.ahead[oid] = remaining
+                # Remove the entry only when its entire ahead quantity is exhausted.
+                else:
+                    # Leave all unrelated queue entries and our own order untouched.
+                    del order.ahead[oid]
 
     def _on_snapshot_queue_reset(self):
         """A snapshot just REPLACED the historical book, so our carefully
@@ -2020,6 +2038,32 @@ class Backtester:
             o.ahead = self.book.qty_at(o.side, o.price)
 
     # ================ strategy plumbing (KNOWLEDGE side) ==================
+    # Use the same cancellation implementation for halts and data-quality stops.
+    def _cancel_desired_quotes(self, ts_know):
+        # Cancel every working order that isn't already being cancelled.
+        for side, cur in [(s_, o_) for s_ in ("BUY", "SELL")
+                          for o_ in list(self._side_orders(s_))]:
+            # Skip orders with ANY message of ours outstanding: a cancel
+            # already in flight, an order that has not reached the exchange
+            # yet, or an amendment awaiting an answer. In each case there
+            # is nothing we may send, and the order manager holds in
+            # exactly the same three cases. Whichever message is
+            # outstanding lands, and the next requote -- still not
+            # quotable -- pulls the order then.
+            if (cur.cancel_at is None and cur.t_active is not None
+                    and cur.amend_at is None):
+                # Draw a send latency for this cancel.
+                a_out = self.lat.draw_out()
+                # The cancel lands (exchange stops matching) at knowledge time + latency.
+                cur.cancel_at = ts_know + a_out
+                # Schedule the cancel to land, targeting this specific order (side, oid).
+                self._push(cur.cancel_at, "CANCEL", (side, cur.oid))
+                # MESSAGE LOG: a halt-pull cancel is an outbound message too
+                self._msg_ts.append(ts_know)
+                # In stochastic mode, mark this side unconfirmed until the ack returns.
+                if self.use_ack:
+                    self.ack_until[side] = cur.cancel_at + self.lat.draw_ack()
+
     def _requote(self, ts_know):
         """Ask the strategy what it wants; reconcile with what's working.
 
@@ -2088,29 +2132,8 @@ class Backtester:
         if not quotable:
             # Count this halted requote for diagnostics.
             self.stats["halted_requotes"] += 1
-            # Cancel every working order that isn't already being cancelled.
-            for side, cur in [(s_, o_) for s_ in ("BUY", "SELL")
-                              for o_ in list(self._side_orders(s_))]:
-                # Skip orders with ANY message of ours outstanding: a cancel
-                # already in flight, an order that has not reached the exchange
-                # yet, or an amendment awaiting an answer. In each case there
-                # is nothing we may send, and the order manager holds in
-                # exactly the same three cases. Whichever message is
-                # outstanding lands, and the next requote -- still not
-                # quotable -- pulls the order then.
-                if (cur.cancel_at is None and cur.t_active is not None
-                        and cur.amend_at is None):
-                    # Draw a send latency for this cancel.
-                    a_out = self.lat.draw_out()
-                    # The cancel lands (exchange stops matching) at knowledge time + latency.
-                    cur.cancel_at = ts_know + a_out
-                    # Schedule the cancel to land, targeting this specific order (side, oid).
-                    self._push(cur.cancel_at, "CANCEL", (side, cur.oid))
-                    # MESSAGE LOG: a halt-pull cancel is an outbound message too
-                    self._msg_ts.append(ts_know)
-                    # In stochastic mode, mark this side unconfirmed until the ack returns.
-                    if self.use_ack:
-                        self.ack_until[side] = cur.cancel_at + self.lat.draw_ack()
+            # Reuse the ordinary cancellation path; keep sent orders until exchange processing.
+            self._cancel_desired_quotes(ts_know)
             # Done -- no new quotes while not quotable.
             return
 
